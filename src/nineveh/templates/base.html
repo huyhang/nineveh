@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}{{ service_title }}{% endblock %}</title>
+    <link rel="icon" href="{{ url_for('static', path='icon.svg') }}" type="image/svg+xml">
+    <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/">
+        <img src="{{ url_for('static', path='icon.svg') }}" alt="" width="34" height="34">
+        <span>{{ service_title }}</span>
+      </a>
+      {% if session %}
+        <nav aria-label="Account">
+          {% if session.user.is_admin %}<a href="/admin">Admin</a>{% endif %}
+          <span>{{ session.user.username }}</span>
+          <form method="post" action="/logout" class="inline-form">
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+            <button type="submit" class="link-button">Sign out</button>
+          </form>
+        </nav>
+      {% endif %}
+    </header>
+    <main class="page-shell">
+      {% if message %}<div class="notice" role="status">{{ message }}</div>{% endif %}
+      {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>
+

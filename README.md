@@ -1,3 +1,142 @@
 # Nineveh
 
-A Docker-based, self-hosted service written in Python that serves only comics and manga in CBZ and PDF format.
+Nineveh is a self-hosted, API-first OPDS 2.0 service for CBZ comic and manga libraries. It provides authenticated OPDS feeds, full-archive downloads, individual page access, a responsive browser catalog, and local user administration.
+
+The service is designed for a small Docker host such as a Synology NAS. Media remains read-only while users, the catalog index, and generated thumbnails live in a separate state volume.
+
+## Features
+
+- OPDS 2.0 catalog and publication feeds
+- HTTP Basic authentication for OPDS clients
+- Secure browser sessions and a responsive catalog
+- Local users managed through an administrator page or JSON API
+- Original CBZ downloads with byte-range and cache support
+- Ordered page manifests and individually streamed page images
+- Contiguous page ranges downloadable as a standalone CBZ
+- Incremental catalog scans with `ComicInfo.xml` support
+- Bounded archive and thumbnail caches
+- ZIP traversal, expansion, and size protections
+
+PDF files are not supported in this initial release.
+
+## Library layout
+
+Mount a directory with this exact structure at `/data`:
+
+```text
+data root/
+├── Library One/
+│   ├── comics/
+│   │   └── Series Name/
+│   │       ├── Issue 01.cbz
+│   │       └── Issue 02.cbz
+│   └── manga/
+│       └── Another Series/
+│           └── Volume 01.cbz
+└── Library Two/
+    └── comics/
+        └── Series Name/
+            └── Collection.cbz
+```
+
+Symlinks and files outside this hierarchy are ignored. Pages are naturally sorted by archive member name. When present, Nineveh uses title, series, number, summary, creators, and cover information from `ComicInfo.xml`.
+
+## Quick start with Docker Compose
+
+1. Copy `docker/.env.example` to `docker/.env` and set the absolute media and state paths.
+2. Create `docker/secrets/admin_password.txt` containing the initial administrator password. Use at least 12 characters and restrict access to the file.
+3. Ensure the configured UID/GID can read the media directory and write to the state directory.
+4. Start the service:
+
+```sh
+docker compose --env-file docker/.env -f docker/compose.yaml up --build -d
+```
+
+Open `http://NAS_ADDRESS:8080/`, or the HTTPS address configured through a reverse proxy. The OPDS catalog URL is:
+
+```text
+https://nineveh.example.com/opds/v2/catalog.json
+```
+
+For detailed Synology instructions, see [docker/synology-deployment.md](docker/synology-deployment.md).
+
+## API overview
+
+All catalog and content endpoints require authentication.
+
+| Endpoint | Purpose |
+|---|---|
+| `/opds/v2/authentication.json` | OPDS authentication discovery |
+| `/opds/v2/catalog.json` | Root OPDS navigation feed |
+| `/opds/v2/navigation.json?library=&category=` | Category and series navigation feeds |
+| `/opds/v2/publications.json` | Paginated publication feed and search |
+| `/api/v1/publications/{id}` | Single publication as an OPDS entry |
+| `/api/v1/publications/{id}/file` | Original CBZ download |
+| `/api/v1/publications/{id}/cover?width=320` | Generated WebP cover (160, 320, or 640) |
+| `/api/v1/publications/{id}/pages?start=1&end=20` | Ordered page-range manifest |
+| `/api/v1/publications/{id}/pages/{number}` | Original page image |
+| `/api/v1/publications/{id}/range?start=1&end=20` | That page range as a standalone CBZ |
+| `/api/v1/health/live`, `/api/v1/health/ready` | Liveness and readiness with scan status |
+| `/docs` | Interactive OpenAPI documentation |
+
+The page manifest and page-range download are Nineveh extensions, advertised from each OPDS publication under the `urn:nineveh:rel:page-manifest` and `urn:nineveh:rel:page-range` relations. Standard OPDS readers can use the full-CBZ acquisition link and ignore both; clients aware of the extensions can fetch individual pages or save an excerpt. A range may span at most `NINEVEH_PAGE_RANGE_LIMIT` pages and is generated on demand, never cached.
+
+## Configuration
+
+| Variable | Default | Description |
+|---|---:|---|
+| `NINEVEH_DATA_DIR` | `/data` | Read-only library root inside the container |
+| `NINEVEH_STATE_DIR` | `/state` | Writable database and cache directory |
+| `NINEVEH_ADMIN_USERNAME` | `admin` | First administrator username |
+| `NINEVEH_ADMIN_PASSWORD_FILE` | — | File containing the first administrator password |
+| `NINEVEH_ADMIN_PASSWORD` | — | Less secure alternative to the password file |
+| `NINEVEH_PUBLIC_BASE_URL` | request URL | Public HTTPS origin used in feed links |
+| `NINEVEH_SECURE_COOKIES` | `true` | Require HTTPS for browser session cookies |
+| `NINEVEH_SESSION_HOURS` | `168` | Browser session lifetime |
+| `NINEVEH_SCAN_INTERVAL_SECONDS` | `900` | Rescan interval; `0` disables scheduled scans |
+| `NINEVEH_FEED_PAGE_SIZE` | `24` | Publications returned per feed/page |
+| `NINEVEH_PAGE_RANGE_LIMIT` | `100` | Maximum pages in one manifest request |
+| `NINEVEH_ARCHIVE_CACHE_SIZE` | `4` | Recently open archive indexes retained in memory |
+| `NINEVEH_THUMBNAIL_CACHE_MB` | `512` | Maximum generated-thumbnail storage |
+| `NINEVEH_PAGE_CACHE_MB` | `1024` | Maximum extracted-page cache; `0` disables it |
+| `NINEVEH_HASH_WORKERS` | `2` | Concurrent password verifications (~19 MiB each) |
+| `NINEVEH_EXTRACT_WORKERS` | `2` | Concurrent page extractions into the cache |
+| `NINEVEH_MAX_IMAGE_PIXELS` | `200000000` | Largest decodable cover; ~3 bytes per pixel |
+| `NINEVEH_MEMORY_LIMIT` | `1g` | Container memory ceiling (Compose only) |
+| `NINEVEH_HOST` | `0.0.0.0` | Listen address |
+| `NINEVEH_PORT` | `8080` | Listen port |
+| `NINEVEH_LOG_LEVEL` | `INFO` | Level for the JSON stdout log |
+| `NINEVEH_FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxies whose `X-Forwarded-*` headers are trusted |
+
+Archive safety limits can also be adjusted through the variables defined in [`config.py`](src/nineveh/config.py).
+
+Nineveh's resident set is roughly 80–120 MB and does not grow with library size; the archive, thumbnail, and page caches are bounded on disk under `/state`, not in memory. The two worker ceilings and `NINEVEH_MAX_IMAGE_PIXELS` are what actually bound peak RAM. See [the deployment guide](docker/synology-deployment.md#resource-tuning) for sizing.
+
+`/state` holds four things: `nineveh.sqlite3`, `thumbnails/`, `page-cache/`, and `ranges/`. Only the database needs backing up; the other three are regenerated on demand. Generated range archives are deleted as soon as their response completes, and any left behind by an unclean shutdown are cleared at startup.
+
+The bootstrap password is used only when `/state` contains no users. Afterwards, users and password resets are managed at `/admin`.
+
+## Local development
+
+Nineveh requires Python 3.12 or newer.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[test]'
+export NINEVEH_DATA_DIR="$PWD/example-data"
+export NINEVEH_STATE_DIR="$PWD/state"
+export NINEVEH_ADMIN_PASSWORD='replace-with-a-long-password'
+export NINEVEH_SECURE_COOKIES=false
+nineveh
+```
+
+Run `pytest` for the suite (it enforces 90% branch coverage), and `ruff check src tests && ruff format --check src tests` for style. [CI](.github/workflows/ci.yml) runs all three on Linux with Python 3.12 — the same platform the image ships — then builds the image and smoke-tests a live container.
+
+`create_app(settings, container)` takes every I/O seam as an argument, so tests can substitute any of them; see [`tests/fakes.py`](tests/fakes.py) and [`tests/test_container.py`](tests/test_container.py) for the whole HTTP surface driven without a single CBZ on disk.
+
+The application uses one process intentionally; blocking archive and password work runs through bounded framework worker threads while SQLite and in-process caches remain singular.
+
+## Security notes
+
+Use HTTPS for any non-local deployment. The Docker Compose configuration mounts `/data` read-only, drops Linux capabilities, uses a read-only container filesystem, and persists only `/state`. Back up `/state/nineveh.sqlite3` to preserve accounts and stable publication identifiers.

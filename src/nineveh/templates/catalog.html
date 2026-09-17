@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="heading-row">
+    <div>
+      <h1>Library</h1>
+      <p>{{ total }} publication{% if total != 1 %}s{% endif %}</p>
+    </div>
+    <a class="button secondary" href="/opds/v2/catalog.json">OPDS feed</a>
+  </div>
+
+  <form method="get" action="/" class="filters">
+    <label>Search <input name="q" value="{{ filters.q or '' }}" placeholder="Title or series"></label>
+    <label>Library
+      <select name="library">
+        <option value="">All libraries</option>
+        {% for name, count in libraries %}
+          <option value="{{ name }}" {% if filters.library == name %}selected{% endif %}>{{ name }} ({{ count }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Type
+      <select name="category">
+        <option value="">Comics and manga</option>
+        <option value="comics" {% if filters.category == 'comics' %}selected{% endif %}>Comics</option>
+        <option value="manga" {% if filters.category == 'manga' %}selected{% endif %}>Manga</option>
+      </select>
+    </label>
+    {% if series_options %}
+      <label>Series
+        <select name="series">
+          <option value="">All series</option>
+          {% for name, count in series_options %}
+            <option value="{{ name }}" {% if filters.series == name %}selected{% endif %}>{{ name }} ({{ count }})</option>
+          {% endfor %}
+        </select>
+      </label>
+    {% endif %}
+    <button type="submit">Filter</button>
+  </form>
+
+  {% if publications %}
+    <div class="card-grid">
+      {% for item in publications %}
+        <article class="card">
+          <img
+            src="/api/v1/publications/{{ item.id }}/cover?width=320&amp;revision={{ item.revision }}"
+            alt="Cover for {{ item.title }}"
+            width="320"
+            loading="lazy"
+          >
+          <div class="card-body">
+            <p class="eyebrow">{{ item.library }} · {{ item.category }}</p>
+            <h2>{{ item.title }}</h2>
+            <p>{{ item.series }}{% if item.number %} · #{{ item.number }}{% endif %}</p>
+            <p>{{ item.page_count }} pages</p>
+            <a class="button" href="/api/v1/publications/{{ item.id }}/file">Download CBZ</a>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+    <nav class="pagination" aria-label="Catalog pages">
+      {% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Previous</a>{% endif %}
+      <span>Page {{ page }} of {{ page_count }}</span>
+      {% if next_url %}<a class="button secondary" href="{{ next_url }}">Next</a>{% endif %}
+    </nav>
+  {% else %}
+    <div class="empty-state">
+      <h2>No publications found</h2>
+      <p>Add CBZ files under the configured directory structure or adjust the filters.</p>
+    </div>
+  {% endif %}
+{% endblock %}

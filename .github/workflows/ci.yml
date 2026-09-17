@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    # The image ships Python 3.12 on Linux; run the checks on the same
+    # platform so filesystem and interpreter behaviour matches production.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]' 'ruff>=0.9,<1'
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Format
+        run: ruff format --check src tests
+
+      - name: Test
+        run: pytest
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: nineveh:ci
+
+      - name: Smoke test the container
+        run: |
+          mkdir -p "$RUNNER_TEMP/library/Sample/comics/Series"
+          python3 docker/create-sample-library.py "$RUNNER_TEMP/library"
+          docker run -d --name nineveh-ci \
+            -e NINEVEH_ADMIN_PASSWORD='correct horse battery staple' \
+            -e NINEVEH_SECURE_COOKIES=false \
+            -e NINEVEH_SCAN_INTERVAL_SECONDS=0 \
+            -v "$RUNNER_TEMP/library:/data:ro" \
+            -p 8080:8080 nineveh:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/api/v1/health/live && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null -w 'unauthenticated=%{http_code}\n' \
+            http://127.0.0.1:8080/opds/v2/catalog.json || true
+          curl -fsS -u 'admin:correct horse battery staple' \
+            http://127.0.0.1:8080/opds/v2/catalog.json > /dev/null
+          docker rm -f nineveh-ci
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the Compose file
+        run: |
+          docker compose --env-file docker/.env.example \
+            -f docker/compose.yaml config --quiet
