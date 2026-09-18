@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Administration · {{ service_title }}{% endblock %}
+{% block main_class %}admin-page{% endblock %}
+{% block content %}
+  <header class="admin-heading">
+    <p class="eyebrow">Control room</p>
+    <h1>Administration</h1>
+    <p>Manage your catalog, accounts, and service.</p>
+  </header>
+  <nav class="admin-tabs" aria-label="Administration">
+    <a href="/admin" {% if admin_section == 'overview' %}aria-current="page"{% endif %}>Overview</a>
+    <a href="/admin/users" {% if admin_section == 'users' %}aria-current="page"{% endif %}>Users</a>
+    <a href="/admin/libraries" {% if admin_section == 'libraries' %}aria-current="page"{% endif %}>Libraries</a>
+    <a href="/admin/settings" {% if admin_section == 'settings' %}aria-current="page"{% endif %}>Settings</a>
+  </nav>
+  {% block admin_content %}{% endblock %}
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='admin.js') }}" defer></script>{% endblock %}

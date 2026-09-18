@@ -10,13 +10,33 @@ import zipfile
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 from xml.etree import ElementTree
 
 from .config import Settings
-from .domain import Page, Publication, ScannedPublication, ScanReport, ScanStatus
-from .ports import CatalogRepository
+from .domain import (
+    ManagedLibrary,
+    Page,
+    Publication,
+    ScannedPublication,
+    ScanReport,
+    ScanStatus,
+)
+from .ports import CatalogRepository, LibraryRepository
 
-__all__ = ["ArchiveInspector", "CatalogScanner", "ScanStatus", "UnsafeArchive"]
+
+class CatalogManagementRepository(CatalogRepository, LibraryRepository, Protocol):
+    pass
+
+
+__all__ = [
+    "ArchiveInspector",
+    "CatalogScanner",
+    "InvalidLibrary",
+    "LibraryService",
+    "ScanStatus",
+    "UnsafeArchive",
+]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +53,53 @@ NATURAL_PARTS = re.compile(r"(\d+)")
 
 class UnsafeArchive(ValueError):
     pass
+
+
+class InvalidLibrary(ValueError):
+    pass
+
+
+class LibraryService:
+    """Manages safe, direct children of the configured read-only data root."""
+
+    def __init__(self, data_dir: Path, repository: LibraryRepository) -> None:
+        self._data_dir = data_dir
+        self._repository = repository
+
+    def initialize(self) -> None:
+        self._repository.initialize_libraries(
+            [entry.name for entry in _directories(self._data_dir)]
+        )
+
+    def available(self) -> list[str]:
+        enabled = {
+            item.relative_path.casefold()
+            for item in self._repository.managed_libraries()
+        }
+        return [
+            entry.name
+            for entry in _directories(self._data_dir)
+            if entry.name.casefold() not in enabled
+        ]
+
+    def add(self, relative_path: str) -> ManagedLibrary:
+        candidate = relative_path.strip()
+        if (
+            not candidate
+            or Path(candidate).name != candidate
+            or candidate in {".", ".."}
+        ):
+            raise InvalidLibrary("Select a top-level directory under the data root")
+        present = {entry.name for entry in _directories(self._data_dir)}
+        if candidate not in present:
+            raise InvalidLibrary(f"No directory named {candidate} under the data root")
+        return self._repository.add_library(candidate)
+
+    def remove(self, library_id: str) -> ManagedLibrary:
+        library = self._repository.remove_library(library_id)
+        if not library:
+            raise InvalidLibrary("Managed library not found")
+        return library
 
 
 class ArchiveInspector:
@@ -205,7 +272,10 @@ class ArchiveInspector:
 
 class CatalogScanner:
     def __init__(
-        self, data_dir: Path, repository: CatalogRepository, inspector: ArchiveInspector
+        self,
+        data_dir: Path,
+        repository: CatalogManagementRepository,
+        inspector: ArchiveInspector,
     ) -> None:
         self._data_dir = data_dir
         self._repository = repository
@@ -219,14 +289,22 @@ class CatalogScanner:
         with self._status_lock:
             return self._status
 
-    def scan(self) -> ScanReport:
+    def scan(self, library_id: str | None = None) -> ScanReport:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("A catalog scan is already running")
         started = _now_iso()
         previous = self.status
-        self._set_status(replace(previous, running=True, started_at=started))
+        self._set_status(
+            replace(
+                previous,
+                running=True,
+                started_at=started,
+                error=None,
+                library_id=library_id,
+            )
+        )
         try:
-            report = self._scan_once()
+            report = self._scan_once(library_id)
         except Exception as error:
             LOGGER.exception("Catalog scan failed")
             self._set_status(
@@ -236,19 +314,25 @@ class CatalogScanner:
                     started_at=started,
                     completed_at=_now_iso(),
                     error=str(error),
+                    library_id=library_id,
                 )
             )
             raise
         else:
-            self._set_status(_completed_status(previous, started, report))
+            self._set_status(_completed_status(previous, started, report, library_id))
             return report
         finally:
             self._run_lock.release()
 
-    def _scan_once(self) -> ScanReport:
+    def _scan_once(self, library_id: str | None) -> ScanReport:
         if not self._data_dir.is_dir():
             raise FileNotFoundError(f"Data directory does not exist: {self._data_dir}")
-        paths = list(self._discover())
+        if not self._repository.managed_libraries(include_disabled=True):
+            self._repository.initialize_libraries(
+                [entry.name for entry in _directories(self._data_dir)]
+            )
+        libraries = self._libraries_for_scan(library_id)
+        paths = [path for library in libraries for path in self._discover(library)]
         seen: set[str] = set()
         indexed = unchanged = failed = 0
         for path in paths:
@@ -271,30 +355,39 @@ class CatalogScanner:
             except (OSError, UnsafeArchive, zipfile.BadZipFile) as error:
                 failed += 1
                 LOGGER.warning("Skipping %s: %s", relative_path, error)
-        removed = self._repository.remove_publications_except(seen)
+        removed = self._repository.remove_publications_except(seen, library_id)
         return ScanReport(len(paths), indexed, unchanged, removed, failed)
 
-    def _discover(self):
-        for library in _directories(self._data_dir):
-            for category_name in ("comics", "manga"):
-                category = library.path / category_name
-                if not category.is_dir() or category.is_symlink():
+    def _libraries_for_scan(self, library_id: str | None) -> list[ManagedLibrary]:
+        if library_id is None:
+            return self._repository.managed_libraries()
+        library = self._repository.managed_library(library_id)
+        if not library or not library.enabled:
+            raise InvalidLibrary("Managed library not found")
+        return [library]
+
+    def _discover(self, library: ManagedLibrary):
+        root = self._data_dir / library.relative_path
+        if not root.is_dir() or root.is_symlink():
+            LOGGER.warning("Managed library directory is unavailable: %s", root)
+            return
+        for category_name in ("comics", "manga"):
+            category = root / category_name
+            if not category.is_dir() or category.is_symlink():
+                continue
+            for series in _directories(category):
+                try:
+                    entries = list(os.scandir(series.path))
+                except OSError as error:
+                    LOGGER.warning(
+                        "Cannot read series directory %s: %s", series.path, error
+                    )
                     continue
-                for series in _directories(category):
-                    try:
-                        entries = list(os.scandir(series.path))
-                    except OSError as error:
-                        LOGGER.warning(
-                            "Cannot read series directory %s: %s", series.path, error
-                        )
-                        continue
-                    for entry in sorted(
-                        entries, key=lambda item: _natural_key(item.name)
+                for entry in sorted(entries, key=lambda item: _natural_key(item.name)):
+                    if entry.name.casefold().endswith(".cbz") and entry.is_file(
+                        follow_symlinks=False
                     ):
-                        if entry.name.casefold().endswith(".cbz") and entry.is_file(
-                            follow_symlinks=False
-                        ):
-                            yield Path(entry.path)
+                        yield Path(entry.path)
 
     def _set_status(self, status: ScanStatus) -> None:
         with self._status_lock:
@@ -302,7 +395,10 @@ class CatalogScanner:
 
 
 def _completed_status(
-    previous: ScanStatus, started: str, report: ScanReport
+    previous: ScanStatus,
+    started: str,
+    report: ScanReport,
+    library_id: str | None,
 ) -> ScanStatus:
     changed = bool(report.indexed or report.removed)
     return ScanStatus(
@@ -313,6 +409,7 @@ def _completed_status(
         if changed or previous.catalog_modified_at is None
         else previous.catalog_modified_at,
         report=report,
+        library_id=library_id,
     )
 
 

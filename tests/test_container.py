@@ -14,6 +14,7 @@ from fakes import (
     FakeArchives,
     FakeCovers,
     FakePageStore,
+    FakeRestartController,
     FakeScanner,
     page,
     publication,
@@ -22,8 +23,9 @@ from fastapi.testclient import TestClient
 
 from nineveh.app import Container, create_app
 from nineveh.auth import AuthService
-from nineveh.authorization import ReadAllPolicy
-from nineveh.config import Settings
+from nineveh.authorization import AccessService, ReadAllPolicy
+from nineveh.catalog import LibraryService
+from nineveh.config import Settings, SettingsService
 from nineveh.database import SQLiteRepository
 from nineveh.domain import ScannedPublication
 from nineveh.opds import OpdsBuilder
@@ -51,6 +53,10 @@ def fake_container(tmp_path: Path) -> Container:
         thumbnails=FakeCovers(cover),
         page_cache=FakePageStore(),
         opds=OpdsBuilder("Nineveh"),
+        access=AccessService(repository),
+        libraries=LibraryService(settings.data_dir, repository),
+        configuration=SettingsService(settings, repository),
+        restarter=FakeRestartController(enabled=False),
     )
 
 

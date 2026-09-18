@@ -1,3 +1,9 @@
+# Without this, Compose names the project after the directory holding this file
+# -- "docker" -- which is what Docker Desktop and `docker compose ls` display,
+# and which would collide with any other project laid out the same way. Compose
+# lowercases project names, so this is `nineveh`, not `Nineveh`.
+name: nineveh
+
 services:
   nineveh:
     build:
@@ -13,19 +19,13 @@ services:
     environment:
       NINEVEH_DATA_DIR: /data
       NINEVEH_STATE_DIR: /state
-      NINEVEH_TITLE: "${NINEVEH_TITLE:-Nineveh}"
       NINEVEH_PUBLIC_BASE_URL: "${NINEVEH_PUBLIC_BASE_URL:-}"
       NINEVEH_ADMIN_USERNAME: "${NINEVEH_ADMIN_USERNAME:-admin}"
       NINEVEH_ADMIN_PASSWORD: "${NINEVEH_ADMIN_PASSWORD:-}"
       NINEVEH_ADMIN_PASSWORD_FILE: "${NINEVEH_ADMIN_PASSWORD_FILE:-/run/secrets/admin_password.txt}"
       NINEVEH_SECURE_COOKIES: "${NINEVEH_SECURE_COOKIES:-true}"
-      NINEVEH_SCAN_INTERVAL_SECONDS: "${NINEVEH_SCAN_INTERVAL_SECONDS:-900}"
-      NINEVEH_ARCHIVE_CACHE_SIZE: "${NINEVEH_ARCHIVE_CACHE_SIZE:-4}"
-      NINEVEH_THUMBNAIL_CACHE_MB: "${NINEVEH_THUMBNAIL_CACHE_MB:-512}"
-      NINEVEH_PAGE_CACHE_MB: "${NINEVEH_PAGE_CACHE_MB:-1024}"
-      NINEVEH_HASH_WORKERS: "${NINEVEH_HASH_WORKERS:-2}"
-      NINEVEH_EXTRACT_WORKERS: "${NINEVEH_EXTRACT_WORKERS:-2}"
-      NINEVEH_MAX_IMAGE_PIXELS: "${NINEVEH_MAX_IMAGE_PIXELS:-200000000}"
+      NINEVEH_MEMORY_LIMIT: "${NINEVEH_MEMORY_LIMIT:-1g}"
+      NINEVEH_RESTART_ENABLED: "${NINEVEH_RESTART_ENABLED:-true}"
       NINEVEH_FORWARDED_ALLOW_IPS: "${NINEVEH_FORWARDED_ALLOW_IPS:-127.0.0.1}"
     volumes:
       - "${NINEVEH_DATA_PATH:?Set NINEVEH_DATA_PATH in .env}:/data:ro"

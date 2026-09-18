@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
@@ -22,7 +22,17 @@ from .auth import (
     InvalidUserInput,
     LastAdministratorError,
 )
-from .domain import Page, Publication, Session, User
+from .catalog import InvalidLibrary
+from .deployment import memory_limit_text
+from .domain import (
+    AccessGrant,
+    LibraryUsage,
+    ManagedLibrary,
+    Page,
+    Publication,
+    Session,
+    User,
+)
 from .opds import CBZ_MEDIA_TYPE, NAVIGATION_PATH, PUBLICATIONS_PATH
 from .opds import url as opds_url
 
@@ -49,6 +59,24 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     enabled: bool | None = None
     password: str | None = Field(default=None, min_length=12, max_length=1024)
+
+
+class GrantInput(BaseModel):
+    library_id: str
+    category: Literal["comics", "manga"] | None = None
+    series_id: str | None = None
+
+
+class AccessUpdate(BaseModel):
+    grants: list[GrantInput]
+
+
+class LibraryCreate(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=255)
+
+
+class SettingsUpdate(BaseModel):
+    values: dict[str, str]
 
 
 def _container(request: Request) -> Container:
@@ -140,10 +168,11 @@ async def opds_authentication(request: Request) -> dict[str, object]:
 
 @router.get("/opds/v2/catalog.json", response_class=OpdsResponse, tags=["opds"])
 async def opds_catalog(
-    request: Request, _: Annotated[Identity, Depends(authenticated)]
+    request: Request, identity: Annotated[Identity, Depends(authenticated)]
 ) -> dict[str, object]:
     container = _container(request)
-    libraries = await run_in_threadpool(container.repository.libraries)
+    scope = container.authorization.read_scope(identity.user)
+    libraries = await run_in_threadpool(container.repository.libraries, scope)
     return container.opds.root_feed(
         base_url(request), libraries, _catalog_modified(container)
     )
@@ -152,16 +181,17 @@ async def opds_catalog(
 @router.get("/opds/v2/navigation.json", response_class=OpdsResponse, tags=["opds"])
 async def opds_navigation(
     request: Request,
-    _: Annotated[Identity, Depends(authenticated)],
+    identity: Annotated[Identity, Depends(authenticated)],
     library: str,
     category: str | None = None,
 ) -> dict[str, object]:
     container = _container(request)
     root = base_url(request)
+    scope = container.authorization.read_scope(identity.user)
     title, parameters, entries = await (
-        _category_entries(container, root, library)
+        _category_entries(container, root, library, scope)
         if category is None
-        else _series_entries(container, root, library, category)
+        else _series_entries(container, root, library, category, scope)
     )
     return container.opds.navigation_feed(
         root,
@@ -173,9 +203,9 @@ async def opds_navigation(
 
 
 async def _category_entries(
-    container: Container, root: str, library: str
+    container: Container, root: str, library: str, scope
 ) -> NavigationEntries:
-    groups = await run_in_threadpool(container.repository.categories, library)
+    groups = await run_in_threadpool(container.repository.categories, library, scope)
     entries = [
         (
             name,
@@ -188,9 +218,11 @@ async def _category_entries(
 
 
 async def _series_entries(
-    container: Container, root: str, library: str, category: str
+    container: Container, root: str, library: str, category: str, scope
 ) -> NavigationEntries:
-    groups = await run_in_threadpool(container.repository.series, library, category)
+    groups = await run_in_threadpool(
+        container.repository.series, library, category, scope
+    )
     entries = [
         (
             name,
@@ -210,7 +242,7 @@ async def _series_entries(
 @router.get("/opds/v2/publications.json", response_class=OpdsResponse, tags=["opds"])
 async def opds_publications(
     request: Request,
-    _: Annotated[Identity, Depends(authenticated)],
+    identity: Annotated[Identity, Depends(authenticated)],
     library: str | None = None,
     category: str | None = None,
     series: str | None = None,
@@ -218,6 +250,7 @@ async def opds_publications(
     page: int = Query(default=1, ge=1),
 ) -> dict[str, object]:
     container = _container(request)
+    scope = container.authorization.read_scope(identity.user)
     page_size = container.settings.feed_page_size
     items, total = await run_in_threadpool(
         container.repository.publications,
@@ -227,6 +260,7 @@ async def opds_publications(
         query=q,
         limit=page_size,
         offset=(page - 1) * page_size,
+        scope=scope,
     )
     return container.opds.publication_feed(
         base_url(request),
@@ -252,10 +286,17 @@ async def publication_detail(
     return _container(request).opds.publication(base_url(request), publication)
 
 
-@router.api_route(
+# One handler, registered once per verb so each OpenAPI operation carries a
+# unique id -- generators reject a spec that repeats one.
+@router.get(
     "/api/v1/publications/{publication_id}/file",
-    methods=["GET", "HEAD"],
     tags=["publications"],
+    operation_id="downloadPublicationFile",
+)
+@router.head(
+    "/api/v1/publications/{publication_id}/file",
+    tags=["publications"],
+    operation_id="headPublicationFile",
 )
 async def publication_file(
     request: Request,
@@ -427,10 +468,17 @@ def _build_range(
     return archive
 
 
-@router.api_route(
+# One handler, registered once per verb so each OpenAPI operation carries a
+# unique id -- generators reject a spec that repeats one.
+@router.get(
     "/api/v1/publications/{publication_id}/pages/{number}",
-    methods=["GET", "HEAD"],
     tags=["pages"],
+    operation_id="readPublicationPage",
+)
+@router.head(
+    "/api/v1/publications/{publication_id}/pages/{number}",
+    tags=["pages"],
+    operation_id="headPublicationPage",
 )
 async def publication_page(
     request: Request,
@@ -440,11 +488,12 @@ async def publication_page(
     revision: str | None = None,
 ):
     container = _container(request)
-    item = await run_in_threadpool(container.repository.page, publication_id, number)
+    scope = container.authorization.read_scope(identity.user)
+    item = await run_in_threadpool(
+        container.repository.page, publication_id, number, scope
+    )
     if not item:
         raise HTTPException(status_code=404, detail="Page not found")
-    if not container.authorization.can_read(identity.user, item.publication):
-        raise HTTPException(status_code=403, detail="Publication access denied")
     if revision and revision != item.publication.revision:
         raise HTTPException(status_code=409, detail="Publication revision has changed")
     etag = _etag(f"{item.publication.revision}-{item.page.crc:08x}")
@@ -475,10 +524,17 @@ async def publication_page(
     return StreamingResponse(content, media_type=item.page.media_type, headers=headers)
 
 
-@router.api_route(
+# One handler, registered once per verb so each OpenAPI operation carries a
+# unique id -- generators reject a spec that repeats one.
+@router.get(
     "/api/v1/publications/{publication_id}/cover",
-    methods=["GET", "HEAD"],
     tags=["pages"],
+    operation_id="readPublicationCover",
+)
+@router.head(
+    "/api/v1/publications/{publication_id}/cover",
+    tags=["pages"],
+    operation_id="headPublicationCover",
 )
 async def publication_cover(
     request: Request,
@@ -589,6 +645,105 @@ async def update_user(
     return _public_user(user)
 
 
+@router.get("/api/v1/admin/users/{user_id}/access", tags=["administration"])
+async def user_access(
+    request: Request,
+    user_id: str,
+    _: Annotated[Identity, Depends(administrator)],
+) -> dict[str, object]:
+    container = _container(request)
+    user = await run_in_threadpool(container.repository.user_by_id, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    grants = (
+        []
+        if user.is_admin
+        else await run_in_threadpool(container.access.grants, user_id)
+    )
+    return {
+        "unrestricted": user.is_admin,
+        "grants": [_public_grant(item) for item in grants],
+    }
+
+
+@router.put("/api/v1/admin/users/{user_id}/access", tags=["administration"])
+async def update_user_access(
+    request: Request,
+    user_id: str,
+    body: AccessUpdate,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    service = _container(request).access
+    grants = [
+        AccessGrant(user_id, item.library_id, item.category, item.series_id)
+        for item in body.grants
+    ]
+    try:
+        await run_in_threadpool(service.replace, user_id, grants)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    saved = await run_in_threadpool(service.grants, user_id)
+    return {"unrestricted": False, "grants": [_public_grant(item) for item in saved]}
+
+
+@router.get("/api/v1/admin/libraries", tags=["administration"])
+async def admin_libraries(
+    request: Request, _: Annotated[Identity, Depends(administrator)]
+) -> dict[str, object]:
+    container = _container(request)
+    usage = await run_in_threadpool(container.repository.library_usage)
+    available = await run_in_threadpool(container.libraries.available)
+    return {
+        "libraries": [_public_usage(item) for item in usage],
+        "available": available,
+    }
+
+
+@router.post("/api/v1/admin/libraries", status_code=201, tags=["administration"])
+async def add_library(
+    request: Request,
+    body: LibraryCreate,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    if scan_active(request):
+        raise HTTPException(
+            status_code=409, detail="Wait for the catalog scan to finish"
+        )
+    service = _container(request).libraries
+    try:
+        library = await run_in_threadpool(service.add, body.relative_path)
+    except InvalidLibrary as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {
+        **_public_library(library),
+        "scanStarted": request.app.state.start_scan(library.id),
+    }
+
+
+@router.delete("/api/v1/admin/libraries/{library_id}", tags=["administration"])
+async def remove_library(
+    request: Request,
+    library_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    if scan_active(request):
+        raise HTTPException(
+            status_code=409, detail="Wait for the catalog scan to finish"
+        )
+    service = _container(request).libraries
+    try:
+        library = await run_in_threadpool(service.remove, library_id)
+    except InvalidLibrary as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return _public_library(library)
+
+
 @router.post("/api/v1/admin/catalog/scan", status_code=202, tags=["administration"])
 async def scan_catalog(
     request: Request,
@@ -601,16 +756,78 @@ async def scan_catalog(
     return {"status": "accepted"}
 
 
+@router.post(
+    "/api/v1/admin/libraries/{library_id}/scan",
+    status_code=202,
+    tags=["administration"],
+)
+async def scan_library(
+    request: Request,
+    library_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    library = await run_in_threadpool(
+        _container(request).repository.managed_library, library_id
+    )
+    if not library or not library.enabled:
+        raise HTTPException(status_code=404, detail="Managed library not found")
+    if not request.app.state.start_scan(library_id):
+        raise HTTPException(status_code=409, detail="A catalog scan is already running")
+    return {"status": "accepted", "libraryId": library_id}
+
+
+@router.get("/api/v1/admin/settings", tags=["administration"])
+async def admin_settings(
+    request: Request, _: Annotated[Identity, Depends(administrator)]
+) -> dict[str, object]:
+    return await _settings_response(request)
+
+
+@router.put("/api/v1/admin/settings", tags=["administration"])
+async def update_settings(
+    request: Request,
+    body: SettingsUpdate,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    service = _container(request).configuration
+    try:
+        await run_in_threadpool(service.update, body.values)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return await _settings_response(request)
+
+
+@router.post("/api/v1/admin/restart", status_code=202, tags=["administration"])
+async def restart_application(
+    request: Request,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, str]:
+    require_api_csrf(request, identity, csrf_token)
+    restarter = _container(request).restarter
+    if not restarter.enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="Automatic restart is not enabled for this deployment",
+        )
+    restarter.request_restart()
+    return {"status": "restarting"}
+
+
 async def _publication_or_404(
     request: Request, publication_id: str, identity: Identity
 ) -> Publication:
     publication = await run_in_threadpool(
-        _container(request).repository.publication_by_id, publication_id
+        _container(request).repository.publication_by_id,
+        publication_id,
+        _container(request).authorization.read_scope(identity.user),
     )
     if not publication:
         raise HTTPException(status_code=404, detail="Publication not found")
-    if not _container(request).authorization.can_read(identity.user, publication):
-        raise HTTPException(status_code=403, detail="Publication access denied")
     return publication
 
 
@@ -643,6 +860,70 @@ def _public_user(user: User) -> dict[str, object]:
         "enabled": user.enabled,
         "createdAt": user.created_at.isoformat(),
     }
+
+
+def _public_grant(grant: AccessGrant) -> dict[str, str | None]:
+    return {
+        "libraryId": grant.library_id,
+        "category": grant.category,
+        "seriesId": grant.series_id,
+    }
+
+
+def _public_library(library: ManagedLibrary) -> dict[str, object]:
+    return {
+        "id": library.id,
+        "name": library.name,
+        "relativePath": library.relative_path,
+        "enabled": library.enabled,
+        "createdAt": library.created_at.isoformat(),
+    }
+
+
+def _public_usage(usage: LibraryUsage) -> dict[str, object]:
+    return {
+        **_public_library(usage.library),
+        "publicationCount": usage.publication_count,
+        "size": usage.size,
+        "categories": [
+            {
+                "name": category.name,
+                "publicationCount": category.publication_count,
+                "size": category.size,
+                "series": [
+                    {
+                        "id": series.id,
+                        "name": series.name,
+                        "publicationCount": series.publication_count,
+                        "size": series.size,
+                    }
+                    for series in category.series
+                ],
+            }
+            for category in usage.categories
+        ],
+    }
+
+
+async def _settings_response(request: Request) -> dict[str, object]:
+    container = _container(request)
+    saved = await run_in_threadpool(container.configuration.saved)
+    pending = await run_in_threadpool(container.configuration.pending_restart)
+    memory = await run_in_threadpool(
+        memory_limit_text, container.settings.deployment_memory_limit
+    )
+    return {
+        "values": saved.editable_values(),
+        "pendingRestart": pending,
+        "restartEnabled": container.restarter.enabled,
+        "deploymentMemoryLimit": memory,
+    }
+
+
+def scan_active(request: Request) -> bool:
+    """Shared by both HTTP surfaces: library edits must not race a live scan."""
+    task = request.app.state.scan_task
+    return task is not None and not task.done()
 
 
 def _etag(value: str) -> str:

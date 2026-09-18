@@ -1,68 +1,38 @@
-{% extends "base.html" %}
-{% block title %}Administration · {{ service_title }}{% endblock %}
-{% block content %}
-  <div class="heading-row">
-    <div><h1>Administration</h1><p>Manage access and refresh the catalog.</p></div>
-    <a class="button secondary" href="/">Back to library</a>
-  </div>
-
-  <section class="panel">
-    <div class="heading-row">
-      <div>
-        <h2>Catalog scan</h2>
-        {% if scan_status.running %}<p>A scan is currently running.</p>
-        {% elif scan_status.completed_at %}<p>Last completed {{ scan_status.completed_at }}.</p>
-        {% else %}<p>No scan has completed yet.</p>{% endif %}
-      </div>
+{% extends "admin_base.html" %}
+{% block admin_content %}
+  <section class="admin-section">
+    <div class="section-heading">
+      <div><p class="eyebrow">At a glance</p><h2>Overview</h2></div>
       <form method="post" action="/admin/scan">
         <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-        <button type="submit" {% if scan_status.running %}disabled{% endif %}>Scan now</button>
+        <button type="submit" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan all libraries" }}</button>
       </form>
     </div>
-    {% if scan_status.error %}<p class="error-text">{{ scan_status.error }}</p>{% endif %}
-  </section>
-
-  <section class="panel">
-    <h2>Create user</h2>
-    <form method="post" action="/admin/users" class="form-row">
-      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-      <label>Username <input name="username" required minlength="3" maxlength="64"></label>
-      <label>Password <input name="password" type="password" required minlength="12"></label>
-      <label class="checkbox"><input name="is_admin" type="checkbox" value="true"> Administrator</label>
-      <button type="submit">Create</button>
-    </form>
-  </section>
-
-  <section class="panel">
-    <h2>Users</h2>
-    <div class="table-scroll">
-      <table>
-        <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>
-          {% for user in users %}
-            <tr>
-              <td>{{ user.username }}</td>
-              <td>{% if user.is_admin %}Administrator{% else %}Reader{% endif %}</td>
-              <td>{% if user.enabled %}Enabled{% else %}Disabled{% endif %}</td>
-              <td>
-                <form method="post" action="/admin/users/{{ user.id }}/enabled" class="inline-form">
-                  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-                  <input type="hidden" name="enabled" value="{% if user.enabled %}false{% else %}true{% endif %}">
-                  <button class="secondary" type="submit" {% if user.id == session.user.id %}disabled{% endif %}>
-                    {% if user.enabled %}Disable{% else %}Enable{% endif %}
-                  </button>
-                </form>
-                <form method="post" action="/admin/users/{{ user.id }}/password" class="inline-form compact-reset">
-                  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-                  <input name="password" type="password" placeholder="New password" minlength="12" required aria-label="New password for {{ user.username }}">
-                  <button class="secondary" type="submit">Reset</button>
-                </form>
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <div class="metric-grid">
+      <article class="metric"><span>Libraries</span><strong>{{ library_count }}</strong></article>
+      <article class="metric"><span>Publications</span><strong>{{ publication_count }}</strong></article>
+      <article class="metric"><span>Indexed media</span><strong>{{ total_size|gib }}</strong><small>{{ total_size }} bytes</small></article>
+      <article class="metric"><span>Users</span><strong>{{ user_count }}</strong></article>
+    </div>
+    {% if untrusted_proxy %}
+      <div class="notice error proxy-warning" role="alert">
+        <strong>Forwarded headers are being ignored.</strong>
+        A request arrived from <code>{{ untrusted_proxy }}</code> carrying <code>X-Forwarded-Proto</code>, but only <code>{{ trusted_proxies }}</code> is trusted, so Nineveh is treating it as plain HTTP.
+        Set <code>NINEVEH_FORWARDED_ALLOW_IPS={{ untrusted_proxy }}</code> in <code>docker/.env</code> and recreate the container.
+      </div>
+    {% endif %}
+    <div class="status-line {% if scan_status.error %}status-error{% endif %}">
+      <span class="status-dot"></span>
+      {% if scan_status.running %}Scan in progress.
+      {% elif scan_status.error %}Last scan failed: {{ scan_status.error }}
+      {% elif scan_status.completed_at %}Last scan completed {{ scan_status.completed_at }}.
+      {% else %}No scan has completed yet.{% endif %}
     </div>
   </section>
-{% endblock %}
 
+  <div class="admin-shortcuts">
+    <a href="/admin/users"><span>Users</span><strong>Manage accounts and read access →</strong></a>
+    <a href="/admin/libraries"><span>Libraries</span><strong>Review capacity and run scans →</strong></a>
+    <a href="/admin/settings"><span>Settings</span><strong>Configure and restart Nineveh →</strong></a>
+  </div>
+{% endblock %}

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import ClassVar, Protocol
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -21,6 +26,24 @@ def _int_env(name: str, default: int, minimum: int = 0) -> int:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
+    EDITABLE_INTEGERS: ClassVar[dict[str, tuple[int, int]]] = {
+        "session_hours": (1, 24 * 365),
+        "scan_interval_seconds": (0, 30 * 24 * 3600),
+        "page_range_limit": (1, 1_000),
+        "feed_page_size": (1, 200),
+        "archive_cache_size": (0, 128),
+        "thumbnail_cache_mb": (1, 1024 * 1024),
+        "page_cache_mb": (0, 1024 * 1024),
+        "hash_workers": (1, 32),
+        "extract_workers": (1, 32),
+        "max_image_pixels": (1, 1_000_000_000),
+    }
+    # `public_base_url` is deliberately absent: it is a deployment fact owned by
+    # whatever publishes the service, and it gates the browser login origin
+    # check. Editing it from the UI is the one change that can lock an
+    # administrator out of the UI they would need to undo it.
+    EDITABLE_TEXT: ClassVar[set[str]] = {"service_title"}
+
     data_dir: Path = Path("/data")
     state_dir: Path = Path("/state")
     service_title: str = "Nineveh"
@@ -46,6 +69,9 @@ class Settings:
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_password: str | None = None
     bootstrap_admin_password_file: Path | None = None
+    deployment_memory_limit: str | None = None
+    restart_enabled: bool = False
+    forwarded_allow_ips: str = "127.0.0.1"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -79,7 +105,39 @@ class Settings:
             bootstrap_admin_password_file=Path(password_file)
             if password_file
             else None,
+            deployment_memory_limit=os.getenv("NINEVEH_MEMORY_LIMIT") or None,
+            restart_enabled=_bool_env("NINEVEH_RESTART_ENABLED", False),
+            forwarded_allow_ips=os.getenv("NINEVEH_FORWARDED_ALLOW_IPS", "127.0.0.1"),
         )
+
+    def with_overrides(self, values: Mapping[str, str]) -> Settings:
+        unknown = set(values) - (set(self.EDITABLE_INTEGERS) | self.EDITABLE_TEXT)
+        if unknown:
+            raise ValueError(f"Unsupported setting: {min(unknown)}")
+        updates: dict[str, object] = {}
+        for name, value in values.items():
+            if name in self.EDITABLE_TEXT:
+                cleaned = value.strip()
+                if name == "service_title" and not 1 <= len(cleaned) <= 80:
+                    raise ValueError("Service title must be 1-80 characters")
+                updates[name] = cleaned
+                continue
+            try:
+                number = int(value)
+            except ValueError as error:
+                raise ValueError(f"{name} must be an integer") from error
+            minimum, maximum = self.EDITABLE_INTEGERS[name]
+            if not minimum <= number <= maximum:
+                raise ValueError(f"{name} must be between {minimum} and {maximum}")
+            updates[name] = number
+        return replace(self, **updates)
+
+    def editable_values(self) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for name in sorted(set(self.EDITABLE_INTEGERS) | self.EDITABLE_TEXT):
+            value = getattr(self, name)
+            values[name] = "" if value is None else str(value)
+        return values
 
     @property
     def database_path(self) -> Path:
@@ -110,3 +168,64 @@ class Settings:
                 encoding="utf-8"
             ).strip()
         return None
+
+
+class SettingsStore(Protocol):
+    def settings(self) -> dict[str, str]: ...
+
+    def replace_settings(self, values: dict[str, str]) -> None: ...
+
+
+class SettingsService:
+    """Administrator overrides layered over the deployment's own defaults.
+
+    Only a value that actually differs from the deployment default is persisted.
+    That keeps `docker/.env` authoritative for everything an administrator has
+    not deliberately pinned in the UI — saving one field must not silently
+    freeze the other eleven at whatever they happened to be that day.
+    """
+
+    def __init__(self, defaults: Settings, store: SettingsStore) -> None:
+        self._defaults = defaults
+        self._store = store
+        self._startup = defaults
+
+    def activate(self) -> Settings:
+        """Drop overrides that are retired or match the defaults, then settle.
+
+        Retired keys are discarded rather than rejected: a setting that moves
+        back to the environment between releases must not leave an existing
+        database unbootable.
+        """
+        stored = self._store.settings()
+        live = {name: value for name, value in stored.items() if name in self._editable}
+        for retired in sorted(set(stored) - set(live)):
+            LOGGER.info("Discarding override for retired setting %s", retired)
+        wanted = self._divergent(self._defaults.with_overrides(live))
+        if wanted != stored:
+            self._store.replace_settings(wanted)
+        self._startup = self._defaults.with_overrides(wanted)
+        return self._startup
+
+    @property
+    def _editable(self) -> set[str]:
+        return set(Settings.EDITABLE_INTEGERS) | Settings.EDITABLE_TEXT
+
+    def saved(self) -> Settings:
+        return self._defaults.with_overrides(self._store.settings())
+
+    def update(self, values: Mapping[str, str]) -> Settings:
+        candidate = self.saved().with_overrides(values)
+        self._store.replace_settings(self._divergent(candidate))
+        return candidate
+
+    def pending_restart(self) -> bool:
+        return self.saved().editable_values() != self._startup.editable_values()
+
+    def _divergent(self, candidate: Settings) -> dict[str, str]:
+        defaults = self._defaults.editable_values()
+        return {
+            name: value
+            for name, value in candidate.editable_values().items()
+            if value != defaults[name]
+        }

@@ -11,11 +11,17 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .auth import AuthenticationError, InvalidUserInput, LastAdministratorError
-from .domain import Session
-from .http_api import SESSION_COOKIE
+from .catalog import InvalidLibrary
+from .deployment import memory_limit_text
+from .domain import AccessGrant, Session
+from .http_api import SESSION_COOKIE, scan_active
+from .units import gibibytes
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 router = APIRouter(include_in_schema=False)
+
+
+templates.env.filters["gib"] = gibibytes
 
 
 def _container(request: Request):
@@ -37,7 +43,7 @@ async def _require_browser_session(request: Request) -> Session:
 
 async def _require_admin(request: Request) -> Session:
     session = await _require_browser_session(request)
-    if not session.user.is_admin:
+    if not _container(request).authorization.can_administer(session.user):
         raise HTTPException(status_code=403, detail="Administrator access required")
     return session
 
@@ -129,7 +135,7 @@ async def catalog(
         "series": series or "",
         "q": q or "",
     }
-    view = await _catalog_view(container, filters, page)
+    view = await _catalog_view(container, session, filters, page)
     return templates.TemplateResponse(
         request,
         "catalog.html",
@@ -143,9 +149,12 @@ async def catalog(
     )
 
 
-async def _catalog_view(container, filters: dict[str, str], page: int) -> dict:
+async def _catalog_view(
+    container, session: Session, filters: dict[str, str], page: int
+) -> dict:
     """Everything the catalog template needs beyond the request and session."""
     page_size = container.settings.feed_page_size
+    scope = container.authorization.read_scope(session.user)
     publications, total = await run_in_threadpool(
         container.repository.publications,
         library=filters["library"] or None,
@@ -154,11 +163,15 @@ async def _catalog_view(container, filters: dict[str, str], page: int) -> dict:
         query=filters["q"] or None,
         limit=page_size,
         offset=(page - 1) * page_size,
+        scope=scope,
     )
-    libraries = await run_in_threadpool(container.repository.libraries)
+    libraries = await run_in_threadpool(container.repository.libraries, scope)
     series_options = (
         await run_in_threadpool(
-            container.repository.series, filters["library"], filters["category"]
+            container.repository.series,
+            filters["library"],
+            filters["category"],
+            scope,
         )
         if filters["library"] and filters["category"]
         else []
@@ -176,26 +189,101 @@ async def _catalog_view(container, filters: dict[str, str], page: int) -> dict:
 
 
 @router.get("/admin", response_class=HTMLResponse)
-async def admin_page(
+async def admin_overview(
     request: Request,
     message: str | None = Query(default=None, max_length=200),
     error: str | None = Query(default=None, max_length=200),
 ):
-    session = await _require_admin(request)
+    context = await _admin_context(request, "overview", message, error)
+    container = _container(request)
+    usage = await run_in_threadpool(container.repository.library_usage)
+    context.update(
+        {
+            "scan_status": container.scanner.status,
+            "library_count": len(usage),
+            "user_count": await run_in_threadpool(container.repository.user_count),
+            "total_size": sum(item.size for item in usage),
+            "publication_count": sum(item.publication_count for item in usage),
+            "untrusted_proxy": request.app.state.untrusted_proxy,
+            "trusted_proxies": container.settings.forwarded_allow_ips,
+        }
+    )
+    return templates.TemplateResponse(request, "admin.html", context)
+
+
+@router.get("/admin/libraries", response_class=HTMLResponse)
+async def admin_libraries_page(
+    request: Request,
+    message: str | None = Query(default=None, max_length=200),
+    error: str | None = Query(default=None, max_length=200),
+):
+    context = await _admin_context(request, "libraries", message, error)
+    container = _container(request)
+    context["library_usage"] = await run_in_threadpool(
+        container.repository.library_usage
+    )
+    context["scan_status"] = container.scanner.status
+    context["available_libraries"] = await run_in_threadpool(
+        container.libraries.available
+    )
+    return templates.TemplateResponse(request, "admin_libraries.html", context)
+
+
+@router.get("/admin/users", response_class=HTMLResponse)
+async def admin_users_page(
+    request: Request,
+    message: str | None = Query(default=None, max_length=200),
+    error: str | None = Query(default=None, max_length=200),
+):
+    context = await _admin_context(request, "users", message, error)
     container = _container(request)
     users = await run_in_threadpool(container.repository.users)
-    return templates.TemplateResponse(
-        request,
-        "admin.html",
-        {
-            "service_title": container.settings.service_title,
-            "session": session,
-            "users": users,
-            "scan_status": container.scanner.status,
-            "message": message,
-            "error": error,
-        },
+    context["users"] = users
+    context["library_usage"] = await run_in_threadpool(
+        container.repository.library_usage
     )
+    granted = await run_in_threadpool(container.repository.all_access_grants)
+    context["grants"] = {
+        user.id: {_grant_key(item) for item in granted.get(user.id, ())}
+        for user in users
+        if not user.is_admin
+    }
+    return templates.TemplateResponse(request, "admin_users.html", context)
+
+
+@router.get("/admin/settings", response_class=HTMLResponse)
+async def admin_settings_page(
+    request: Request,
+    message: str | None = Query(default=None, max_length=200),
+    error: str | None = Query(default=None, max_length=200),
+):
+    context = await _admin_context(request, "settings", message, error)
+    container = _container(request)
+    context["settings"] = await run_in_threadpool(container.configuration.saved)
+    context["pending_restart"] = await run_in_threadpool(
+        container.configuration.pending_restart
+    )
+    context["restart_enabled"] = container.restarter.enabled
+    context["memory_limit"] = await run_in_threadpool(
+        memory_limit_text, container.settings.deployment_memory_limit
+    )
+    return templates.TemplateResponse(request, "admin_settings.html", context)
+
+
+async def _admin_context(
+    request: Request,
+    section: str,
+    message: str | None,
+    error: str | None,
+) -> dict[str, object]:
+    session = await _require_admin(request)
+    return {
+        "service_title": _container(request).settings.service_title,
+        "session": session,
+        "admin_section": section,
+        "message": message,
+        "error": error,
+    }
 
 
 @router.post("/admin/users")
@@ -221,8 +309,8 @@ async def admin_create_user(
             if isinstance(error, sqlite3.IntegrityError)
             else str(error)
         )
-        return _admin_redirect(error=message)
-    return _admin_redirect(message=f"Created user {username.strip()}.")
+        return _admin_redirect("users", error=message)
+    return _admin_redirect("users", message=f"Created user {username.strip()}.")
 
 
 @router.post("/admin/users/{user_id}/enabled")
@@ -235,17 +323,17 @@ async def admin_enable_user(
     session = await _require_admin(request)
     _verify_csrf(request, session, csrf_token)
     if user_id == session.user.id and not enabled:
-        return _admin_redirect(error="You cannot disable your own account.")
+        return _admin_redirect("users", error="You cannot disable your own account.")
     try:
         user = await run_in_threadpool(
             _container(request).auth.set_enabled, user_id, enabled
         )
     except LastAdministratorError as error:
-        return _admin_redirect(error=str(error))
+        return _admin_redirect("users", error=str(error))
     if not user:
-        return _admin_redirect(error="User not found.")
+        return _admin_redirect("users", error="User not found.")
     state = "enabled" if enabled else "disabled"
-    return _admin_redirect(message=f"{user.username} is now {state}.")
+    return _admin_redirect("users", message=f"{user.username} is now {state}.")
 
 
 @router.post("/admin/users/{user_id}/password")
@@ -262,10 +350,118 @@ async def admin_reset_password(
             _container(request).auth.reset_password, user_id, password
         )
     except InvalidUserInput as error:
-        return _admin_redirect(error=str(error))
+        return _admin_redirect("users", error=str(error))
     if not user:
-        return _admin_redirect(error="User not found.")
-    return _admin_redirect(message=f"Reset the password for {user.username}.")
+        return _admin_redirect("users", error="User not found.")
+    return _admin_redirect("users", message=f"Reset the password for {user.username}.")
+
+
+@router.post("/admin/users/{user_id}/access")
+async def admin_update_access(
+    request: Request,
+    user_id: str,
+):
+    session = await _require_admin(request)
+    form = await request.form()
+    _verify_csrf(request, session, str(form.get("csrf_token", "")))
+    service = _container(request).access
+    try:
+        decoded = [
+            _decode_grant(user_id, str(value)) for value in form.getlist("grant")
+        ]
+        await run_in_threadpool(service.replace, user_id, decoded)
+    except ValueError as error:
+        return _admin_redirect("users", error=str(error))
+    return _admin_redirect("users", message="Reader access updated.")
+
+
+@router.post("/admin/libraries")
+async def admin_add_library(
+    request: Request,
+    relative_path: str = Form(..., max_length=255),
+    csrf_token: str = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    if scan_active(request):
+        return _admin_redirect(
+            "libraries", error="Wait for the catalog scan to finish."
+        )
+    service = _container(request).libraries
+    try:
+        library = await run_in_threadpool(service.add, relative_path)
+    except InvalidLibrary as error:
+        return _admin_redirect("libraries", error=str(error))
+    request.app.state.start_scan(library.id)
+    return _admin_redirect(
+        "libraries", message=f"Added {library.name} and started its first scan."
+    )
+
+
+@router.post("/admin/libraries/{library_id}/remove")
+async def admin_remove_library(
+    request: Request, library_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    if scan_active(request):
+        return _admin_redirect(
+            "libraries", error="Wait for the catalog scan to finish."
+        )
+    service = _container(request).libraries
+    try:
+        library = await run_in_threadpool(service.remove, library_id)
+    except InvalidLibrary as error:
+        return _admin_redirect("libraries", error=str(error))
+    return _admin_redirect(
+        "libraries", message=f"Removed {library.name}; no media files were deleted."
+    )
+
+
+@router.post("/admin/libraries/{library_id}/scan")
+async def admin_scan_library(
+    request: Request, library_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    library = await run_in_threadpool(
+        _container(request).repository.managed_library, library_id
+    )
+    if not library or not library.enabled:
+        return _admin_redirect("libraries", error="Managed library not found.")
+    if not request.app.state.start_scan(library_id):
+        return _admin_redirect("libraries", error="A catalog scan is already running.")
+    return _admin_redirect("libraries", message=f"Started scanning {library.name}.")
+
+
+@router.post("/admin/settings")
+async def admin_update_settings(request: Request):
+    session = await _require_admin(request)
+    form = await request.form()
+    _verify_csrf(request, session, str(form.get("csrf_token", "")))
+    service = _container(request).configuration
+    values = {
+        key: str(form.get(key, ""))
+        for key in _container(request).settings.editable_values()
+    }
+    try:
+        await run_in_threadpool(service.update, values)
+    except ValueError as error:
+        return _admin_redirect("settings", error=str(error))
+    if form.get("action") == "restart":
+        restarter = _container(request).restarter
+        if not restarter.enabled:
+            return _admin_redirect(
+                "settings",
+                error="Settings saved, but automatic restart is not enabled.",
+            )
+        restarter.request_restart()
+        return _admin_redirect(
+            "settings", message="Settings saved. Nineveh is restarting."
+        )
+    return _admin_redirect(
+        "settings", message="Settings saved. Restart Nineveh to apply them."
+    )
 
 
 @router.post("/admin/scan")
@@ -277,14 +473,39 @@ async def admin_scan(request: Request, csrf_token: str = Form(...)):
     return _admin_redirect(message="Catalog scan started.")
 
 
-def _admin_redirect(*, message: str | None = None, error: str | None = None):
+def _admin_redirect(
+    section: str = "overview",
+    *,
+    message: str | None = None,
+    error: str | None = None,
+):
     parameters = {
         key: value
         for key, value in {"message": message, "error": error}.items()
         if value
     }
     suffix = f"?{urlencode(parameters)}" if parameters else ""
-    return RedirectResponse(f"/admin{suffix}", status_code=303)
+    path = "/admin" if section == "overview" else f"/admin/{section}"
+    return RedirectResponse(f"{path}{suffix}", status_code=303)
+
+
+def _decode_grant(user_id: str, value: str) -> AccessGrant:
+    parts = value.split("|")
+    if len(parts) == 2 and parts[0] == "library":
+        return AccessGrant(user_id, parts[1])
+    if len(parts) == 3 and parts[0] == "category":
+        return AccessGrant(user_id, parts[1], parts[2])
+    if len(parts) == 4 and parts[0] == "series":
+        return AccessGrant(user_id, parts[1], parts[2], parts[3])
+    raise ValueError("Invalid access selection")
+
+
+def _grant_key(grant: AccessGrant) -> str:
+    if grant.series_id:
+        return f"series|{grant.library_id}|{grant.category}|{grant.series_id}"
+    if grant.category:
+        return f"category|{grant.library_id}|{grant.category}"
+    return f"library|{grant.library_id}"
 
 
 def _catalog_url(filters: dict[str, str], page: int) -> str:

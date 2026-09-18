@@ -1,0 +1,56 @@
+{% extends "admin_base.html" %}
+{% block admin_content %}
+  <section class="admin-section">
+    <div class="section-heading"><div><p class="eyebrow">Accounts and access</p><h2>Users</h2></div></div>
+    <form method="post" action="/admin/users" class="create-user-form">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <label>Username <input name="username" autocomplete="off" required minlength="3" maxlength="64"></label>
+      <label>Temporary password <input name="password" type="password" autocomplete="new-password" required minlength="12"></label>
+      <label class="checkbox"><input name="is_admin" type="checkbox" value="true"> Administrator</label>
+      <button type="submit">Create account</button>
+    </form>
+    <div class="user-list">
+      {% for user in users %}
+        <article class="user-card">
+          <div class="user-summary">
+            <div class="avatar" aria-hidden="true">{{ user.username[:1]|upper }}</div>
+            <div><h3>{{ user.username }}</h3><p>{{ "Administrator" if user.is_admin else "Reader" }} · {{ "Enabled" if user.enabled else "Disabled" }}</p></div>
+            <form class="user-actions" method="post" action="/admin/users/{{ user.id }}/enabled"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="enabled" value="{{ 'false' if user.enabled else 'true' }}"><button class="secondary" type="submit" {% if user.id == session.user.id %}disabled{% endif %}>{{ "Disable" if user.enabled else "Enable" }}</button></form>
+          </div>
+          <details>
+            <summary>Manage account</summary>
+            <div class="user-editor">
+              <form method="post" action="/admin/users/{{ user.id }}/password" class="inline-form"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><label>New password <input name="password" type="password" autocomplete="new-password" minlength="12" required></label><button class="secondary" type="submit">Reset password</button></form>
+              {% if user.is_admin %}<p class="access-note">Administrators have access to every managed library.</p>
+              {% else %}
+                <form method="post" action="/admin/users/{{ user.id }}/access" class="access-form">
+                  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+                  <div class="access-heading"><strong>Read access</strong><span>{{ grants[user.id]|length }} explicit grant{% if grants[user.id]|length != 1 %}s{% endif %}</span></div>
+                  {% for usage in library_usage %}
+                    {% set library_key = 'library|' ~ usage.library.id %}
+                    <fieldset class="permission-library">
+                      <label class="permission-parent"><input type="checkbox" name="grant" value="{{ library_key }}" data-permission="library" {% if library_key in grants[user.id] %}checked{% endif %}> <span>{{ usage.library.name }}<small>Entire library</small></span></label>
+                      {% for category in usage.categories %}
+                        {% set category_key = 'category|' ~ usage.library.id ~ '|' ~ category.name %}
+                        <div class="permission-branch">
+                          <label><input type="checkbox" name="grant" value="{{ category_key }}" data-permission="category" {% if category_key in grants[user.id] %}checked{% endif %}> <span>{{ category.name|title }}<small>Entire content type</small></span></label>
+                          <div class="permission-series">
+                            {% for item in category.series %}
+                              {% set series_key = 'series|' ~ usage.library.id ~ '|' ~ category.name ~ '|' ~ item.id %}
+                              <label><input type="checkbox" name="grant" value="{{ series_key }}" data-permission="series" {% if series_key in grants[user.id] %}checked{% endif %}> {{ item.name }}</label>
+                            {% endfor %}
+                          </div>
+                        </div>
+                      {% endfor %}
+                    </fieldset>
+                  {% endfor %}
+                  <button type="submit">Save access</button>
+                </form>
+              {% endif %}
+            </div>
+          </details>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}

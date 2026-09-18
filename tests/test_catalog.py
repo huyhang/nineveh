@@ -194,3 +194,23 @@ def test_two_scans_cannot_run_at_once(library):
             scanner.scan()
     finally:
         scanner._run_lock.release()
+
+
+def test_library_scan_only_reconciles_that_library(library):
+    settings, first_archive = library
+    second = settings.data_dir / "Second Library" / "manga" / "Series" / "One.cbz"
+    second.parent.mkdir(parents=True)
+    write_cbz(second)
+    scanner, repository = _scanner(settings)
+    scanner.scan()
+    first = next(
+        item for item in repository.managed_libraries() if item.name == "Main Library"
+    )
+
+    first_archive.unlink()
+    report = scanner.scan(first.id)
+
+    assert report.removed == 1
+    remaining, total = repository.publications(limit=10)
+    assert total == 1
+    assert remaining[0].library == "Second Library"

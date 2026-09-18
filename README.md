@@ -9,7 +9,10 @@ The service is designed for a small Docker host such as a Synology NAS. Media re
 - OPDS 2.0 catalog and publication feeds
 - HTTP Basic authentication for OPDS clients
 - Secure browser sessions and a responsive catalog
-- Local users managed through an administrator page or JSON API
+- Local users and hierarchical read access managed through an administrator page or JSON API
+- Explicitly managed libraries with per-library scans and indexed-size reporting
+- Persisted application settings with a Docker-supervised restart action
+- System, light, paper, and dark display themes with a persistent header toggle
 - Original CBZ downloads with byte-range and cache support
 - Ordered page manifests and individually streamed page images
 - Contiguous page ranges downloadable as a standalone CBZ
@@ -76,8 +79,14 @@ All catalog and content endpoints require authentication.
 | `/api/v1/publications/{id}/pages?start=1&end=20` | Ordered page-range manifest |
 | `/api/v1/publications/{id}/pages/{number}` | Original page image |
 | `/api/v1/publications/{id}/range?start=1&end=20` | That page range as a standalone CBZ |
+| `/api/v1/admin/libraries` | Managed libraries, indexed capacity, and available `/data` directories |
+| `/api/v1/admin/users/{id}/access` | Library, content-type, and series read grants |
+| `/api/v1/admin/settings`, `/api/v1/admin/restart` | Persisted application settings and restart control |
 | `/api/v1/health/live`, `/api/v1/health/ready` | Liveness and readiness with scan status |
 | `/docs` | Interactive OpenAPI documentation |
+| `/openapi.json` | The same contract this service serves, committed at [`docs/openapi.json`](docs/openapi.json) |
+
+The committed specification is generated with `python scripts/export-openapi.py`. `tests/test_contract.py` compares it against the live route table, so a route added, removed, or renamed without regenerating the file fails the build rather than silently shipping a stale contract.
 
 The page manifest and page-range download are Nineveh extensions, advertised from each OPDS publication under the `urn:nineveh:rel:page-manifest` and `urn:nineveh:rel:page-range` relations. Standard OPDS readers can use the full-CBZ acquisition link and ignore both; clients aware of the extensions can fetch individual pages or save an excerpt. A range may span at most `NINEVEH_PAGE_RANGE_LIMIT` pages and is generated on demand, never cached.
 
@@ -90,31 +99,38 @@ The page manifest and page-range download are Nineveh extensions, advertised fro
 | `NINEVEH_ADMIN_USERNAME` | `admin` | First administrator username |
 | `NINEVEH_ADMIN_PASSWORD_FILE` | — | File containing the first administrator password |
 | `NINEVEH_ADMIN_PASSWORD` | — | Less secure alternative to the password file |
-| `NINEVEH_PUBLIC_BASE_URL` | request URL | Public HTTPS origin used in feed links |
 | `NINEVEH_SECURE_COOKIES` | `true` | Require HTTPS for browser session cookies |
-| `NINEVEH_SESSION_HOURS` | `168` | Browser session lifetime |
-| `NINEVEH_SCAN_INTERVAL_SECONDS` | `900` | Rescan interval; `0` disables scheduled scans |
-| `NINEVEH_FEED_PAGE_SIZE` | `24` | Publications returned per feed/page |
-| `NINEVEH_PAGE_RANGE_LIMIT` | `100` | Maximum pages in one manifest request |
-| `NINEVEH_ARCHIVE_CACHE_SIZE` | `4` | Recently open archive indexes retained in memory |
-| `NINEVEH_THUMBNAIL_CACHE_MB` | `512` | Maximum generated-thumbnail storage |
-| `NINEVEH_PAGE_CACHE_MB` | `1024` | Maximum extracted-page cache; `0` disables it |
-| `NINEVEH_HASH_WORKERS` | `2` | Concurrent password verifications (~19 MiB each) |
-| `NINEVEH_EXTRACT_WORKERS` | `2` | Concurrent page extractions into the cache |
-| `NINEVEH_MAX_IMAGE_PIXELS` | `200000000` | Largest decodable cover; ~3 bytes per pixel |
+| `NINEVEH_PUBLIC_BASE_URL` | request URL | Origin stamped into OPDS links and accepted for browser sign-in |
 | `NINEVEH_MEMORY_LIMIT` | `1g` | Container memory ceiling (Compose only) |
+| `NINEVEH_RESTART_ENABLED` | `false` | Permit the admin UI to terminate gracefully for supervisor restart |
 | `NINEVEH_HOST` | `0.0.0.0` | Listen address |
 | `NINEVEH_PORT` | `8080` | Listen port |
 | `NINEVEH_LOG_LEVEL` | `INFO` | Level for the JSON stdout log |
 | `NINEVEH_FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxies whose `X-Forwarded-*` headers are trusted |
 
+Getting that last one wrong used to fail silently. Nineveh now warns at startup when its own container gateway is not in the trusted list, and raises a banner on **Admin → Overview** — naming the peer address and the exact variable to set — the first time it discards a real proxy's `X-Forwarded-Proto`. It reports; it never widens the trust list itself, because finding the address in front of the container does not establish that it is your proxy.
+
 Archive safety limits can also be adjusted through the variables defined in [`config.py`](src/nineveh/config.py).
+
+### Settings owned by the admin UI
+
+Eleven settings are edited at **Admin → Settings** rather than in the environment: service title, session lifetime, scan interval, feed page size, page-range limit, archive cache size, thumbnail and page cache budgets, the two worker ceilings, and the image-pixel ceiling. They are deliberately absent from `docker/.env.example` — a value with two owners is a value that eventually disagrees with itself.
+
+`NINEVEH_PUBLIC_BASE_URL` stays deployment-owned and is shown read-only on the settings page. It decides which origin may sign in, so an administrator who mistyped it in the UI would be locked out of the page needed to correct it. An override left in the database by an older release is discarded at startup rather than rejected, so retiring a setting never leaves an existing install unbootable.
+
+Each has the same environment variable as before (`NINEVEH_FEED_PAGE_SIZE` and friends) and still reads from it if you set one. Precedence is narrow on purpose: a saved value is stored **only while it differs from the environment**, so editing one field in the UI never freezes the other eleven. Set a variable in `docker/.env` and it takes effect on the next `up -d` for every setting an administrator has not deliberately pinned; pin one in the UI and it wins until you clear it by saving the environment's value back.
 
 Nineveh's resident set is roughly 80–120 MB and does not grow with library size; the archive, thumbnail, and page caches are bounded on disk under `/state`, not in memory. The two worker ceilings and `NINEVEH_MAX_IMAGE_PIXELS` are what actually bound peak RAM. See [the deployment guide](docker/synology-deployment.md#resource-tuning) for sizing.
 
 `/state` holds four things: `nineveh.sqlite3`, `thumbnails/`, `page-cache/`, and `ranges/`. Only the database needs backing up; the other three are regenerated on demand. Generated range archives are deleted as soon as their response completes, and any left behind by an unclean shutdown are cleared at startup.
 
-The bootstrap password is used only when `/state` contains no users. Afterwards, users and password resets are managed at `/admin`.
+The bootstrap password is used only when `/state` contains no users. Afterwards, users, access grants, libraries, scans, and application settings are managed at `/admin`. New readers have no catalog access until an administrator grants it. Existing readers are granted access to their currently indexed libraries when upgrading from the original schema.
+
+On first startup, Nineveh registers each top-level directory under `/data`. Later directories must be added explicitly from the admin UI. Removing a library clears its index and grants but never changes the read-only media directory. Reported capacity is the sum of indexed CBZ file sizes.
+
+Docker-level options such as `NINEVEH_MEMORY_LIMIT` remain deployment-managed. Compose enables the UI restart action; it gracefully exits the application and the `unless-stopped` policy restarts the same container with saved application settings. A Docker restart does not apply edits to Compose-level resource limits; recreate the service after changing those values. The settings page reports the ceiling it reads from the container's own cgroup, so it shows what is actually enforced rather than what was declared.
+
+Upgrades run in place and are replayable: a v1 database gains the managed-library, series, grant, and settings tables on first start, and an upgrade interrupted partway through resumes on the next start rather than leaving the database unopenable.
 
 ## Local development
 

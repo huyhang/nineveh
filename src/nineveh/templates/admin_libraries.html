@@ -1,0 +1,40 @@
+{% extends "admin_base.html" %}
+{% block admin_content %}
+  <section class="admin-section">
+    <div class="section-heading">
+      <div><p class="eyebrow">Catalog sources</p><h2>Libraries</h2></div>
+      {% if available_libraries %}
+        <form method="post" action="/admin/libraries" class="inline-form add-library-form">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <label><span class="sr-only">Available directory</span><select name="relative_path" required><option value="">Choose a directory…</option>{% for name in available_libraries %}<option value="{{ name }}">{{ name }}</option>{% endfor %}</select></label>
+          <button type="submit" {% if scan_status.running %}disabled{% endif %}>Add library</button>
+        </form>
+      {% else %}
+        <p class="muted add-library-hint">Every directory under the media root is already managed. Create another folder there to add one.</p>
+      {% endif %}
+    </div>
+    {% if library_usage %}
+      <div class="library-list">
+        {% for usage in library_usage %}
+          <details class="library-card" open>
+            <summary><span><strong>{{ usage.library.name }}</strong><small>{{ usage.publication_count }} publications</small></span><span class="size-value" title="{{ usage.size }} bytes">{{ usage.size|gib }}</span></summary>
+            <div class="library-body">
+              {% if usage.categories %}
+                {% for category in usage.categories %}
+                  <div class="category-row"><div><strong>{{ category.name|title }}</strong><small>{{ category.publication_count }} publications</small></div><span title="{{ category.size }} bytes">{{ category.size|gib }}</span></div>
+                  <div class="series-list">
+                    {% for item in category.series %}<div><span>{{ item.name }}</span><small>{{ item.publication_count }} · {{ item.size|gib }}</small></div>{% endfor %}
+                  </div>
+                {% endfor %}
+              {% else %}<p class="muted">No indexed publications yet.</p>{% endif %}
+              <div class="card-actions">
+                <form method="post" action="/admin/libraries/{{ usage.library.id }}/scan"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit" {% if scan_status.running %}disabled{% endif %}>Scan library</button></form>
+                <form method="post" action="/admin/libraries/{{ usage.library.id }}/remove" data-confirm="Remove {{ usage.library.name }} from Nineveh? Media files will not be deleted."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit" {% if scan_status.running %}disabled{% endif %}>Remove</button></form>
+              </div>
+            </div>
+          </details>
+        {% endfor %}
+      </div>
+    {% else %}<div class="empty-state"><h3>No managed libraries</h3><p>Add an available directory to begin indexing it.</p></div>{% endif %}
+  </section>
+{% endblock %}

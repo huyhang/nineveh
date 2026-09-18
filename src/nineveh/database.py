@@ -8,9 +8,21 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .domain import Page, Publication, PublicationPage, ScannedPublication, User
+from .domain import (
+    AccessGrant,
+    CategoryUsage,
+    LibraryUsage,
+    ManagedLibrary,
+    Page,
+    Publication,
+    PublicationPage,
+    ReadScope,
+    ScannedPublication,
+    SeriesUsage,
+    User,
+)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -30,6 +42,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS managed_libraries (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    relative_path TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS catalog_series (
+    id TEXT PRIMARY KEY,
+    library_id TEXT NOT NULL REFERENCES managed_libraries(id) ON DELETE CASCADE,
+    category TEXT NOT NULL COLLATE NOCASE,
+    name TEXT NOT NULL COLLATE NOCASE,
+    UNIQUE(library_id, category, name)
+);
+
 CREATE TABLE IF NOT EXISTS publications (
     id TEXT PRIMARY KEY,
     relative_path TEXT NOT NULL UNIQUE,
@@ -45,7 +73,9 @@ CREATE TABLE IF NOT EXISTS publications (
     size INTEGER NOT NULL,
     revision TEXT NOT NULL,
     page_count INTEGER NOT NULL,
-    cover_page INTEGER NOT NULL DEFAULT 1
+    cover_page INTEGER NOT NULL DEFAULT 1,
+    library_id TEXT REFERENCES managed_libraries(id),
+    series_id TEXT REFERENCES catalog_series(id)
 );
 CREATE INDEX IF NOT EXISTS publications_hierarchy
     ON publications(library, category, series, title);
@@ -62,6 +92,34 @@ CREATE TABLE IF NOT EXISTS pages (
     height INTEGER,
     PRIMARY KEY(publication_id, number)
 );
+
+CREATE TABLE IF NOT EXISTS access_grants (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    library_id TEXT NOT NULL REFERENCES managed_libraries(id) ON DELETE CASCADE,
+    category TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+    series_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(user_id, library_id, category, series_id),
+    CHECK(category IN ('', 'comics', 'manga')),
+    CHECK(series_id = '' OR category != '')
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS application_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+# Applied after `SCHEMA`, because a v1 database only grows the columns it indexes
+# once `_ensure_scope_columns` has added them.
+SCOPE_INDEX = """
+CREATE INDEX IF NOT EXISTS publications_scope
+    ON publications(library_id, category, series_id);
 """
 
 
@@ -95,12 +153,320 @@ class SQLiteRepository:
                     f"Database schema version {version} is newer than this Nineveh release"
                 )
             connection.execute("PRAGMA journal_mode = WAL")
+            # Every statement below is replayable. `executescript` commits as it
+            # goes, so an upgrade interrupted before `user_version` is bumped has
+            # to survive being run again on the next start rather than wedging
+            # the database on "table already exists".
             connection.executescript(SCHEMA)
+            self._ensure_scope_columns(connection)
+            connection.executescript(SCOPE_INDEX)
+            if 0 < version < SCHEMA_VERSION:
+                self._backfill_scope(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    @staticmethod
+    def _ensure_scope_columns(connection: sqlite3.Connection) -> None:
+        """v1 publications predate the library and series identity columns."""
+        present = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(publications)").fetchall()
+        }
+        if "library_id" not in present:
+            connection.execute(
+                "ALTER TABLE publications "
+                "ADD COLUMN library_id TEXT REFERENCES managed_libraries(id)"
+            )
+        if "series_id" not in present:
+            connection.execute(
+                "ALTER TABLE publications "
+                "ADD COLUMN series_id TEXT REFERENCES catalog_series(id)"
+            )
+
+    @staticmethod
+    def _backfill_scope(connection: sqlite3.Connection) -> None:
+        """Give pre-v2 rows their identities, preserving existing reader access."""
+        now = _now_iso()
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO managed_libraries(
+                id, name, relative_path, enabled, created_at
+            ) VALUES (?, ?, ?, 1, ?)
+            """,
+            [
+                (str(uuid.uuid4()), row["library"], row["library"], now)
+                for row in connection.execute(
+                    "SELECT DISTINCT library FROM publications WHERE library_id IS NULL"
+                ).fetchall()
+            ],
+        )
+        connection.execute(
+            """
+            UPDATE publications SET library_id = (
+                SELECT id FROM managed_libraries
+                WHERE managed_libraries.name = publications.library COLLATE NOCASE
+            ) WHERE library_id IS NULL
+            """
+        )
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO catalog_series(id, library_id, category, name)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (str(uuid.uuid4()), row["library_id"], row["category"], row["series"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT library_id, category, series FROM publications
+                    WHERE series_id IS NULL AND library_id IS NOT NULL
+                    """
+                ).fetchall()
+            ],
+        )
+        connection.execute(
+            """
+            UPDATE publications SET series_id = (
+                SELECT id FROM catalog_series
+                WHERE catalog_series.library_id = publications.library_id
+                  AND catalog_series.category = publications.category COLLATE NOCASE
+                  AND catalog_series.name = publications.series COLLATE NOCASE
+            ) WHERE series_id IS NULL
+            """
+        )
+        # Seeding readers happens exactly once. The marker is what makes that
+        # true even if the upgrade is replayed, and it stops a later replay from
+        # handing back access an administrator has since revoked.
+        seeded = connection.execute(
+            "SELECT 1 FROM application_metadata WHERE key = 'libraries_initialized'"
+        ).fetchone()
+        if seeded:
+            return
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO access_grants(user_id, library_id, category, series_id)
+            SELECT users.id, managed_libraries.id, '', ''
+            FROM users CROSS JOIN managed_libraries
+            WHERE users.is_admin = 0
+            """
+        )
+        connection.execute(
+            "INSERT INTO application_metadata(key, value)"
+            " VALUES ('libraries_initialized', '1')"
+        )
 
     def ping(self) -> bool:
         with self._connect() as connection:
             return connection.execute("SELECT 1").fetchone()[0] == 1
+
+    def initialize_libraries(self, relative_paths: list[str]) -> None:
+        """Register the initial data-root children once, preserving later removals."""
+        with self._connect() as connection:
+            initialized = connection.execute(
+                "SELECT 1 FROM application_metadata WHERE key = 'libraries_initialized'"
+            ).fetchone()
+            if initialized:
+                return
+            now = _now_iso()
+            connection.executemany(
+                """
+                INSERT INTO managed_libraries(id, name, relative_path, enabled, created_at)
+                VALUES (?, ?, ?, 1, ?)
+                """,
+                [(str(uuid.uuid4()), path, path, now) for path in relative_paths],
+            )
+            connection.execute(
+                """
+                INSERT INTO application_metadata(key, value)
+                VALUES ('libraries_initialized', '1')
+                """
+            )
+
+    def managed_libraries(
+        self, *, include_disabled: bool = False
+    ) -> list[ManagedLibrary]:
+        where = "" if include_disabled else " WHERE enabled = 1"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM managed_libraries{where} ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+        return [self._library(row) for row in rows]
+
+    def managed_library(self, library_id: str) -> ManagedLibrary | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM managed_libraries WHERE id = ?", (library_id,)
+            ).fetchone()
+        return self._library(row) if row else None
+
+    def add_library(self, relative_path: str) -> ManagedLibrary:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM managed_libraries
+                WHERE relative_path = ? COLLATE NOCASE
+                """,
+                (relative_path,),
+            ).fetchone()
+            if row:
+                connection.execute(
+                    "UPDATE managed_libraries SET enabled = 1 WHERE id = ?",
+                    (row["id"],),
+                )
+                library_id = row["id"]
+            else:
+                library_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO managed_libraries(
+                        id, name, relative_path, enabled, created_at
+                    ) VALUES (?, ?, ?, 1, ?)
+                    """,
+                    (library_id, relative_path, relative_path, _now_iso()),
+                )
+        library = self.managed_library(library_id)
+        if library is None:
+            raise RuntimeError(f"Managed library disappeared during add: {library_id}")
+        return library
+
+    def remove_library(self, library_id: str) -> ManagedLibrary | None:
+        library = self.managed_library(library_id)
+        if not library or not library.enabled:
+            return None
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE managed_libraries SET enabled = 0 WHERE id = ?", (library_id,)
+            )
+            connection.execute(
+                "DELETE FROM access_grants WHERE library_id = ?", (library_id,)
+            )
+            connection.execute(
+                "DELETE FROM publications WHERE library_id = ?", (library_id,)
+            )
+        return self.managed_library(library_id)
+
+    def library_usage(self) -> list[LibraryUsage]:
+        """Capacity for every managed library, aggregated in a single pass."""
+        libraries = self.managed_libraries()
+        if not libraries:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT publications.library_id AS library_id, catalog_series.id AS id,
+                       publications.category AS category,
+                       publications.series AS series,
+                       COUNT(publications.id) AS item_count,
+                       COALESCE(SUM(publications.size), 0) AS total_size
+                FROM publications
+                JOIN catalog_series ON catalog_series.id = publications.series_id
+                GROUP BY publications.library_id, catalog_series.id
+                ORDER BY publications.category COLLATE NOCASE,
+                         publications.series COLLATE NOCASE
+                """
+            ).fetchall()
+        grouped: dict[str, dict[str, list[SeriesUsage]]] = {}
+        for row in rows:
+            by_category = grouped.setdefault(row["library_id"], {})
+            by_category.setdefault(row["category"], []).append(
+                SeriesUsage(
+                    id=row["id"],
+                    name=row["series"],
+                    publication_count=row["item_count"],
+                    size=row["total_size"],
+                )
+            )
+        return [
+            _library_usage(library, grouped.get(library.id, {}))
+            for library in libraries
+        ]
+
+    def all_access_grants(self) -> dict[str, list[AccessGrant]]:
+        """Every grant, keyed by user, for the administration console."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id, library_id, category, series_id
+                FROM access_grants
+                ORDER BY user_id, library_id, category, series_id
+                """
+            ).fetchall()
+        grouped: dict[str, list[AccessGrant]] = {}
+        for row in rows:
+            grouped.setdefault(row["user_id"], []).append(_access_grant(row))
+        return grouped
+
+    def access_grants(self, user_id: str) -> list[AccessGrant]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id, library_id, category, series_id
+                FROM access_grants WHERE user_id = ?
+                ORDER BY library_id, category, series_id
+                """,
+                (user_id,),
+            ).fetchall()
+        return [_access_grant(row) for row in rows]
+
+    def replace_access_grants(self, user_id: str, grants: list[AccessGrant]) -> None:
+        with self._connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM users WHERE id = ?", (user_id,)
+            ).fetchone():
+                raise ValueError("User not found")
+            for grant in grants:
+                self._validate_grant(connection, grant)
+            connection.execute(
+                "DELETE FROM access_grants WHERE user_id = ?", (user_id,)
+            )
+            connection.executemany(
+                """
+                INSERT INTO access_grants(user_id, library_id, category, series_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (
+                        user_id,
+                        grant.library_id,
+                        grant.category or "",
+                        grant.series_id or "",
+                    )
+                    for grant in grants
+                ],
+            )
+
+    @staticmethod
+    def _validate_grant(connection: sqlite3.Connection, grant: AccessGrant) -> None:
+        library = connection.execute(
+            "SELECT 1 FROM managed_libraries WHERE id = ? AND enabled = 1",
+            (grant.library_id,),
+        ).fetchone()
+        if not library:
+            raise ValueError("Library not found")
+        if grant.category not in {None, "comics", "manga"}:
+            raise ValueError("Content type must be comics or manga")
+        if grant.series_id:
+            series = connection.execute(
+                """
+                SELECT 1 FROM catalog_series
+                WHERE id = ? AND library_id = ? AND category = ? COLLATE NOCASE
+                """,
+                (grant.series_id, grant.library_id, grant.category),
+            ).fetchone()
+            if not series:
+                raise ValueError("Series not found in the selected content type")
+
+    def settings(self) -> dict[str, str]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT key, value FROM app_settings").fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
+    def replace_settings(self, values: dict[str, str]) -> None:
+        """The stored set *is* the override set, so absent keys fall back."""
+        with self._connect() as connection:
+            connection.execute("DELETE FROM app_settings")
+            connection.executemany(
+                "INSERT INTO app_settings(key, value, updated_at) VALUES (?, ?, ?)",
+                [(key, value, _now_iso()) for key, value in values.items()],
+            )
 
     @staticmethod
     def _user(row: sqlite3.Row) -> User:
@@ -131,6 +497,18 @@ class SQLiteRepository:
             revision=row["revision"],
             page_count=row["page_count"],
             cover_page=row["cover_page"],
+            library_id=row["library_id"],
+            series_id=row["series_id"],
+        )
+
+    @staticmethod
+    def _library(row: sqlite3.Row) -> ManagedLibrary:
+        return ManagedLibrary(
+            id=row["id"],
+            name=row["name"],
+            relative_path=row["relative_path"],
+            enabled=bool(row["enabled"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
         )
 
     def user_count(self) -> int:
@@ -239,10 +617,14 @@ class SQLiteRepository:
                 "DELETE FROM sessions WHERE token_hash = ?", (token_hash,)
             )
 
-    def publication_by_id(self, publication_id: str) -> Publication | None:
+    def publication_by_id(
+        self, publication_id: str, scope: ReadScope | None = None
+    ) -> Publication | None:
+        predicate, parameters = _scope_predicate(scope)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM publications WHERE id = ?", (publication_id,)
+                f"SELECT * FROM publications WHERE id = ? AND ({predicate})",
+                (publication_id, *parameters),
             ).fetchone()
         return self._publication(row) if row else None
 
@@ -253,8 +635,10 @@ class SQLiteRepository:
             ).fetchone()
         return self._publication(row) if row else None
 
-    def page(self, publication_id: str, number: int) -> PublicationPage | None:
-        publication = self.publication_by_id(publication_id)
+    def page(
+        self, publication_id: str, number: int, scope: ReadScope | None = None
+    ) -> PublicationPage | None:
+        publication = self.publication_by_id(publication_id, scope)
         if not publication:
             return None
         with self._connect() as connection:
@@ -308,18 +692,23 @@ class SQLiteRepository:
 
     @staticmethod
     def _write_publication(connection: sqlite3.Connection, item: Publication) -> None:
+        library_id, series_id = SQLiteRepository._ensure_catalog_hierarchy(
+            connection, item
+        )
         connection.execute(
             """
                 INSERT INTO publications(
                     id, relative_path, library, category, series, filename, title, number,
-                    description, authors_json, modified_ns, size, revision, page_count, cover_page
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    description, authors_json, modified_ns, size, revision, page_count,
+                    cover_page, library_id, series_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relative_path) DO UPDATE SET
                     library=excluded.library, category=excluded.category, series=excluded.series,
                     filename=excluded.filename, title=excluded.title, number=excluded.number,
                     description=excluded.description, authors_json=excluded.authors_json,
                     modified_ns=excluded.modified_ns, size=excluded.size, revision=excluded.revision,
-                    page_count=excluded.page_count, cover_page=excluded.cover_page
+                    page_count=excluded.page_count, cover_page=excluded.cover_page,
+                    library_id=excluded.library_id, series_id=excluded.series_id
                 """,
             (
                 item.id,
@@ -337,8 +726,54 @@ class SQLiteRepository:
                 item.revision,
                 item.page_count,
                 item.cover_page,
+                library_id,
+                series_id,
             ),
         )
+
+    @staticmethod
+    def _ensure_catalog_hierarchy(
+        connection: sqlite3.Connection, item: Publication
+    ) -> tuple[str, str]:
+        library_id = item.library_id
+        if not library_id:
+            row = connection.execute(
+                "SELECT id FROM managed_libraries WHERE name = ? COLLATE NOCASE",
+                (item.library,),
+            ).fetchone()
+            if row:
+                library_id = row["id"]
+            else:
+                library_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO managed_libraries(id, name, relative_path, enabled, created_at)
+                    VALUES (?, ?, ?, 1, ?)
+                    """,
+                    (library_id, item.library, item.library, _now_iso()),
+                )
+        series_id = item.series_id
+        if not series_id:
+            row = connection.execute(
+                """
+                SELECT id FROM catalog_series
+                WHERE library_id = ? AND category = ? COLLATE NOCASE
+                    AND name = ? COLLATE NOCASE
+                """,
+                (library_id, item.category, item.series),
+            ).fetchone()
+            if row:
+                series_id = row["id"]
+            else:
+                series_id = str(uuid.uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO catalog_series(id, library_id, category, name)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (series_id, library_id, item.category, item.series),
+                )
+        return library_id, series_id
 
     @staticmethod
     def _replace_pages(
@@ -372,7 +807,9 @@ class SQLiteRepository:
             ],
         )
 
-    def remove_publications_except(self, relative_paths: set[str]) -> int:
+    def remove_publications_except(
+        self, relative_paths: set[str], library_id: str | None = None
+    ) -> int:
         with self._connect() as connection:
             connection.execute("CREATE TEMP TABLE seen_paths(path TEXT PRIMARY KEY)")
             connection.executemany(
@@ -381,28 +818,43 @@ class SQLiteRepository:
             )
             # `cursor.rowcount` counts only rows this statement deleted; using the
             # connection's `total_changes` would also count the cascaded page rows.
+            library_clause = " AND library_id = ?" if library_id else ""
+            parameters = (library_id,) if library_id else ()
             cursor = connection.execute(
-                "DELETE FROM publications WHERE relative_path NOT IN (SELECT path FROM seen_paths)"
+                "DELETE FROM publications "
+                "WHERE relative_path NOT IN (SELECT path FROM seen_paths)"
+                f"{library_clause}",
+                parameters,
             )
             return cursor.rowcount
 
-    def libraries(self) -> list[tuple[str, int]]:
-        return self._grouped("library", ())
+    def libraries(self, scope: ReadScope | None = None) -> list[tuple[str, int]]:
+        return self._grouped("library", (), scope)
 
-    def categories(self, library: str) -> list[tuple[str, int]]:
-        return self._grouped("category", ("library = ?", library))
+    def categories(
+        self, library: str, scope: ReadScope | None = None
+    ) -> list[tuple[str, int]]:
+        return self._grouped("category", ("library = ?", library), scope)
 
-    def series(self, library: str, category: str) -> list[tuple[str, int]]:
+    def series(
+        self, library: str, category: str, scope: ReadScope | None = None
+    ) -> list[tuple[str, int]]:
         return self._grouped(
-            "series", ("library = ? AND category = ?", library, category)
+            "series", ("library = ? AND category = ?", library, category), scope
         )
 
-    def _grouped(self, column: str, where: tuple[object, ...]) -> list[tuple[str, int]]:
+    def _grouped(
+        self, column: str, where: tuple[object, ...], scope: ReadScope | None
+    ) -> list[tuple[str, int]]:
         allowed = {"library", "category", "series"}
         if column not in allowed:
             raise ValueError("unsupported grouping")
-        clause = f" WHERE {where[0]}" if where else ""
-        parameters = where[1:] if where else ()
+        clauses = [str(where[0])] if where else []
+        parameters = list(where[1:]) if where else []
+        scope_clause, scope_parameters = _scope_predicate(scope)
+        clauses.append(scope_clause)
+        parameters.extend(scope_parameters)
+        clause = f" WHERE {' AND '.join(f'({item})' for item in clauses)}"
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -424,8 +876,9 @@ class SQLiteRepository:
         query: str | None = None,
         limit: int = 24,
         offset: int = 0,
+        scope: ReadScope | None = None,
     ) -> tuple[list[Publication], int]:
-        where, parameters = _publication_filter(library, category, series, query)
+        where, parameters = _publication_filter(library, category, series, query, scope)
         with self._connect() as connection:
             total = int(
                 connection.execute(
@@ -444,8 +897,41 @@ class SQLiteRepository:
         return [self._publication(row) for row in rows], total
 
 
+def _access_grant(row: sqlite3.Row) -> AccessGrant:
+    return AccessGrant(
+        user_id=row["user_id"],
+        library_id=row["library_id"],
+        category=row["category"] or None,
+        series_id=row["series_id"] or None,
+    )
+
+
+def _library_usage(
+    library: ManagedLibrary, series_by_category: dict[str, list[SeriesUsage]]
+) -> LibraryUsage:
+    categories = tuple(
+        CategoryUsage(
+            name=name,
+            publication_count=sum(item.publication_count for item in items),
+            size=sum(item.size for item in items),
+            series=tuple(items),
+        )
+        for name, items in series_by_category.items()
+    )
+    return LibraryUsage(
+        library=library,
+        publication_count=sum(item.publication_count for item in categories),
+        size=sum(item.size for item in categories),
+        categories=categories,
+    )
+
+
 def _publication_filter(
-    library: str | None, category: str | None, series: str | None, query: str | None
+    library: str | None,
+    category: str | None,
+    series: str | None,
+    query: str | None,
+    scope: ReadScope | None = None,
 ) -> tuple[str, list[object]]:
     """Build the WHERE fragment and bound parameters for a publication search."""
     clauses: list[str] = []
@@ -465,7 +951,37 @@ def _publication_filter(
             "OR filename LIKE ? ESCAPE '\\')"
         )
         parameters.extend([f"%{escaped}%"] * 3)
+    scope_clause, scope_parameters = _scope_predicate(scope)
+    clauses.append(scope_clause)
+    parameters.extend(scope_parameters)
     return (f" WHERE {' AND '.join(clauses)}" if clauses else ""), parameters
+
+
+def _scope_predicate(scope: ReadScope | None) -> tuple[str, list[object]]:
+    if scope is None or scope.unrestricted:
+        return "1", []
+    if scope.user_id:
+        return (
+            """
+            EXISTS (
+                SELECT 1 FROM access_grants
+                WHERE access_grants.user_id = ?
+                  AND access_grants.library_id = publications.library_id
+                  AND (
+                    access_grants.category = ''
+                    OR (
+                      access_grants.category = publications.category COLLATE NOCASE
+                      AND (
+                        access_grants.series_id = ''
+                        OR access_grants.series_id = publications.series_id
+                      )
+                    )
+                  )
+            )
+            """,
+            [scope.user_id],
+        )
+    return "0", []
 
 
 def _now_iso() -> str:

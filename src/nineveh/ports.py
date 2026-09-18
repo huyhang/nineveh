@@ -6,9 +6,13 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from .domain import (
+    AccessGrant,
+    LibraryUsage,
+    ManagedLibrary,
     Page,
     Publication,
     PublicationPage,
+    ReadScope,
     ScannedPublication,
     ScanReport,
     ScanStatus,
@@ -17,11 +21,15 @@ from .domain import (
 
 
 class CatalogRepository(Protocol):
-    def publication_by_id(self, publication_id: str) -> Publication | None: ...
+    def publication_by_id(
+        self, publication_id: str, scope: ReadScope | None = None
+    ) -> Publication | None: ...
 
     def publication_by_path(self, relative_path: str) -> Publication | None: ...
 
-    def page(self, publication_id: str, number: int) -> PublicationPage | None: ...
+    def page(
+        self, publication_id: str, number: int, scope: ReadScope | None = None
+    ) -> PublicationPage | None: ...
 
     def pages(self, publication_id: str, start: int, end: int) -> list[Page]: ...
 
@@ -31,13 +39,19 @@ class CatalogRepository(Protocol):
 
     def upsert_publication(self, scanned: ScannedPublication) -> None: ...
 
-    def remove_publications_except(self, relative_paths: set[str]) -> int: ...
+    def remove_publications_except(
+        self, relative_paths: set[str], library_id: str | None = None
+    ) -> int: ...
 
-    def libraries(self) -> list[tuple[str, int]]: ...
+    def libraries(self, scope: ReadScope | None = None) -> list[tuple[str, int]]: ...
 
-    def categories(self, library: str) -> list[tuple[str, int]]: ...
+    def categories(
+        self, library: str, scope: ReadScope | None = None
+    ) -> list[tuple[str, int]]: ...
 
-    def series(self, library: str, category: str) -> list[tuple[str, int]]: ...
+    def series(
+        self, library: str, category: str, scope: ReadScope | None = None
+    ) -> list[tuple[str, int]]: ...
 
     def publications(
         self,
@@ -48,7 +62,34 @@ class CatalogRepository(Protocol):
         query: str | None = None,
         limit: int = 24,
         offset: int = 0,
+        scope: ReadScope | None = None,
     ) -> tuple[list[Publication], int]: ...
+
+
+class LibraryRepository(Protocol):
+    def initialize_libraries(self, relative_paths: list[str]) -> None: ...
+
+    def managed_libraries(
+        self, *, include_disabled: bool = False
+    ) -> list[ManagedLibrary]: ...
+
+    def managed_library(self, library_id: str) -> ManagedLibrary | None: ...
+
+    def add_library(self, relative_path: str) -> ManagedLibrary: ...
+
+    def remove_library(self, library_id: str) -> ManagedLibrary | None: ...
+
+    def library_usage(self) -> list[LibraryUsage]: ...
+
+
+class AccessRepository(Protocol):
+    def access_grants(self, user_id: str) -> list[AccessGrant]: ...
+
+    def all_access_grants(self) -> dict[str, list[AccessGrant]]: ...
+
+    def replace_access_grants(
+        self, user_id: str, grants: list[AccessGrant]
+    ) -> None: ...
 
 
 class UserRepository(Protocol):
@@ -83,12 +124,18 @@ class UserRepository(Protocol):
     def delete_session(self, token_hash: str) -> None: ...
 
 
-class Repository(CatalogRepository, UserRepository, Protocol):
+class Repository(
+    CatalogRepository, UserRepository, LibraryRepository, AccessRepository, Protocol
+):
     """The single persistence seam the application composes against."""
 
     def initialize(self) -> None: ...
 
     def ping(self) -> bool: ...
+
+    def settings(self) -> dict[str, str]: ...
+
+    def replace_settings(self, values: dict[str, str]) -> None: ...
 
 
 class ArchiveSource(Protocol):
@@ -127,4 +174,11 @@ class CatalogScan(Protocol):
     @property
     def status(self) -> ScanStatus: ...
 
-    def scan(self) -> ScanReport: ...
+    def scan(self, library_id: str | None = None) -> ScanReport: ...
+
+
+class RestartController(Protocol):
+    @property
+    def enabled(self) -> bool: ...
+
+    def request_restart(self) -> None: ...

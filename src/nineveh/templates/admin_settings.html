@@ -1,0 +1,29 @@
+{% extends "admin_base.html" %}
+{% block admin_content %}
+  <section class="admin-section">
+    <div class="section-heading"><div><p class="eyebrow">Runtime configuration</p><h2>Settings</h2></div>{% if pending_restart %}<span class="badge warning">Restart required</span>{% endif %}</div>
+    <form method="post" action="/admin/settings" class="settings-form">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <div class="settings-group"><h3>General</h3>
+        <label>Service title <input name="service_title" value="{{ settings.service_title }}" required maxlength="80"></label>
+        <label>Session lifetime <span class="input-unit"><input name="session_hours" type="number" min="1" max="8760" value="{{ settings.session_hours }}" required><span>hours</span></span></label>
+        <label>Automatic scan interval <span class="input-unit"><input name="scan_interval_seconds" type="number" min="0" value="{{ settings.scan_interval_seconds }}" required><span>seconds</span></span></label>
+      </div>
+      <div class="settings-group"><h3>Catalog and cache</h3>
+        <label>Feed page size <input name="feed_page_size" type="number" min="1" max="200" value="{{ settings.feed_page_size }}" required></label>
+        <label>Page range limit <input name="page_range_limit" type="number" min="1" max="1000" value="{{ settings.page_range_limit }}" required></label>
+        <label>Open archive cache <input name="archive_cache_size" type="number" min="0" max="128" value="{{ settings.archive_cache_size }}" required></label>
+        <label>Thumbnail cache <span class="input-unit"><input name="thumbnail_cache_mb" type="number" min="1" value="{{ settings.thumbnail_cache_mb }}" required><span>MiB</span></span></label>
+        <label>Page cache <span class="input-unit"><input name="page_cache_mb" type="number" min="0" value="{{ settings.page_cache_mb }}" required><span>MiB</span></span></label>
+      </div>
+      <details class="settings-group advanced-settings"><summary>Advanced limits</summary>
+        <label>Password workers <input name="hash_workers" type="number" min="1" max="32" value="{{ settings.hash_workers }}" required></label>
+        <label>Extraction workers <input name="extract_workers" type="number" min="1" max="32" value="{{ settings.extract_workers }}" required></label>
+        <label>Maximum image pixels <input name="max_image_pixels" type="number" min="1" value="{{ settings.max_image_pixels }}" required></label>
+      </details>
+      <div class="deployment-note"><div><strong>Public base URL</strong><p>The origin this service is published at. Set by <code>NINEVEH_PUBLIC_BASE_URL</code> because it decides which origin may sign in — a wrong value here would lock you out of this page.</p></div><code>{{ settings.public_base_url or "From the request host" }}</code></div>
+      <div class="deployment-note"><div><strong>Docker memory ceiling</strong><p>Detected from the container. Change it in <code>docker/.env</code> and recreate the service — a restart from here cannot apply it.</p></div><code>{{ memory_limit }}</code></div>
+      <div class="settings-actions"><button class="secondary" type="submit" name="action" value="save">Save settings</button><button type="submit" name="action" value="restart" {% if not restart_enabled %}disabled title="Automatic restart is not enabled"{% endif %}>Save and restart</button></div>
+    </form>
+  </section>
+{% endblock %}

@@ -64,15 +64,26 @@ class FakePageStore:
 class FakeScanner:
     def __init__(self) -> None:
         self.runs = 0
+        self.targets: list[str | None] = []
         self.status = ScanStatus(
             completed_at="2026-01-01T00:00:00+00:00",
             catalog_modified_at="2026-01-01T00:00:00+00:00",
             report=ScanReport(0, 0, 0, 0, 0),
         )
 
-    def scan(self) -> ScanReport:
+    def scan(self, library_id: str | None = None) -> ScanReport:
         self.runs += 1
+        self.targets.append(library_id)
         return ScanReport(0, 0, 0, 0, 0)
+
+
+class FakeRestartController:
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self.requests = 0
+
+    def request_restart(self) -> None:
+        self.requests += 1
 
 
 def publication(publication_id: str = "fake-id", pages: int = 3) -> Publication:

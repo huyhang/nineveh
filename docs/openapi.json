@@ -1,0 +1,1808 @@
+{
+  "components": {
+    "schemas": {
+      "AccessUpdate": {
+        "properties": {
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/GrantInput"
+            },
+            "title": "Grants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "grants"
+        ],
+        "title": "AccessUpdate",
+        "type": "object"
+      },
+      "GrantInput": {
+        "properties": {
+          "category": {
+            "anyOf": [
+              {
+                "enum": [
+                  "comics",
+                  "manga"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Category"
+          },
+          "library_id": {
+            "title": "Library Id",
+            "type": "string"
+          },
+          "series_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Series Id"
+          }
+        },
+        "required": [
+          "library_id"
+        ],
+        "title": "GrantInput",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "LibraryCreate": {
+        "properties": {
+          "relative_path": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Relative Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "relative_path"
+        ],
+        "title": "LibraryCreate",
+        "type": "object"
+      },
+      "SettingsUpdate": {
+        "properties": {
+          "values": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "required": [
+          "values"
+        ],
+        "title": "SettingsUpdate",
+        "type": "object"
+      },
+      "UserCreate": {
+        "properties": {
+          "is_admin": {
+            "default": false,
+            "title": "Is Admin",
+            "type": "boolean"
+          },
+          "password": {
+            "maxLength": 1024,
+            "minLength": 12,
+            "title": "Password",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "UserCreate",
+        "type": "object"
+      },
+      "UserUpdate": {
+        "properties": {
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "password": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "minLength": 12,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Password"
+          }
+        },
+        "title": "UserUpdate",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBasic": {
+        "scheme": "basic",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "An authenticated OPDS 2.0 service for CBZ libraries.",
+    "title": "Nineveh",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/admin/catalog/scan": {
+      "post": {
+        "operationId": "scan_catalog_api_v1_admin_catalog_scan_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Scan Catalog Api V1 Admin Catalog Scan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Scan Catalog",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/libraries": {
+      "get": {
+        "operationId": "admin_libraries_api_v1_admin_libraries_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admin Libraries Api V1 Admin Libraries Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Admin Libraries",
+        "tags": [
+          "administration"
+        ]
+      },
+      "post": {
+        "operationId": "add_library_api_v1_admin_libraries_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LibraryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Add Library Api V1 Admin Libraries Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Add Library",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/libraries/{library_id}": {
+      "delete": {
+        "operationId": "remove_library_api_v1_admin_libraries__library_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "library_id",
+            "required": true,
+            "schema": {
+              "title": "Library Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Remove Library Api V1 Admin Libraries  Library Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Remove Library",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/libraries/{library_id}/scan": {
+      "post": {
+        "operationId": "scan_library_api_v1_admin_libraries__library_id__scan_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "library_id",
+            "required": true,
+            "schema": {
+              "title": "Library Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Scan Library Api V1 Admin Libraries  Library Id  Scan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Scan Library",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/restart": {
+      "post": {
+        "operationId": "restart_application_api_v1_admin_restart_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Restart Application Api V1 Admin Restart Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Restart Application",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/settings": {
+      "get": {
+        "operationId": "admin_settings_api_v1_admin_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admin Settings Api V1 Admin Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Admin Settings",
+        "tags": [
+          "administration"
+        ]
+      },
+      "put": {
+        "operationId": "update_settings_api_v1_admin_settings_put",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Settings Api V1 Admin Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Update Settings",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/users": {
+      "get": {
+        "operationId": "users_api_v1_admin_users_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Users Api V1 Admin Users Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Users",
+        "tags": [
+          "administration"
+        ]
+      },
+      "post": {
+        "operationId": "create_user_api_v1_admin_users_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create User Api V1 Admin Users Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Create User",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/users/{user_id}": {
+      "patch": {
+        "operationId": "update_user_api_v1_admin_users__user_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update User Api V1 Admin Users  User Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Update User",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/users/{user_id}/access": {
+      "get": {
+        "operationId": "user_access_api_v1_admin_users__user_id__access_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response User Access Api V1 Admin Users  User Id  Access Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "User Access",
+        "tags": [
+          "administration"
+        ]
+      },
+      "put": {
+        "operationId": "update_user_access_api_v1_admin_users__user_id__access_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update User Access Api V1 Admin Users  User Id  Access Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Update User Access",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "operationId": "me_api_v1_auth_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Me Api V1 Auth Me Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Me",
+        "tags": [
+          "authentication"
+        ]
+      }
+    },
+    "/api/v1/health/live": {
+      "get": {
+        "operationId": "live_api_v1_health_live_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Live Api V1 Health Live Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Live",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/v1/health/ready": {
+      "get": {
+        "operationId": "ready_api_v1_health_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ready Api V1 Health Ready Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ready",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/v1/publications/{publication_id}": {
+      "get": {
+        "operationId": "publication_detail_api_v1_publications__publication_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Publication Detail Api V1 Publications  Publication Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication Detail",
+        "tags": [
+          "publications"
+        ]
+      }
+    },
+    "/api/v1/publications/{publication_id}/cover": {
+      "get": {
+        "operationId": "readPublicationCover",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "width",
+            "required": false,
+            "schema": {
+              "default": 320,
+              "title": "Width",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication Cover",
+        "tags": [
+          "pages"
+        ]
+      },
+      "head": {
+        "operationId": "headPublicationCover",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "width",
+            "required": false,
+            "schema": {
+              "default": 320,
+              "title": "Width",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication Cover",
+        "tags": [
+          "pages"
+        ]
+      }
+    },
+    "/api/v1/publications/{publication_id}/file": {
+      "get": {
+        "operationId": "downloadPublicationFile",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication File",
+        "tags": [
+          "publications"
+        ]
+      },
+      "head": {
+        "operationId": "headPublicationFile",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication File",
+        "tags": [
+          "publications"
+        ]
+      }
+    },
+    "/api/v1/publications/{publication_id}/pages": {
+      "get": {
+        "operationId": "page_manifest_api_v1_publications__publication_id__pages_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Start",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Page Manifest Api V1 Publications  Publication Id  Pages Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Page Manifest",
+        "tags": [
+          "pages"
+        ]
+      }
+    },
+    "/api/v1/publications/{publication_id}/pages/{number}": {
+      "get": {
+        "operationId": "readPublicationPage",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "number",
+            "required": true,
+            "schema": {
+              "title": "Number",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication Page",
+        "tags": [
+          "pages"
+        ]
+      },
+      "head": {
+        "operationId": "headPublicationPage",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "number",
+            "required": true,
+            "schema": {
+              "title": "Number",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "revision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication Page",
+        "tags": [
+          "pages"
+        ]
+      }
+    },
+    "/api/v1/publications/{publication_id}/range": {
+      "get": {
+        "description": "Download a contiguous page range as a standalone CBZ.",
+        "operationId": "publication_range_api_v1_publications__publication_id__range_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Start",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Publication Range",
+        "tags": [
+          "pages"
+        ]
+      }
+    },
+    "/opds/v2/authentication.json": {
+      "get": {
+        "operationId": "opds_authentication_opds_v2_authentication_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/opds-authentication+json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Opds Authentication Opds V2 Authentication Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Opds Authentication",
+        "tags": [
+          "opds"
+        ]
+      }
+    },
+    "/opds/v2/catalog.json": {
+      "get": {
+        "operationId": "opds_catalog_opds_v2_catalog_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/opds+json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Opds Catalog Opds V2 Catalog Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Opds Catalog",
+        "tags": [
+          "opds"
+        ]
+      }
+    },
+    "/opds/v2/navigation.json": {
+      "get": {
+        "operationId": "opds_navigation_opds_v2_navigation_json_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "library",
+            "required": true,
+            "schema": {
+              "title": "Library",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/opds+json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Opds Navigation Opds V2 Navigation Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Opds Navigation",
+        "tags": [
+          "opds"
+        ]
+      }
+    },
+    "/opds/v2/publications.json": {
+      "get": {
+        "operationId": "opds_publications_opds_v2_publications_json_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "library",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Library"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          },
+          {
+            "in": "query",
+            "name": "series",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Series"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/opds+json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Opds Publications Opds V2 Publications Json Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Opds Publications",
+        "tags": [
+          "opds"
+        ]
+      }
+    }
+  }
+}

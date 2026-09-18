@@ -36,6 +36,11 @@ jobs:
       - name: Format
         run: ruff format --check src tests
 
+      - name: API contract is current
+        run: |
+          python scripts/export-openapi.py
+          git diff --exit-code -- docs/openapi.json
+
       - name: Test
         run: pytest
 

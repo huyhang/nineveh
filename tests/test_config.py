@@ -113,3 +113,38 @@ def test_the_password_file_is_read_and_stripped(tmp_path: Path):
 
 def test_no_configured_password_is_none():
     assert Settings().admin_password() is None
+
+
+def test_deployment_information_is_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("NINEVEH_MEMORY_LIMIT", "2g")
+    monkeypatch.setenv("NINEVEH_RESTART_ENABLED", "true")
+    settings = Settings.from_env()
+    assert settings.deployment_memory_limit == "2g"
+    assert settings.restart_enabled
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ({"unknown": "1"}, "Unsupported setting"),
+        ({"service_title": ""}, "Service title"),
+        # Retired from the UI: it is deployment-owned again.
+        ({"public_base_url": "https://x.example"}, "Unsupported setting"),
+        ({"feed_page_size": "many"}, "must be an integer"),
+        ({"feed_page_size": "201"}, "must be between"),
+    ],
+)
+def test_persisted_setting_validation(values: dict[str, str], message: str):
+    with pytest.raises(ValueError, match=message):
+        Settings().with_overrides(values)
+
+
+def test_persisted_text_settings_are_normalized():
+    assert Settings().with_overrides({"service_title": " Archive "}).service_title == (
+        "Archive"
+    )
+
+
+def test_the_public_base_url_is_not_editable_from_the_user_interface():
+    """It gates the login origin check, so a bad value locks the admin out."""
+    assert "public_base_url" not in Settings().editable_values()

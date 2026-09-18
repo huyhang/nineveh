@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}{{ service_title }}{% endblock %}</title>
     <link rel="icon" href="{{ url_for('static', path='icon.svg') }}" type="image/svg+xml">
+    <script src="{{ url_for('static', path='theme.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
   </head>
   <body>
@@ -13,22 +14,33 @@
         <img src="{{ url_for('static', path='icon.svg') }}" alt="" width="34" height="34">
         <span>{{ service_title }}</span>
       </a>
-      {% if session %}
-        <nav aria-label="Account">
-          {% if session.user.is_admin %}<a href="/admin">Admin</a>{% endif %}
-          <span>{{ session.user.username }}</span>
-          <form method="post" action="/logout" class="inline-form">
-            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-            <button type="submit" class="link-button">Sign out</button>
-          </form>
-        </nav>
-      {% endif %}
+      <div class="header-navigation">
+        {% if session %}
+          <nav class="primary-tabs" aria-label="Main navigation">
+            <a href="/" {% if not request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>Library</a>
+            {% if session.user.is_admin %}<a href="/admin" {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>Admin</a>{% endif %}
+          </nav>
+        {% endif %}
+        <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch color theme" title="Switch color theme">
+          <span class="theme-icon" aria-hidden="true">◐</span>
+          <span data-theme-label>System</span>
+        </button>
+        {% if session %}
+          <div class="account-menu">
+            <span>{{ session.user.username }}</span>
+            <form method="post" action="/logout" class="inline-form">
+              <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+              <button type="submit" class="link-button">Sign out</button>
+            </form>
+          </div>
+        {% endif %}
+      </div>
     </header>
-    <main class="page-shell">
+    <main class="page-shell {% block main_class %}{% endblock %}">
       {% if message %}<div class="notice" role="status">{{ message }}</div>{% endif %}
       {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
       {% block content %}{% endblock %}
     </main>
+    {% block scripts %}{% endblock %}
   </body>
 </html>
-

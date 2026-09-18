@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .archives import (
     ArchiveService,
     PageCacheService,
@@ -17,14 +19,23 @@ from .archives import (
     ThumbnailService,
 )
 from .auth import AuthService
-from .authorization import AuthorizationPolicy, ReadAllPolicy
-from .catalog import ArchiveInspector, CatalogScanner
-from .config import Settings
+from .authorization import AccessService, AuthorizationPolicy, GrantPolicy
+from .catalog import ArchiveInspector, CatalogScanner, LibraryService
+from .config import Settings, SettingsService
 from .database import SQLiteRepository
+from .deployment import discarded_forwarded_proto, proxy_trust_advice
 from .http_api import router as api_router
 from .http_web import router as web_router
 from .opds import OpdsBuilder
-from .ports import ArchiveSource, CatalogScan, CoverSource, PageStore, Repository
+from .ports import (
+    ArchiveSource,
+    CatalogScan,
+    CoverSource,
+    PageStore,
+    Repository,
+    RestartController,
+)
+from .restart import DisabledRestartController, ProcessRestartController
 
 LOGGER = logging.getLogger(__name__)
 
@@ -42,25 +53,43 @@ class Container:
     thumbnails: CoverSource
     page_cache: PageStore
     opds: OpdsBuilder
+    access: AccessService
+    libraries: LibraryService
+    configuration: SettingsService
+    restarter: RestartController
 
 
 def build_container(settings: Settings) -> Container:
     repository = SQLiteRepository(settings.database_path)
-    archives = ArchiveService(settings)
+    # Persisted settings decide how the rest of the graph is built, so the
+    # schema has to exist before anything else is constructed. `initialize` is
+    # idempotent; the lifespan calls it again for containers built by hand.
+    repository.initialize()
+    configuration = SettingsService(settings, repository)
+    effective = configuration.activate()
+    archives = ArchiveService(effective)
     return Container(
-        settings=settings,
+        settings=effective,
         repository=repository,
-        auth=AuthService(repository, settings.session_hours, settings.hash_workers),
-        authorization=ReadAllPolicy(),
+        auth=AuthService(repository, effective.session_hours, effective.hash_workers),
+        authorization=GrantPolicy(repository),
         scanner=CatalogScanner(
-            settings.data_dir, repository, ArchiveInspector(settings)
+            effective.data_dir, repository, ArchiveInspector(effective)
         ),
         archives=archives,
         thumbnails=ThumbnailService(
-            settings, archives, PillowThumbnailRenderer(settings.max_image_pixels)
+            effective,
+            archives,
+            PillowThumbnailRenderer(effective.max_image_pixels),
         ),
-        page_cache=PageCacheService(settings, archives),
-        opds=OpdsBuilder(settings.service_title),
+        page_cache=PageCacheService(effective, archives),
+        opds=OpdsBuilder(effective.service_title),
+        access=AccessService(repository),
+        libraries=LibraryService(effective.data_dir, repository),
+        configuration=configuration,
+        restarter=ProcessRestartController()
+        if effective.restart_enabled
+        else DisabledRestartController(),
     )
 
 
@@ -68,8 +97,9 @@ def create_app(
     settings: Settings | None = None, container: Container | None = None
 ) -> FastAPI:
     """Compose the application. Pass a `container` to substitute any I/O seam."""
-    configured = settings or (container.settings if container else Settings.from_env())
-    container = container or build_container(configured)
+    defaults = settings or (container.settings if container else Settings.from_env())
+    container = container or build_container(defaults)
+    configured = container.settings
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -83,7 +113,13 @@ def create_app(
         _discard_stale_ranges(configured.range_dir)
         if not configured.data_dir.is_dir():
             raise RuntimeError(f"Data directory does not exist: {configured.data_dir}")
+        advice = await asyncio.to_thread(
+            proxy_trust_advice, configured.forwarded_allow_ips
+        )
+        if advice:
+            LOGGER.warning("%s", advice)
         await asyncio.to_thread(container.repository.initialize)
+        await asyncio.to_thread(container.libraries.initialize)
         if await asyncio.to_thread(container.repository.user_count) == 0:
             await asyncio.to_thread(
                 container.auth.bootstrap_admin,
@@ -103,24 +139,33 @@ def create_app(
 
     application = FastAPI(
         title=configured.service_title,
-        version="0.1.0",
+        version=__version__,
         description="An authenticated OPDS 2.0 service for CBZ libraries.",
         lifespan=lifespan,
     )
     application.state.container = container
     application.state.scan_task = None
+    # Set by the middleware the first time a proxy's X-Forwarded-Proto is
+    # discarded, so the admin console can name the address to trust.
+    application.state.untrusted_proxy = None
 
-    def start_scan() -> bool:
+    def start_scan(library_id: str | None = None) -> bool:
         current = application.state.scan_task
         if current is not None and not current.done():
             return False
-        application.state.scan_task = asyncio.create_task(_run_scan(container.scanner))
+        application.state.scan_task = asyncio.create_task(
+            _run_scan(container.scanner, library_id)
+        )
         return True
 
     application.state.start_scan = start_scan
 
     @application.middleware("http")
     async def security_headers(request: Request, call_next):
+        if discarded_forwarded_proto(
+            request.headers.get("x-forwarded-proto"), request.url.scheme
+        ):
+            _note_untrusted_proxy(application, request)
         response: Response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "same-origin")
@@ -160,6 +205,32 @@ def create_app(
     return application
 
 
+def _note_untrusted_proxy(application: FastAPI, request: Request) -> None:
+    """Record, once per peer, that a forwarded header was thrown away."""
+    peer = request.client.host if request.client else "an unknown address"
+    if application.state.untrusted_proxy == peer:
+        return
+    application.state.untrusted_proxy = peer
+    LOGGER.warning(
+        "Ignoring X-Forwarded-Proto from %s: add it to NINEVEH_FORWARDED_ALLOW_IPS "
+        "(currently %r) and recreate the container to honour it",
+        peer,
+        application.state.container.settings.forwarded_allow_ips,
+    )
+
+
+def openapi_document() -> dict[str, object]:
+    """The published API contract, built without touching a real deployment.
+
+    Composes the app against a throwaway state directory so the document
+    depends only on the route table, never on the machine generating it.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        settings = Settings(data_dir=root, state_dir=root / "state")
+        return create_app(settings).openapi()
+
+
 def _discard_stale_ranges(directory: Path) -> None:
     """Generated range archives never outlive the response that produced them."""
     for leftover in directory.glob("range-*.cbz"):
@@ -180,9 +251,9 @@ async def _drain_scan(scan_task: asyncio.Task | None) -> None:
         LOGGER.exception("Catalog scan failed during shutdown")
 
 
-async def _run_scan(scanner: CatalogScan) -> None:
+async def _run_scan(scanner: CatalogScan, library_id: str | None = None) -> None:
     try:
-        report = await asyncio.to_thread(scanner.scan)
+        report = await asyncio.to_thread(scanner.scan, library_id)
         LOGGER.info(
             "Catalog scan completed: discovered=%d indexed=%d unchanged=%d removed=%d failed=%d",
             report.discovered,
