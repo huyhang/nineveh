@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import replace
 
@@ -565,3 +566,45 @@ def test_a_library_page_lists_its_categories(client: TestClient):
 def test_an_unknown_library_page_is_not_found(client: TestClient):
     _login(client)
     assert client.get("/libraries/missing").status_code == 404
+
+
+def _relative_luminance(colour: str) -> float:
+    raw = colour.lstrip("#")
+    channels = []
+    for index in (0, 2, 4):
+        value = int(raw[index : index + 2], 16) / 255
+        channels.append(
+            value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+        )
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(foreground: str, background: str) -> float:
+    first, second = _relative_luminance(foreground), _relative_luminance(background)
+    lighter, darker = max(first, second), min(first, second)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_the_filled_destructive_button_is_readable_in_every_theme(client: TestClient):
+    """`.danger` alone only recoloured the text, leaving danger-red lettering
+    on the accent fill at 1.04:1 -- unreadable, and in all four palettes."""
+    stylesheet = client.get("/static/style.css").text
+    backgrounds = re.findall(r"--danger:\s*(#[0-9a-fA-F]{6})", stylesheet)
+    foregrounds = re.findall(r"--on-danger:\s*(#[0-9a-fA-F]{6})", stylesheet)
+
+    assert len(backgrounds) == len(foregrounds) == 4
+    assert "button.danger:not(.ghost)" in stylesheet
+    for background, foreground in zip(backgrounds, foregrounds, strict=True):
+        assert _contrast(foreground, background) >= 4.5, (
+            f"{foreground} on {background} fails WCAG AA"
+        )
+
+
+def test_the_quiet_destructive_buttons_are_unchanged(client: TestClient):
+    """Every existing call site is `danger ghost` and must keep the text
+    treatment; only a bare `.danger` becomes a filled button."""
+    stylesheet = client.get("/static/style.css").text
+    assert "button.ghost { background: transparent; }" in stylesheet
+    assert "button.danger { border-color: transparent; color: var(--danger); }" in (
+        stylesheet
+    )
