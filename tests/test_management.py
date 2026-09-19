@@ -73,6 +73,13 @@ def test_readers_are_default_deny_and_library_grants_filter_every_surface(
             == 404
         )
 
+    series_id = client.app.state.container.repository.catalog_series()[0].id
+    assert client.get(f"/api/v1/series/{series_id}", headers=reader).status_code == 404
+    assert (
+        client.get(f"/api/v1/series/{series_id}/cover", headers=reader).status_code
+        == 404
+    )
+
     library = client.get("/api/v1/admin/libraries", headers=authorization()).json()[
         "libraries"
     ][0]
@@ -290,6 +297,18 @@ def test_settings_service_reports_pending_changes(tmp_path: Path):
     service.update({"feed_page_size": "12"})
     assert service.saved().feed_page_size == 12
     assert service.pending_restart()
+
+
+def test_mangabaka_rate_limit_applies_without_a_restart(tmp_path: Path):
+    repository = SQLiteRepository(tmp_path / "nineveh.sqlite3")
+    repository.initialize()
+    service = SettingsService(Settings(), repository)
+    service.activate()
+
+    service.update({"mangabaka_requests_per_minute": "7"})
+
+    assert service.mangabaka_request_limit() == 7
+    assert not service.pending_restart()
 
 
 def test_only_settings_that_differ_from_the_deployment_are_persisted(tmp_path: Path):

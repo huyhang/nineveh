@@ -3,12 +3,15 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import Any, BinaryIO, Protocol
 
 from .domain import (
     AccessGrant,
+    CatalogSeries,
     LibraryUsage,
     ManagedLibrary,
+    MetadataCandidate,
+    MetadataLookup,
     Page,
     Publication,
     PublicationPage,
@@ -16,6 +19,8 @@ from .domain import (
     ScannedPublication,
     ScanReport,
     ScanStatus,
+    SeriesMetadata,
+    SeriesMetadataSummary,
     User,
 )
 
@@ -65,6 +70,20 @@ class CatalogRepository(Protocol):
         scope: ReadScope | None = None,
     ) -> tuple[list[Publication], int]: ...
 
+    def catalog_series(
+        self,
+        *,
+        series_id: str | None = None,
+        library_id: str | None = None,
+        category: str | None = None,
+        query: str | None = None,
+        scope: ReadScope | None = None,
+    ) -> list[CatalogSeries]: ...
+
+    def catalog_series_by_id(
+        self, series_id: str, scope: ReadScope | None = None
+    ) -> CatalogSeries | None: ...
+
 
 class LibraryRepository(Protocol):
     def initialize_libraries(self, relative_paths: list[str]) -> None: ...
@@ -90,6 +109,43 @@ class AccessRepository(Protocol):
     def replace_access_grants(
         self, user_id: str, grants: list[AccessGrant]
     ) -> None: ...
+
+
+class MetadataRepository(Protocol):
+    def series_metadata(self, series_id: str) -> SeriesMetadata | None: ...
+
+    def all_series_metadata(self) -> dict[str, SeriesMetadata]: ...
+
+    def series_metadata_summaries(self) -> dict[str, SeriesMetadataSummary]: ...
+
+    def save_series_metadata(
+        self,
+        series_id: str,
+        provider_id: int,
+        canonical_url: str,
+        values: dict[str, Any],
+        raw: dict[str, Any],
+        provider_updated_at: str | None,
+    ) -> SeriesMetadata: ...
+
+    def replace_metadata_overrides(
+        self, series_id: str, overrides: dict[str, Any]
+    ) -> SeriesMetadata: ...
+
+    def delete_series_metadata(self, series_id: str) -> None: ...
+
+    def metadata_lookup(self, series_id: str) -> MetadataLookup: ...
+
+    def replace_metadata_lookup(
+        self,
+        series_id: str,
+        candidates: list[MetadataCandidate],
+        error: str | None = None,
+    ) -> MetadataLookup: ...
+
+    def reserve_metadata_request(
+        self, limit: int, now: float, window_seconds: float = 60.0
+    ) -> float: ...
 
 
 class UserRepository(Protocol):
@@ -123,9 +179,20 @@ class UserRepository(Protocol):
 
     def delete_session(self, token_hash: str) -> None: ...
 
+    def set_session_flash(
+        self, token_hash: str, message: str | None, error: str | None
+    ) -> None: ...
+
+    def take_session_flash(self, token_hash: str) -> tuple[str | None, str | None]: ...
+
 
 class Repository(
-    CatalogRepository, UserRepository, LibraryRepository, AccessRepository, Protocol
+    CatalogRepository,
+    UserRepository,
+    LibraryRepository,
+    AccessRepository,
+    MetadataRepository,
+    Protocol,
 ):
     """The single persistence seam the application composes against."""
 

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ display_title }} · {{ service_title }}{% endblock %}
+{% block content %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="/">Libraries</a><span>/</span>
+    <a href="/libraries/{{ series.library_id }}">{{ series.library }}</a><span>/</span>
+    <a href="/libraries/{{ series.library_id }}/{{ series.category }}">{{ series.category|title }}</a><span>/</span>
+    <span>{{ display_title }}</span>
+  </nav>
+  <section class="series-hero">
+    <img class="hero-cover" src="/api/v1/series/{{ series.id }}/cover?revision={{ series.first_publication_revision }}" alt="Cover for {{ display_title }}" width="640">
+    <div class="series-summary">
+      <p class="eyebrow">{{ series.category }} · {{ series.publication_count }} volume{% if series.publication_count != 1 %}s{% endif %}</p>
+      <h1>{{ display_title }}</h1>
+      {% if series.category == 'manga' and session.user.is_admin %}<a class="button metadata-manage-button" href="/series/{{ series.id }}/metadata">Manage metadata</a>{% endif %}
+      {% if display_title != series.name %}<p class="local-title">Filed locally as {{ series.name }}</p>{% endif %}
+      {% if metadata %}
+        <div class="metadata-badges">
+          {% if details.media_type %}<span>{{ details.media_type|replace('_', ' ')|title }}</span>{% endif %}
+          {% if details.status %}<span>{{ details.status|replace('_', ' ')|title }}</span>{% endif %}
+          {% if details.published_start %}<span>{{ details.published_start[:4] }}</span>{% endif %}
+          {% if details.rating is not none %}<span>{{ details.rating|round|int }}/100</span>{% endif %}
+        </div>
+        {% if details.description %}<p class="series-description">{{ details.description }}</p>{% endif %}
+        <dl class="metadata-facts">
+          {% if details.authors %}<div><dt>Written by</dt><dd>{{ details.authors|join(', ') }}</dd></div>{% endif %}
+          {% if details.artists %}<div><dt>Art by</dt><dd>{{ details.artists|join(', ') }}</dd></div>{% endif %}
+          {% if details.publishers %}<div><dt>Publishers</dt><dd>{{ details.publishers|join(', ') }}</dd></div>{% endif %}
+          {% if details.published_start or details.published_end %}<div><dt>Published</dt><dd>{{ details.published_start or 'Unknown' }}{% if details.published_end %} – {{ details.published_end }}{% endif %}</dd></div>{% endif %}
+        </dl>
+        {% if details.tags %}<div class="tag-list">{% for tag in details.tags %}<span>{{ tag }}</span>{% endfor %}</div>{% endif %}
+        <p class="attribution">Metadata from <a href="{{ metadata.canonical_url }}" rel="external noreferrer">MangaBaka</a>, licensed <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="external noreferrer">CC BY-NC-SA 4.0</a>{% if metadata.overrides %}; edited locally{% endif %}.</p>
+      {% else %}
+        <p class="muted">No series metadata is available. Local volumes remain fully accessible below.</p>
+      {% endif %}
+    </div>
+  </section>
+  <section class="volume-section">
+    <div class="section-heading"><div><p class="eyebrow">On this server</p><h2>Volumes and issues</h2></div></div>
+    <div class="card-grid publication-grid">
+      {% for item in publications %}
+        <article class="card publication-card">
+          <img src="/api/v1/publications/{{ item.id }}/cover?width=320&amp;revision={{ item.revision }}" alt="Cover for {{ item.title }}" width="320" loading="lazy">
+          <div class="card-body">
+            <h3>{{ item.title }}</h3>
+            <p>{% if item.number %}Volume {{ item.number }} · {% endif %}{{ item.page_count }} pages</p>
+            <a class="button" href="/api/v1/publications/{{ item.id }}/file">Download CBZ</a>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}

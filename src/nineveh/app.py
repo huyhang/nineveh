@@ -26,6 +26,13 @@ from .database import SQLiteRepository
 from .deployment import discarded_forwarded_proto, proxy_trust_advice
 from .http_api import router as api_router
 from .http_web import router as web_router
+from .metadata import (
+    MangaBakaProvider,
+    MetadataCoverStore,
+    MetadataService,
+    PersistentRateLimiter,
+    UrllibTransport,
+)
 from .opds import OpdsBuilder
 from .ports import (
     ArchiveSource,
@@ -57,6 +64,7 @@ class Container:
     libraries: LibraryService
     configuration: SettingsService
     restarter: RestartController
+    metadata: MetadataService | None = None
 
 
 def build_container(settings: Settings) -> Container:
@@ -68,6 +76,7 @@ def build_container(settings: Settings) -> Container:
     configuration = SettingsService(settings, repository)
     effective = configuration.activate()
     archives = ArchiveService(effective)
+    limiter = PersistentRateLimiter(repository, configuration.mangabaka_request_limit)
     return Container(
         settings=effective,
         repository=repository,
@@ -90,6 +99,13 @@ def build_container(settings: Settings) -> Container:
         restarter=ProcessRestartController()
         if effective.restart_enabled
         else DisabledRestartController(),
+        metadata=MetadataService(
+            repository,
+            MangaBakaProvider(UrllibTransport(), limiter),
+            MetadataCoverStore(
+                effective.metadata_cover_dir, effective.max_image_pixels
+            ),
+        ),
     )
 
 
@@ -108,9 +124,11 @@ def create_app(
             configured.thumbnail_dir,
             configured.page_cache_dir,
             configured.range_dir,
+            configured.metadata_cover_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         _discard_stale_ranges(configured.range_dir)
+        _discard_flat_candidate_covers(configured.metadata_cover_dir)
         if not configured.data_dir.is_dir():
             raise RuntimeError(f"Data directory does not exist: {configured.data_dir}")
         advice = await asyncio.to_thread(
@@ -135,6 +153,7 @@ def create_app(
             with suppress(asyncio.CancelledError):
                 await scheduler
             await _drain_scan(application.state.scan_task)
+            await _drain_scan(application.state.metadata_task)
             container.archives.close()
 
     application = FastAPI(
@@ -145,6 +164,13 @@ def create_app(
     )
     application.state.container = container
     application.state.scan_task = None
+    application.state.metadata_task = None
+    application.state.metadata_status = {
+        "running": False,
+        "completed": 0,
+        "total": 0,
+        "failed": 0,
+    }
     # Set by the middleware the first time a proxy's X-Forwarded-Proto is
     # discarded, so the admin console can name the address to trust.
     application.state.untrusted_proxy = None
@@ -159,6 +185,23 @@ def create_app(
         return True
 
     application.state.start_scan = start_scan
+
+    def start_metadata_lookup(series_ids: list[str]) -> bool:
+        current = application.state.metadata_task
+        if container.metadata is None or (current is not None and not current.done()):
+            return False
+        application.state.metadata_status = {
+            "running": True,
+            "completed": 0,
+            "total": len(series_ids),
+            "failed": 0,
+        }
+        application.state.metadata_task = asyncio.create_task(
+            _run_metadata_lookup(application, series_ids)
+        )
+        return True
+
+    application.state.start_metadata_lookup = start_metadata_lookup
 
     @application.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -237,6 +280,16 @@ def _discard_stale_ranges(directory: Path) -> None:
         leftover.unlink(missing_ok=True)
 
 
+def _discard_flat_candidate_covers(directory: Path) -> None:
+    """Drop suggestion thumbnails written before they moved under a budget.
+
+    They sit beside the series covers an operator is told to back up, and the
+    new cache only scans `candidates/`, so nothing would ever reclaim them.
+    """
+    for leftover in directory.glob("candidate-*.webp"):
+        leftover.unlink(missing_ok=True)
+
+
 async def _drain_scan(scan_task: asyncio.Task | None) -> None:
     """Give an in-flight scan a bounded chance to finish, reporting why it did not."""
     if scan_task is None or scan_task.done():
@@ -264,6 +317,27 @@ async def _run_scan(scanner: CatalogScan, library_id: str | None = None) -> None
         )
     except Exception:
         LOGGER.exception("Background catalog scan failed")
+
+
+async def _run_metadata_lookup(application: FastAPI, series_ids: list[str]) -> None:
+    container = application.state.container
+    try:
+        for series_id in series_ids:
+            series = await asyncio.to_thread(
+                container.repository.catalog_series_by_id, series_id
+            )
+            if not series or series.category.casefold() != "manga":
+                application.state.metadata_status["failed"] += 1
+                application.state.metadata_status["completed"] += 1
+                continue
+            try:
+                await asyncio.to_thread(container.metadata.lookup, series)
+            except Exception:
+                LOGGER.exception("Metadata lookup failed for series %s", series_id)
+                application.state.metadata_status["failed"] += 1
+            application.state.metadata_status["completed"] += 1
+    finally:
+        application.state.metadata_status["running"] = False
 
 
 async def _scan_scheduler(application: FastAPI, settings: Settings) -> None:

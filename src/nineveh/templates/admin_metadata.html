@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Manage metadata · {{ library.name }} · {{ service_title }}{% endblock %}
+{% block main_class %}metadata-page{% endblock %}
+{% block content %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><a href="/libraries/{{ library.id }}">{{ library.name }}</a><span>/</span><a href="/libraries/{{ library.id }}/{{ category }}">{{ category|title }}</a><span>/</span><span>Manage metadata</span></nav>
+  <section class="admin-section">
+    <div class="section-heading">
+      <div><p class="eyebrow">MangaBaka</p><h2>Series metadata</h2><p class="muted">Review every match before it changes what readers see.</p></div>
+      <span class="badge">{{ request_limit }} requests/minute</span>
+    </div>
+    {% if metadata_status.running %}
+      <div class="lookup-progress" role="status" data-metadata-progress><span class="status-dot"></span><strong>Looking up suggestions</strong><span>{{ metadata_status.completed }} of {{ metadata_status.total }} complete{% if metadata_status.failed %} · {{ metadata_status.failed }} failed{% endif %}</span></div>
+    {% endif %}
+    <form method="get" action="/libraries/{{ library.id }}/{{ category }}/metadata" class="filters compact-filters">
+      <label>Search <input name="q" value="{{ query }}" placeholder="Local or metadata title"></label>
+      <label>Status <select name="state"><option value="all">All manga</option><option value="unmatched" {% if state_filter == 'unmatched' %}selected{% endif %}>Needs a match</option><option value="matched" {% if state_filter == 'matched' %}selected{% endif %}>Matched</option></select></label>
+      <button class="secondary" type="submit">Filter</button>
+    </form>
+    {% if rows %}
+      <form method="post" action="/libraries/{{ library.id }}/{{ category }}/metadata/lookup">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <div class="metadata-list">
+          {% for row in rows %}
+            <article class="metadata-row">
+              <label class="metadata-select"><input type="checkbox" name="series_id" value="{{ row.series.id }}" {% if metadata_status.running %}disabled{% endif %}><span class="sr-only">Select {{ row.title }}</span></label>
+              <img src="/api/v1/series/{{ row.series.id }}/cover?revision={{ row.series.first_publication_revision }}" alt="" width="72" loading="lazy">
+              <div><h3><a href="/series/{{ row.series.id }}/metadata">{{ row.title }}</a></h3><p>{{ row.series.library }} · {{ row.series.publication_count }} volume{% if row.series.publication_count != 1 %}s{% endif %}</p>{% if row.title != row.series.name %}<small>Folder: {{ row.series.name }}</small>{% endif %}</div>
+              {% if row.metadata %}<span class="badge success">Matched</span>{% else %}<span class="badge warning">Unmatched</span>{% endif %}
+              <a class="button secondary" href="/series/{{ row.series.id }}/metadata">Manage</a>
+            </article>
+          {% endfor %}
+        </div>
+        <div class="settings-actions"><button type="submit" {% if metadata_status.running %}disabled{% endif %}>Find suggestions for selected</button></div>
+      </form>
+    {% else %}
+      <div class="empty-state"><h3>No manga series found</h3><p>Add manga archives or adjust the filters.</p></div>
+    {% endif %}
+    <p class="attribution admin-attribution">Metadata provided by <a href="https://mangabaka.org/" rel="external noreferrer">MangaBaka</a> under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="external noreferrer">CC BY-NC-SA 4.0</a>. Requests occur only when an administrator asks.</p>
+  </section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='admin.js') }}" defer></script>{% endblock %}

@@ -99,14 +99,23 @@ def trusts(configured: str, address: str) -> bool:
     return False
 
 
-def proxy_trust_advice(configured: str, gateway: str | None = None) -> str | None:
+def proxy_trust_advice(
+    configured: str,
+    gateway: str | None = None,
+    route_table: Path = ROUTE_TABLE,
+) -> str | None:
     """A warning when the host-facing gateway would not be believed.
 
     Advisory only. The gateway is where a proxy on the host arrives from under
     Linux Docker; other setups route differently, so a clean result here is not
     a guarantee -- `untrusted_proxy` reports what actually happened.
+
+    `gateway=None` means "detect it", so `route_table` is an argument for the
+    same reason the cgroup paths are: without it the only way to exercise
+    detection is to inherit the host's real routing table, which makes the
+    outcome depend on whether the tests run on Linux.
     """
-    detected = default_gateway() if gateway is None else gateway
+    detected = default_gateway(route_table) if gateway is None else gateway
     if detected is None or trusts(configured, detected):
         return None
     return (

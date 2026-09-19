@@ -1,72 +1,99 @@
 {% extends "base.html" %}
 {% block content %}
-  <div class="heading-row">
+  <div class="catalog-toolbar">
     <div>
-      <h1>Library</h1>
-      <p>{{ total }} publication{% if total != 1 %}s{% endif %}</p>
+      {% if mode == "libraries" %}
+        <p class="eyebrow">Your collection</p><h1>Libraries</h1>
+        <p>{{ total }} publication{% if total != 1 %}s{% endif %} across {{ libraries|length }} librar{% if libraries|length == 1 %}y{% else %}ies{% endif %}</p>
+      {% elif mode == "categories" %}
+        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><span>{{ library.name }}</span></nav>
+        <h1>{{ library.name }}</h1><p>{{ total }} publication{% if total != 1 %}s{% endif %}</p>
+      {% elif mode == "series" %}
+        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><a href="/libraries/{{ library.id }}">{{ library.name }}</a><span>/</span><span>{{ category|title }}</span></nav>
+        <h1>{{ category|title }}</h1><p>{{ series_cards|length }} series · {{ total }} publication{% if total != 1 %}s{% endif %}</p>
+      {% else %}
+        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><span>Search</span></nav>
+        <h1>Search results</h1><p>{{ total }} series for “{{ query }}”</p>
+      {% endif %}
     </div>
-    <a class="button secondary" href="/opds/v2/catalog.json">OPDS feed</a>
+    <div class="catalog-actions">
+      {% if mode == 'series' and category == 'manga' and session.user.is_admin %}<a class="button" href="/libraries/{{ library.id }}/{{ category }}/metadata">Manage metadata</a>{% endif %}
+      <a class="button secondary" href="/opds/v2/catalog.json">OPDS feed</a>
+    </div>
   </div>
 
-  <form method="get" action="/" class="filters">
-    <label>Search <input name="q" value="{{ filters.q or '' }}" placeholder="Title or series"></label>
-    <label>Library
-      <select name="library">
-        <option value="">All libraries</option>
-        {% for name, count in libraries %}
-          <option value="{{ name }}" {% if filters.library == name %}selected{% endif %}>{{ name }} ({{ count }})</option>
-        {% endfor %}
-      </select>
-    </label>
-    <label>Type
-      <select name="category">
-        <option value="">Comics and manga</option>
-        <option value="comics" {% if filters.category == 'comics' %}selected{% endif %}>Comics</option>
-        <option value="manga" {% if filters.category == 'manga' %}selected{% endif %}>Manga</option>
-      </select>
-    </label>
-    {% if series_options %}
-      <label>Series
-        <select name="series">
-          <option value="">All series</option>
-          {% for name, count in series_options %}
-            <option value="{{ name }}" {% if filters.series == name %}selected{% endif %}>{{ name }} ({{ count }})</option>
-          {% endfor %}
-        </select>
-      </label>
-    {% endif %}
-    <button type="submit">Filter</button>
+  <form method="get" action="/" class="catalog-search" role="search">
+    <label class="sr-only" for="catalog-query">Search your library</label>
+    <input id="catalog-query" name="q" value="{{ query or '' }}" placeholder="Search titles, alternate titles, or creators">
+    <button type="submit">Search</button>
   </form>
 
-  {% if publications %}
-    <div class="card-grid">
-      {% for item in publications %}
-        <article class="card">
-          <img
-            src="/api/v1/publications/{{ item.id }}/cover?width=320&amp;revision={{ item.revision }}"
-            alt="Cover for {{ item.title }}"
-            width="320"
-            loading="lazy"
-          >
-          <div class="card-body">
-            <p class="eyebrow">{{ item.library }} · {{ item.category }}</p>
-            <h2>{{ item.title }}</h2>
-            <p>{{ item.series }}{% if item.number %} · #{{ item.number }}{% endif %}</p>
-            <p>{{ item.page_count }} pages</p>
-            <a class="button" href="/api/v1/publications/{{ item.id }}/file">Download CBZ</a>
+  {% if mode == "libraries" %}
+    {% if libraries %}
+      <div class="browse-grid">
+        {% for item, count in libraries %}
+          <a class="browse-card library-tile" href="/libraries/{{ item.id }}">
+            <span class="browse-icon" aria-hidden="true">▥</span>
+            <span><strong>{{ item.name }}</strong><small>{{ count }} publication{% if count != 1 %}s{% endif %}</small></span>
+            <span class="browse-arrow" aria-hidden="true">→</span>
+          </a>
+        {% endfor %}
+      </div>
+      {% if recent_publications %}
+        <section class="recent-section">
+          <div class="section-heading"><div><p class="eyebrow">From your shelves</p><h2>Quick access</h2></div></div>
+          <div class="recent-list">
+            {% for item in recent_publications %}
+              <a href="/series/{{ item.series_id }}"><img src="/api/v1/publications/{{ item.id }}/cover?width=160&amp;revision={{ item.revision }}" alt="" width="48" loading="lazy"><span><strong>{{ item.title }}</strong><small>{{ item.series }}</small></span></a>
+            {% endfor %}
           </div>
-        </article>
-      {% endfor %}
-    </div>
-    <nav class="pagination" aria-label="Catalog pages">
-      {% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Previous</a>{% endif %}
-      <span>Page {{ page }} of {{ page_count }}</span>
-      {% if next_url %}<a class="button secondary" href="{{ next_url }}">Next</a>{% endif %}
-    </nav>
+        </section>
+      {% endif %}
+    {% else %}
+      <div class="empty-state"><h2>No accessible libraries</h2><p>Ask an administrator for access or add a library from the administration area.</p></div>
+    {% endif %}
+  {% elif mode == "categories" %}
+    {% if categories %}
+      <div class="browse-grid">
+        {% for name, count in categories %}
+          <a class="browse-card category-tile" href="/libraries/{{ library.id }}/{{ name }}">
+            <span class="browse-icon" aria-hidden="true">{% if name == 'manga' %}❖{% else %}✦{% endif %}</span>
+            <span><strong>{{ name|title }}</strong><small>{{ count }} publication{% if count != 1 %}s{% endif %}</small></span>
+            <span class="browse-arrow" aria-hidden="true">→</span>
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state"><h2>This library is empty</h2><p>Run a catalog scan after adding CBZ files.</p></div>
+    {% endif %}
   {% else %}
-    <div class="empty-state">
-      <h2>No publications found</h2>
-      <p>Add CBZ files under the configured directory structure or adjust the filters.</p>
-    </div>
+    {% if series_cards %}
+      <div class="series-grid">
+        {% for card in series_cards %}
+          <a class="series-card" href="/series/{{ card.series.id }}">
+            <div class="series-cover">
+              <img src="/api/v1/series/{{ card.series.id }}/cover?revision={{ card.series.first_publication_revision }}" alt="Cover for {{ card.title }}" width="320" loading="lazy">
+              {% if card.metadata %}<span class="metadata-mark" title="Metadata from MangaBaka">MB</span>{% endif %}
+            </div>
+            <div class="series-card-body">
+              <p class="eyebrow">{{ card.series.library }} · {{ card.series.category }}</p>
+              <h2>{{ card.title }}</h2>
+              {% if card.title != card.series.name %}<p class="local-title">{{ card.series.name }}</p>{% endif %}
+              <p>{{ card.series.publication_count }} volume{% if card.series.publication_count != 1 %}s{% endif %}</p>
+            </div>
+          </a>
+        {% endfor %}
+      </div>
+      {% if metadata_attribution %}<p class="attribution grid-attribution">Series metadata and marked covers from <a href="https://mangabaka.org/" rel="external noreferrer">MangaBaka</a>, licensed <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="external noreferrer">CC BY-NC-SA 4.0</a>.</p>{% endif %}
+      {% if previous_url or next_url %}
+        <nav class="pagination" aria-label="Catalog pages">
+          {% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Previous</a>{% endif %}
+          <span>Page {{ page }} of {{ page_count }}</span>
+          {% if next_url %}<a class="button secondary" href="{{ next_url }}">Next</a>{% endif %}
+        </nav>
+      {% endif %}
+    {% else %}
+      <div class="empty-state"><h2>No publications found</h2><p>Try another search or run a catalog scan after adding CBZ files.</p></div>
+    {% endif %}
   {% endif %}
 {% endblock %}

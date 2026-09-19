@@ -37,6 +37,9 @@ class Settings:
         "hash_workers": (1, 32),
         "extract_workers": (1, 32),
         "max_image_pixels": (1, 1_000_000_000),
+        # MangaBaka's public-use ceiling is a hard upper bound. Operators may
+        # deliberately lower it, but no configuration surface can raise it.
+        "mangabaka_requests_per_minute": (1, 30),
     }
     # `public_base_url` is deliberately absent: it is a deployment fact owned by
     # whatever publishes the service, and it gates the browser login origin
@@ -72,6 +75,13 @@ class Settings:
     deployment_memory_limit: str | None = None
     restart_enabled: bool = False
     forwarded_allow_ips: str = "127.0.0.1"
+    mangabaka_requests_per_minute: int = 30
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.mangabaka_requests_per_minute <= 30:
+            raise ValueError(
+                "NINEVEH_MANGABAKA_REQUESTS_PER_MINUTE must be between 1 and 30"
+            )
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -108,6 +118,9 @@ class Settings:
             deployment_memory_limit=os.getenv("NINEVEH_MEMORY_LIMIT") or None,
             restart_enabled=_bool_env("NINEVEH_RESTART_ENABLED", False),
             forwarded_allow_ips=os.getenv("NINEVEH_FORWARDED_ALLOW_IPS", "127.0.0.1"),
+            mangabaka_requests_per_minute=_int_env(
+                "NINEVEH_MANGABAKA_REQUESTS_PER_MINUTE", 30, 1
+            ),
         )
 
     def with_overrides(self, values: Mapping[str, str]) -> Settings:
@@ -159,6 +172,10 @@ class Settings:
         must not count against — or be evicted by — the page cache budget.
         """
         return self.state_dir / "ranges"
+
+    @property
+    def metadata_cover_dir(self) -> Path:
+        return self.state_dir / "series-covers"
 
     def admin_password(self) -> str | None:
         if self.bootstrap_admin_password:
@@ -220,7 +237,16 @@ class SettingsService:
         return candidate
 
     def pending_restart(self) -> bool:
-        return self.saved().editable_values() != self._startup.editable_values()
+        # The metadata limiter reads its value for every reservation, so this
+        # one setting is genuinely live while the rest configure constructed
+        # services and continue to require a restart.
+        live = {"mangabaka_requests_per_minute"}
+        saved = self.saved().editable_values()
+        startup = self._startup.editable_values()
+        return any(saved[name] != startup[name] for name in saved.keys() - live)
+
+    def mangabaka_request_limit(self) -> int:
+        return self.saved().mangabaka_requests_per_minute
 
     def _divergent(self, candidate: Settings) -> dict[str, str]:
         defaults = self._defaults.editable_values()

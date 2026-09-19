@@ -138,7 +138,27 @@ def test_an_absent_route_table_reports_nothing(tmp_path: Path):
 
 def test_advice_is_silent_when_the_gateway_is_already_trusted():
     assert proxy_trust_advice("172.19.0.0/16", gateway="172.19.0.1") is None
-    assert proxy_trust_advice("127.0.0.1", gateway=None) is None
+
+
+def test_advice_is_silent_when_no_gateway_can_be_detected(tmp_path: Path):
+    """Detection must be driven from an injected route table. Reading the real
+    one made this pass on macOS and fail on Linux CI, where the runner has a
+    default route that is not 127.0.0.1."""
+    assert proxy_trust_advice("127.0.0.1", route_table=tmp_path / "absent") is None
+
+
+def test_advice_warns_about_a_detected_gateway_outside_the_trusted_list(
+    tmp_path: Path,
+):
+    table = tmp_path / "route"
+    table.write_text(
+        "Iface\tDestination\tGateway\neth0\t00000000\t0100010A\n", encoding="utf-8"
+    )
+
+    advice = proxy_trust_advice("127.0.0.1", route_table=table)
+
+    assert advice is not None
+    assert "10.1.0.1" in advice
 
 
 def test_advice_names_the_gateway_and_the_current_value():

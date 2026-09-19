@@ -16,6 +16,10 @@
         <label>Thumbnail cache <span class="input-unit"><input name="thumbnail_cache_mb" type="number" min="1" value="{{ settings.thumbnail_cache_mb }}" required><span>MiB</span></span></label>
         <label>Page cache <span class="input-unit"><input name="page_cache_mb" type="number" min="0" value="{{ settings.page_cache_mb }}" required><span>MiB</span></span></label>
       </div>
+      <div class="settings-group metadata-settings"><h3>MangaBaka</h3>
+        <label>Requests per minute <input name="mangabaka_requests_per_minute" type="number" min="1" max="30" value="{{ settings.mangabaka_requests_per_minute }}" required></label>
+        <p class="muted">Applied immediately. Nineveh enforces a hard maximum of 30 requests in every rolling 60-second window.</p>
+      </div>
       <details class="settings-group advanced-settings"><summary>Advanced limits</summary>
         <label>Password workers <input name="hash_workers" type="number" min="1" max="32" value="{{ settings.hash_workers }}" required></label>
         <label>Extraction workers <input name="extract_workers" type="number" min="1" max="32" value="{{ settings.extract_workers }}" required></label>

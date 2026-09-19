@@ -10,19 +10,24 @@ from pathlib import Path
 
 from .domain import (
     AccessGrant,
+    CatalogSeries,
     CategoryUsage,
     LibraryUsage,
     ManagedLibrary,
+    MetadataCandidate,
+    MetadataLookup,
     Page,
     Publication,
     PublicationPage,
     ReadScope,
     ScannedPublication,
+    SeriesMetadata,
+    SeriesMetadataSummary,
     SeriesUsage,
     User,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -38,7 +43,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     csrf_token TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    -- One pending notice per session, consumed by the next page render. Kept
+    -- here rather than in the redirect URL so a banner cannot be forged by
+    -- handing an administrator a link, and never reaches the access log.
+    flash_message TEXT,
+    flash_error TEXT
 );
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
 
@@ -109,6 +119,31 @@ CREATE TABLE IF NOT EXISTS app_settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS series_metadata (
+    series_id TEXT PRIMARY KEY REFERENCES catalog_series(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_id INTEGER NOT NULL,
+    canonical_url TEXT NOT NULL,
+    values_json TEXT NOT NULL,
+    overrides_json TEXT NOT NULL DEFAULT '{}',
+    raw_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    provider_updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS metadata_lookups (
+    series_id TEXT PRIMARY KEY REFERENCES catalog_series(id) ON DELETE CASCADE,
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    searched_at TEXT NOT NULL,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS metadata_rate_events (
+    requested_at REAL PRIMARY KEY
+);
+CREATE INDEX IF NOT EXISTS metadata_rate_events_time
+    ON metadata_rate_events(requested_at);
+
 CREATE TABLE IF NOT EXISTS application_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -159,6 +194,7 @@ class SQLiteRepository:
             # the database on "table already exists".
             connection.executescript(SCHEMA)
             self._ensure_scope_columns(connection)
+            self._ensure_session_flash_columns(connection)
             connection.executescript(SCOPE_INDEX)
             if 0 < version < SCHEMA_VERSION:
                 self._backfill_scope(connection)
@@ -181,6 +217,17 @@ class SQLiteRepository:
                 "ALTER TABLE publications "
                 "ADD COLUMN series_id TEXT REFERENCES catalog_series(id)"
             )
+
+    @staticmethod
+    def _ensure_session_flash_columns(connection: sqlite3.Connection) -> None:
+        """Sessions created before notices moved out of the redirect URL."""
+        present = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        for column in ("flash_message", "flash_error"):
+            if column not in present:
+                connection.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
 
     @staticmethod
     def _backfill_scope(connection: sqlite3.Connection) -> None:
@@ -468,6 +515,227 @@ class SQLiteRepository:
                 [(key, value, _now_iso()) for key, value in values.items()],
             )
 
+    def series_metadata(self, series_id: str) -> SeriesMetadata | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM series_metadata WHERE series_id = ?", (series_id,)
+            ).fetchone()
+        return self._series_metadata(row) if row else None
+
+    def all_series_metadata(self) -> dict[str, SeriesMetadata]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM series_metadata").fetchall()
+        return {row["series_id"]: self._series_metadata(row) for row in rows}
+
+    def series_metadata_summaries(self) -> dict[str, SeriesMetadataSummary]:
+        """Titles and match state without the retained provider payloads."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT series_id, provider_id,
+                       COALESCE(
+                           json_extract(overrides_json, '$.title'),
+                           json_extract(values_json, '$.title')
+                       ) AS title
+                FROM series_metadata
+                """
+            ).fetchall()
+        return {
+            row["series_id"]: SeriesMetadataSummary(
+                series_id=row["series_id"],
+                provider_id=row["provider_id"],
+                title=row["title"],
+            )
+            for row in rows
+        }
+
+    def save_series_metadata(
+        self,
+        series_id: str,
+        provider_id: int,
+        canonical_url: str,
+        values: dict[str, object],
+        raw: dict[str, object],
+        provider_updated_at: str | None,
+    ) -> SeriesMetadata:
+        """Replace provider-owned values without touching administrator overrides."""
+        with self._connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM catalog_series WHERE id = ?", (series_id,)
+            ).fetchone():
+                raise ValueError("Series not found")
+            connection.execute(
+                """
+                INSERT INTO series_metadata(
+                    series_id, provider, provider_id, canonical_url, values_json,
+                    overrides_json, raw_json, fetched_at, provider_updated_at
+                ) VALUES (?, 'mangabaka', ?, ?, ?, '{}', ?, ?, ?)
+                ON CONFLICT(series_id) DO UPDATE SET
+                    provider=excluded.provider,
+                    provider_id=excluded.provider_id,
+                    canonical_url=excluded.canonical_url,
+                    values_json=excluded.values_json,
+                    raw_json=excluded.raw_json,
+                    fetched_at=excluded.fetched_at,
+                    provider_updated_at=excluded.provider_updated_at
+                """,
+                (
+                    series_id,
+                    provider_id,
+                    canonical_url,
+                    json.dumps(values, ensure_ascii=False),
+                    json.dumps(raw, ensure_ascii=False),
+                    _now_iso(),
+                    provider_updated_at,
+                ),
+            )
+        metadata = self.series_metadata(series_id)
+        if metadata is None:  # pragma: no cover - guarded by the transaction
+            raise RuntimeError("Series metadata disappeared after save")
+        return metadata
+
+    def replace_metadata_overrides(
+        self, series_id: str, overrides: dict[str, object]
+    ) -> SeriesMetadata:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE series_metadata SET overrides_json = ? WHERE series_id = ?",
+                (json.dumps(overrides, ensure_ascii=False), series_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("Series metadata not found")
+        metadata = self.series_metadata(series_id)
+        if metadata is None:  # pragma: no cover - guarded by rowcount
+            raise RuntimeError("Series metadata disappeared after update")
+        return metadata
+
+    def delete_series_metadata(self, series_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM series_metadata WHERE series_id = ?", (series_id,)
+            )
+
+    def metadata_lookup(self, series_id: str) -> MetadataLookup:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM metadata_lookups WHERE series_id = ?", (series_id,)
+            ).fetchone()
+        if not row:
+            return MetadataLookup(series_id, ())
+        candidates = tuple(
+            MetadataCandidate(
+                provider_id=int(item["provider_id"]),
+                title=item["title"],
+                alternative_titles=tuple(item.get("alternative_titles", ())),
+                authors=tuple(item.get("authors", ())),
+                artists=tuple(item.get("artists", ())),
+                description=item.get("description"),
+                year=item.get("year"),
+                media_type=item.get("media_type"),
+                status=item.get("status"),
+                rating=item.get("rating"),
+                publishers=tuple(item.get("publishers", ())),
+                tags=tuple(item.get("tags", ())),
+                cover_url=item.get("cover_url"),
+                source_url=item.get("source_url"),
+            )
+            for item in json.loads(row["candidates_json"])
+        )
+        return MetadataLookup(
+            series_id=series_id,
+            candidates=candidates,
+            searched_at=datetime.fromisoformat(row["searched_at"]),
+            error=row["error"],
+        )
+
+    def replace_metadata_lookup(
+        self,
+        series_id: str,
+        candidates: list[MetadataCandidate],
+        error: str | None = None,
+    ) -> MetadataLookup:
+        payload = [
+            {
+                "provider_id": item.provider_id,
+                "title": item.title,
+                "alternative_titles": item.alternative_titles,
+                "authors": item.authors,
+                "artists": item.artists,
+                "description": item.description,
+                "year": item.year,
+                "media_type": item.media_type,
+                "status": item.status,
+                "rating": item.rating,
+                "publishers": item.publishers,
+                "tags": item.tags,
+                "cover_url": item.cover_url,
+                "source_url": item.source_url,
+            }
+            for item in candidates
+        ]
+        with self._connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM catalog_series WHERE id = ?", (series_id,)
+            ).fetchone():
+                raise ValueError("Series not found")
+            connection.execute(
+                """
+                INSERT INTO metadata_lookups(
+                    series_id, candidates_json, searched_at, error
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(series_id) DO UPDATE SET
+                    candidates_json=excluded.candidates_json,
+                    searched_at=excluded.searched_at,
+                    error=excluded.error
+                """,
+                (series_id, json.dumps(payload, ensure_ascii=False), _now_iso(), error),
+            )
+        return self.metadata_lookup(series_id)
+
+    def reserve_metadata_request(
+        self, limit: int, now: float, window_seconds: float = 60.0
+    ) -> float:
+        """Reserve one outbound request or return its required wait time."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM metadata_rate_events WHERE requested_at <= ?",
+                (now - window_seconds,),
+            )
+            rows = connection.execute(
+                "SELECT requested_at FROM metadata_rate_events ORDER BY requested_at"
+            ).fetchall()
+            if len(rows) >= limit:
+                return max(
+                    0.001,
+                    float(rows[0]["requested_at"]) + window_seconds - now,
+                )
+            timestamp = now
+            while connection.execute(
+                "SELECT 1 FROM metadata_rate_events WHERE requested_at = ?",
+                (timestamp,),
+            ).fetchone():
+                timestamp += 0.000001
+            connection.execute(
+                "INSERT INTO metadata_rate_events(requested_at) VALUES (?)",
+                (timestamp,),
+            )
+        return 0.0
+
+    @staticmethod
+    def _series_metadata(row: sqlite3.Row) -> SeriesMetadata:
+        return SeriesMetadata(
+            series_id=row["series_id"],
+            provider=row["provider"],
+            provider_id=row["provider_id"],
+            canonical_url=row["canonical_url"],
+            values=json.loads(row["values_json"]),
+            overrides=json.loads(row["overrides_json"]),
+            raw=json.loads(row["raw_json"]),
+            fetched_at=datetime.fromisoformat(row["fetched_at"]),
+            provider_updated_at=row["provider_updated_at"],
+        )
+
     @staticmethod
     def _user(row: sqlite3.Row) -> User:
         return User(
@@ -616,6 +884,33 @@ class SQLiteRepository:
             connection.execute(
                 "DELETE FROM sessions WHERE token_hash = ?", (token_hash,)
             )
+
+    def set_session_flash(
+        self, token_hash: str, message: str | None, error: str | None
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE sessions SET flash_message = ?, flash_error = ? "
+                "WHERE token_hash = ?",
+                (message, error, token_hash),
+            )
+
+    def take_session_flash(self, token_hash: str) -> tuple[str | None, str | None]:
+        """Read the pending notice and clear it in one transaction."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT flash_message, flash_error FROM sessions WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if not row or (row["flash_message"] is None and row["flash_error"] is None):
+                return None, None
+            connection.execute(
+                "UPDATE sessions SET flash_message = NULL, flash_error = NULL "
+                "WHERE token_hash = ?",
+                (token_hash,),
+            )
+        return row["flash_message"], row["flash_error"]
 
     def publication_by_id(
         self, publication_id: str, scope: ReadScope | None = None
@@ -827,6 +1122,104 @@ class SQLiteRepository:
                 parameters,
             )
             return cursor.rowcount
+
+    def catalog_series(
+        self,
+        *,
+        series_id: str | None = None,
+        library_id: str | None = None,
+        category: str | None = None,
+        query: str | None = None,
+        scope: ReadScope | None = None,
+    ) -> list[CatalogSeries]:
+        clauses = ["managed_libraries.enabled = 1"]
+        parameters: list[object] = []
+        if series_id:
+            clauses.append("catalog_series.id = ?")
+            parameters.append(series_id)
+        if library_id:
+            clauses.append("catalog_series.library_id = ?")
+            parameters.append(library_id)
+        if category:
+            clauses.append("catalog_series.category = ? COLLATE NOCASE")
+            parameters.append(category)
+        if query:
+            escaped = (
+                query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            )
+            pattern = f"%{escaped}%"
+            # The EXISTS keeps volume titles searchable now that browsing is
+            # series-first; matching them in the outer join instead would drop
+            # every non-matching volume and understate the series' own counts.
+            clauses.append(
+                "(catalog_series.name LIKE ? ESCAPE '\\' "
+                "OR json_extract(series_metadata.values_json, '$.title') LIKE ? ESCAPE '\\' "
+                "OR json_extract(series_metadata.overrides_json, '$.title') LIKE ? ESCAPE '\\' "
+                "OR series_metadata.values_json LIKE ? ESCAPE '\\' "
+                "OR series_metadata.overrides_json LIKE ? ESCAPE '\\' "
+                "OR EXISTS (SELECT 1 FROM publications AS matched "
+                "WHERE matched.series_id = catalog_series.id "
+                "AND (matched.title LIKE ? ESCAPE '\\' "
+                "OR matched.filename LIKE ? ESCAPE '\\')))"
+            )
+            parameters.extend([pattern] * 7)
+        scope_clause, scope_parameters = _scope_predicate(scope)
+        clauses.append(scope_clause)
+        parameters.extend(scope_parameters)
+        where = " AND ".join(f"({clause})" for clause in clauses)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                WITH visible AS (
+                    SELECT catalog_series.id, catalog_series.library_id,
+                           managed_libraries.name AS library,
+                           catalog_series.category, catalog_series.name,
+                           publications.id AS publication_id,
+                           publications.revision AS publication_revision,
+                           COUNT(*) OVER (
+                               PARTITION BY catalog_series.id
+                           ) AS publication_count,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY catalog_series.id
+                               ORDER BY publications.number COLLATE NOCASE,
+                                        publications.title COLLATE NOCASE,
+                                        publications.id
+                           ) AS cover_order
+                    FROM catalog_series
+                    JOIN managed_libraries
+                      ON managed_libraries.id = catalog_series.library_id
+                    JOIN publications
+                      ON publications.series_id = catalog_series.id
+                    LEFT JOIN series_metadata
+                      ON series_metadata.series_id = catalog_series.id
+                    WHERE {where}
+                )
+                SELECT * FROM visible WHERE cover_order = 1
+                ORDER BY library COLLATE NOCASE, category COLLATE NOCASE,
+                         name COLLATE NOCASE
+                """,
+                parameters,
+            ).fetchall()
+        return [self._catalog_series(row) for row in rows]
+
+    def catalog_series_by_id(
+        self, series_id: str, scope: ReadScope | None = None
+    ) -> CatalogSeries | None:
+        items = self.catalog_series(series_id=series_id, scope=scope)
+        return items[0] if items else None
+
+    @staticmethod
+    def _catalog_series(row: sqlite3.Row) -> CatalogSeries:
+        return CatalogSeries(
+            id=row["id"],
+            library_id=row["library_id"],
+            library=row["library"],
+            category=row["category"],
+            name=row["name"],
+            publication_count=row["publication_count"],
+            first_publication_id=row["publication_id"],
+            first_publication_revision=row["publication_revision"],
+        )
 
     def libraries(self, scope: ReadScope | None = None) -> list[tuple[str, int]]:
         return self._grouped("library", (), scope)

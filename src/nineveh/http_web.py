@@ -3,9 +3,10 @@ from __future__ import annotations
 import math
 import sqlite3
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Form, HTTPException, Query, Request
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -15,6 +16,7 @@ from .catalog import InvalidLibrary
 from .deployment import memory_limit_text
 from .domain import AccessGrant, Session
 from .http_api import SESSION_COOKIE, scan_active
+from .metadata import EDITABLE_FIELDS, MAX_COVER_BYTES, MetadataError
 from .units import gibibytes
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -129,72 +131,198 @@ async def catalog(
     if not session:
         return RedirectResponse("/login", status_code=303)
     container = _container(request)
-    filters = {
-        "library": library or "",
-        "category": category or "",
-        "series": series or "",
-        "q": q or "",
-    }
-    view = await _catalog_view(container, session, filters, page)
+    scope = container.authorization.read_scope(session.user)
+
+    moved = await _legacy_filter_redirect(container, scope, library, category, series)
+    if moved:
+        return moved
+
+    query = (q or "").strip()
+    view = (
+        await _search_results(container, scope, query, page)
+        if query
+        else await _library_shelves(container, scope)
+    )
     return templates.TemplateResponse(
         request,
         "catalog.html",
         {
             "service_title": container.settings.service_title,
             "session": session,
-            "filters": filters,
-            "page": page,
+            "mode": "search" if query else "libraries",
+            "query": query,
             **view,
         },
     )
 
 
-async def _catalog_view(
-    container, session: Session, filters: dict[str, str], page: int
-) -> dict:
-    """Everything the catalog template needs beyond the request and session."""
-    page_size = container.settings.feed_page_size
-    scope = container.authorization.read_scope(session.user)
-    publications, total = await run_in_threadpool(
-        container.repository.publications,
-        library=filters["library"] or None,
-        category=filters["category"] or None,
-        series=filters["series"] or None,
-        query=filters["q"] or None,
-        limit=page_size,
-        offset=(page - 1) * page_size,
-        scope=scope,
-    )
-    libraries = await run_in_threadpool(container.repository.libraries, scope)
-    series_options = (
-        await run_in_threadpool(
-            container.repository.series,
-            filters["library"],
-            filters["category"],
-            scope,
+async def _legacy_filter_redirect(container, scope, library, category, series):
+    """Keep the pre-hierarchy `?library=&category=&series=` links working."""
+    if not library:
+        return None
+    managed = await _managed_library_named(container, library, scope)
+    if not managed:
+        return None
+    if category and series:
+        matches = await run_in_threadpool(
+            container.repository.catalog_series,
+            library_id=managed.id,
+            category=category,
+            query=series,
+            scope=scope,
         )
-        if filters["library"] and filters["category"]
-        else []
+        exact = next((item for item in matches if item.name == series), None)
+        if exact:
+            return RedirectResponse(f"/series/{exact.id}", status_code=303)
+    if category:
+        return RedirectResponse(f"/libraries/{managed.id}/{category}", status_code=303)
+    return RedirectResponse(f"/libraries/{managed.id}", status_code=303)
+
+
+async def _search_results(container, scope, query: str, page: int) -> dict[str, object]:
+    matches = await run_in_threadpool(
+        container.repository.catalog_series, query=query, scope=scope
     )
-    page_count = max(1, math.ceil(total / page_size))
+    summaries = await run_in_threadpool(container.repository.series_metadata_summaries)
+    page_size = container.settings.feed_page_size
+    page_count = max(1, math.ceil(len(matches) / page_size))
+    page = min(page, page_count)
+    start = (page - 1) * page_size
+    cards = _series_cards(matches[start : start + page_size], summaries)
     return {
-        "publications": publications,
-        "total": total,
-        "libraries": libraries,
-        "series_options": series_options,
+        "page": page,
         "page_count": page_count,
-        "previous_url": _catalog_url(filters, page - 1) if page > 1 else None,
-        "next_url": _catalog_url(filters, page + 1) if page < page_count else None,
+        "libraries": [],
+        "series_cards": cards,
+        "metadata_attribution": any(card["metadata"] for card in cards),
+        "recent_publications": [],
+        "total": len(matches),
+        "previous_url": _search_url(query, page - 1) if page > 1 else None,
+        "next_url": _search_url(query, page + 1) if page < page_count else None,
     }
 
 
+async def _library_shelves(container, scope) -> dict[str, object]:
+    """The landing view reads neither the series index nor stored metadata."""
+    visible = dict(await run_in_threadpool(container.repository.libraries, scope))
+    managed = await run_in_threadpool(container.repository.managed_libraries)
+    libraries = [(item, visible[item.name]) for item in managed if item.name in visible]
+    recent = await run_in_threadpool(
+        container.repository.publications, limit=6, scope=scope
+    )
+    return {
+        "page": 1,
+        "page_count": 1,
+        "libraries": libraries,
+        "series_cards": [],
+        "metadata_attribution": False,
+        "recent_publications": recent[0],
+        "total": sum(count for _, count in libraries),
+        "previous_url": None,
+        "next_url": None,
+    }
+
+
+@router.get("/libraries/{library_id}", response_class=HTMLResponse)
+async def library_detail(request: Request, library_id: str):
+    session = await _require_browser_session(request)
+    container = _container(request)
+    scope = container.authorization.read_scope(session.user)
+    library = await run_in_threadpool(container.repository.managed_library, library_id)
+    visible = dict(await run_in_threadpool(container.repository.libraries, scope))
+    if not library or library.name not in visible:
+        raise HTTPException(status_code=404, detail="Library not found")
+    categories = await run_in_threadpool(
+        container.repository.categories, library.name, scope
+    )
+    return templates.TemplateResponse(
+        request,
+        "catalog.html",
+        {
+            "service_title": container.settings.service_title,
+            "session": session,
+            "mode": "categories",
+            "library": library,
+            "categories": categories,
+            "total": visible[library.name],
+        },
+    )
+
+
+@router.get("/libraries/{library_id}/{category}", response_class=HTMLResponse)
+async def category_detail(request: Request, library_id: str, category: str):
+    session = await _require_browser_session(request)
+    container = _container(request)
+    scope = container.authorization.read_scope(session.user)
+    library = await run_in_threadpool(container.repository.managed_library, library_id)
+    if not library:
+        raise HTTPException(status_code=404, detail="Library not found")
+    cards = await run_in_threadpool(
+        container.repository.catalog_series,
+        library_id=library_id,
+        category=category,
+        scope=scope,
+    )
+    visible_categories = dict(
+        await run_in_threadpool(container.repository.categories, library.name, scope)
+    )
+    if category not in visible_categories:
+        raise HTTPException(status_code=404, detail="Category not found")
+    metadata = await run_in_threadpool(container.repository.series_metadata_summaries)
+    series_cards = _series_cards(cards, metadata)
+    return templates.TemplateResponse(
+        request,
+        "catalog.html",
+        {
+            "service_title": container.settings.service_title,
+            "session": session,
+            "mode": "series",
+            "library": library,
+            "category": category,
+            "series_cards": series_cards,
+            "metadata_attribution": any(card["metadata"] for card in series_cards),
+            "total": visible_categories[category],
+        },
+    )
+
+
+@router.get("/series/{series_id}", response_class=HTMLResponse)
+async def series_detail(request: Request, series_id: str):
+    session = await _require_browser_session(request)
+    container = _container(request)
+    scope = container.authorization.read_scope(session.user)
+    item = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id, scope
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Series not found")
+    metadata = await run_in_threadpool(container.repository.series_metadata, series_id)
+    publications, _ = await run_in_threadpool(
+        container.repository.publications,
+        library=item.library,
+        category=item.category,
+        series=item.name,
+        limit=10_000,
+        scope=scope,
+    )
+    return templates.TemplateResponse(
+        request,
+        "series.html",
+        {
+            "service_title": container.settings.service_title,
+            "session": session,
+            "series": item,
+            "metadata": metadata,
+            "details": metadata.effective if metadata else {},
+            "display_title": _series_title(item, metadata),
+            "publications": publications,
+        },
+    )
+
+
 @router.get("/admin", response_class=HTMLResponse)
-async def admin_overview(
-    request: Request,
-    message: str | None = Query(default=None, max_length=200),
-    error: str | None = Query(default=None, max_length=200),
-):
-    context = await _admin_context(request, "overview", message, error)
+async def admin_overview(request: Request):
+    context = await _admin_context(request, "overview")
     container = _container(request)
     usage = await run_in_threadpool(container.repository.library_usage)
     context.update(
@@ -212,12 +340,8 @@ async def admin_overview(
 
 
 @router.get("/admin/libraries", response_class=HTMLResponse)
-async def admin_libraries_page(
-    request: Request,
-    message: str | None = Query(default=None, max_length=200),
-    error: str | None = Query(default=None, max_length=200),
-):
-    context = await _admin_context(request, "libraries", message, error)
+async def admin_libraries_page(request: Request):
+    context = await _admin_context(request, "libraries")
     container = _container(request)
     context["library_usage"] = await run_in_threadpool(
         container.repository.library_usage
@@ -229,13 +353,90 @@ async def admin_libraries_page(
     return templates.TemplateResponse(request, "admin_libraries.html", context)
 
 
-@router.get("/admin/users", response_class=HTMLResponse)
-async def admin_users_page(
+@router.get("/libraries/{library_id}/{category}/metadata", response_class=HTMLResponse)
+async def library_metadata_page(
     request: Request,
-    message: str | None = Query(default=None, max_length=200),
-    error: str | None = Query(default=None, max_length=200),
+    library_id: str,
+    category: str,
+    q: str | None = Query(default=None, max_length=200),
+    state: str | None = Query(default=None, max_length=20),
 ):
-    context = await _admin_context(request, "users", message, error)
+    session = await _require_admin(request)
+    message, error = await _take_flash(request)
+    container = _container(request)
+    library = await run_in_threadpool(container.repository.managed_library, library_id)
+    if not library or not library.enabled or category.casefold() != "manga":
+        raise HTTPException(status_code=404, detail="Manga library not found")
+    items = await run_in_threadpool(
+        container.repository.catalog_series,
+        library_id=library_id,
+        category="manga",
+        query=(q or "").strip() or None,
+    )
+    metadata = await run_in_threadpool(container.repository.series_metadata_summaries)
+    rows = [
+        {
+            "series": item,
+            "metadata": metadata.get(item.id),
+            "title": _series_title(item, metadata.get(item.id)),
+        }
+        for item in items
+        if state not in {"matched", "unmatched"}
+        or (state == "matched") == (item.id in metadata)
+    ]
+    return templates.TemplateResponse(
+        request,
+        "admin_metadata.html",
+        {
+            "service_title": container.settings.service_title,
+            "session": session,
+            "library": library,
+            "category": category,
+            "rows": rows,
+            "query": q or "",
+            "state_filter": state or "all",
+            "metadata_status": request.app.state.metadata_status,
+            "request_limit": container.configuration.mangabaka_request_limit(),
+            "message": message,
+            "error": error,
+        },
+    )
+
+
+@router.get("/series/{series_id}/metadata", response_class=HTMLResponse)
+async def series_metadata_page(request: Request, series_id: str):
+    session = await _require_admin(request)
+    message, error = await _take_flash(request)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    if not series or series.category.casefold() != "manga":
+        raise HTTPException(status_code=404, detail="Manga series not found")
+    metadata = await run_in_threadpool(container.repository.series_metadata, series_id)
+    lookup = await run_in_threadpool(container.repository.metadata_lookup, series_id)
+    return templates.TemplateResponse(
+        request,
+        "admin_metadata_detail.html",
+        {
+            "service_title": container.settings.service_title,
+            "session": session,
+            "series": series,
+            "metadata": metadata,
+            "details": metadata.effective if metadata else {},
+            "lookup": lookup,
+            "has_custom_cover": bool(
+                container.metadata and container.metadata.covers.has_custom(series_id)
+            ),
+            "message": message,
+            "error": error,
+        },
+    )
+
+
+@router.get("/admin/users", response_class=HTMLResponse)
+async def admin_users_page(request: Request):
+    context = await _admin_context(request, "users")
     container = _container(request)
     users = await run_in_threadpool(container.repository.users)
     context["users"] = users
@@ -252,12 +453,8 @@ async def admin_users_page(
 
 
 @router.get("/admin/settings", response_class=HTMLResponse)
-async def admin_settings_page(
-    request: Request,
-    message: str | None = Query(default=None, max_length=200),
-    error: str | None = Query(default=None, max_length=200),
-):
-    context = await _admin_context(request, "settings", message, error)
+async def admin_settings_page(request: Request):
+    context = await _admin_context(request, "settings")
     container = _container(request)
     context["settings"] = await run_in_threadpool(container.configuration.saved)
     context["pending_restart"] = await run_in_threadpool(
@@ -270,13 +467,9 @@ async def admin_settings_page(
     return templates.TemplateResponse(request, "admin_settings.html", context)
 
 
-async def _admin_context(
-    request: Request,
-    section: str,
-    message: str | None,
-    error: str | None,
-) -> dict[str, object]:
+async def _admin_context(request: Request, section: str) -> dict[str, object]:
     session = await _require_admin(request)
+    message, error = await _take_flash(request)
     return {
         "service_title": _container(request).settings.service_title,
         "session": session,
@@ -309,8 +502,10 @@ async def admin_create_user(
             if isinstance(error, sqlite3.IntegrityError)
             else str(error)
         )
-        return _admin_redirect("users", error=message)
-    return _admin_redirect("users", message=f"Created user {username.strip()}.")
+        return await _admin_redirect(request, "users", error=message)
+    return await _admin_redirect(
+        request, "users", message=f"Created user {username.strip()}."
+    )
 
 
 @router.post("/admin/users/{user_id}/enabled")
@@ -323,17 +518,21 @@ async def admin_enable_user(
     session = await _require_admin(request)
     _verify_csrf(request, session, csrf_token)
     if user_id == session.user.id and not enabled:
-        return _admin_redirect("users", error="You cannot disable your own account.")
+        return await _admin_redirect(
+            request, "users", error="You cannot disable your own account."
+        )
     try:
         user = await run_in_threadpool(
             _container(request).auth.set_enabled, user_id, enabled
         )
     except LastAdministratorError as error:
-        return _admin_redirect("users", error=str(error))
+        return await _admin_redirect(request, "users", error=str(error))
     if not user:
-        return _admin_redirect("users", error="User not found.")
+        return await _admin_redirect(request, "users", error="User not found.")
     state = "enabled" if enabled else "disabled"
-    return _admin_redirect("users", message=f"{user.username} is now {state}.")
+    return await _admin_redirect(
+        request, "users", message=f"{user.username} is now {state}."
+    )
 
 
 @router.post("/admin/users/{user_id}/password")
@@ -350,10 +549,12 @@ async def admin_reset_password(
             _container(request).auth.reset_password, user_id, password
         )
     except InvalidUserInput as error:
-        return _admin_redirect("users", error=str(error))
+        return await _admin_redirect(request, "users", error=str(error))
     if not user:
-        return _admin_redirect("users", error="User not found.")
-    return _admin_redirect("users", message=f"Reset the password for {user.username}.")
+        return await _admin_redirect(request, "users", error="User not found.")
+    return await _admin_redirect(
+        request, "users", message=f"Reset the password for {user.username}."
+    )
 
 
 @router.post("/admin/users/{user_id}/access")
@@ -371,8 +572,8 @@ async def admin_update_access(
         ]
         await run_in_threadpool(service.replace, user_id, decoded)
     except ValueError as error:
-        return _admin_redirect("users", error=str(error))
-    return _admin_redirect("users", message="Reader access updated.")
+        return await _admin_redirect(request, "users", error=str(error))
+    return await _admin_redirect(request, "users", message="Reader access updated.")
 
 
 @router.post("/admin/libraries")
@@ -384,17 +585,19 @@ async def admin_add_library(
     session = await _require_admin(request)
     _verify_csrf(request, session, csrf_token)
     if scan_active(request):
-        return _admin_redirect(
-            "libraries", error="Wait for the catalog scan to finish."
+        return await _admin_redirect(
+            request, "libraries", error="Wait for the catalog scan to finish."
         )
     service = _container(request).libraries
     try:
         library = await run_in_threadpool(service.add, relative_path)
     except InvalidLibrary as error:
-        return _admin_redirect("libraries", error=str(error))
+        return await _admin_redirect(request, "libraries", error=str(error))
     request.app.state.start_scan(library.id)
-    return _admin_redirect(
-        "libraries", message=f"Added {library.name} and started its first scan."
+    return await _admin_redirect(
+        request,
+        "libraries",
+        message=f"Added {library.name} and started its first scan.",
     )
 
 
@@ -405,16 +608,18 @@ async def admin_remove_library(
     session = await _require_admin(request)
     _verify_csrf(request, session, csrf_token)
     if scan_active(request):
-        return _admin_redirect(
-            "libraries", error="Wait for the catalog scan to finish."
+        return await _admin_redirect(
+            request, "libraries", error="Wait for the catalog scan to finish."
         )
     service = _container(request).libraries
     try:
         library = await run_in_threadpool(service.remove, library_id)
     except InvalidLibrary as error:
-        return _admin_redirect("libraries", error=str(error))
-    return _admin_redirect(
-        "libraries", message=f"Removed {library.name}; no media files were deleted."
+        return await _admin_redirect(request, "libraries", error=str(error))
+    return await _admin_redirect(
+        request,
+        "libraries",
+        message=f"Removed {library.name}; no media files were deleted.",
     )
 
 
@@ -428,10 +633,215 @@ async def admin_scan_library(
         _container(request).repository.managed_library, library_id
     )
     if not library or not library.enabled:
-        return _admin_redirect("libraries", error="Managed library not found.")
+        return await _admin_redirect(
+            request, "libraries", error="Managed library not found."
+        )
     if not request.app.state.start_scan(library_id):
-        return _admin_redirect("libraries", error="A catalog scan is already running.")
-    return _admin_redirect("libraries", message=f"Started scanning {library.name}.")
+        return await _admin_redirect(
+            request, "libraries", error="A catalog scan is already running."
+        )
+    return await _admin_redirect(
+        request, "libraries", message=f"Started scanning {library.name}."
+    )
+
+
+@router.post("/libraries/{library_id}/{category}/metadata/lookup")
+async def library_bulk_metadata_lookup(
+    request: Request, library_id: str, category: str
+):
+    session = await _require_admin(request)
+    form = await request.form()
+    _verify_csrf(request, session, str(form.get("csrf_token", "")))
+    series_ids = list(dict.fromkeys(str(value) for value in form.getlist("series_id")))
+    target = (library_id, category)
+    if not series_ids:
+        return await _library_metadata_redirect(
+            request, *target, error="Select at least one manga series."
+        )
+    if len(series_ids) > 500:
+        return await _library_metadata_redirect(
+            request, *target, error="Select no more than 500 series."
+        )
+    available = {
+        item.id
+        for item in await run_in_threadpool(
+            _container(request).repository.catalog_series,
+            library_id=library_id,
+            category=category,
+        )
+    }
+    if category.casefold() != "manga" or any(
+        series_id not in available for series_id in series_ids
+    ):
+        return await _library_metadata_redirect(
+            request, *target, error="One or more selected manga series were not found."
+        )
+    if not request.app.state.start_metadata_lookup(series_ids):
+        return await _library_metadata_redirect(
+            request, *target, error="A metadata lookup is already running."
+        )
+    return await _library_metadata_redirect(
+        request, *target, message=f"Started looking up {len(series_ids)} series."
+    )
+
+
+@router.post("/series/{series_id}/metadata/lookup")
+async def series_metadata_lookup(
+    request: Request,
+    series_id: str,
+    query: str = Form(default="", max_length=200),
+    csrf_token: str = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    if not series or not container.metadata:
+        return await _metadata_redirect(
+            request, series_id, error="Manga series not found."
+        )
+    try:
+        await run_in_threadpool(container.metadata.lookup, series, query or None)
+    except MetadataError as error:
+        return await _metadata_redirect(request, series_id, error=str(error))
+    return await _metadata_redirect(
+        request, series_id, message="MangaBaka suggestions updated."
+    )
+
+
+@router.post("/series/{series_id}/metadata/match")
+async def series_metadata_match(
+    request: Request,
+    series_id: str,
+    provider_id: int = Form(...),
+    csrf_token: str = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    if not series or not container.metadata:
+        return await _metadata_redirect(
+            request, series_id, error="Manga series not found."
+        )
+    try:
+        await run_in_threadpool(container.metadata.match, series, provider_id)
+    except MetadataError as error:
+        return await _metadata_redirect(request, series_id, error=str(error))
+    return await _metadata_redirect(
+        request, series_id, message="MangaBaka metadata linked."
+    )
+
+
+@router.post("/series/{series_id}/metadata/refresh")
+async def series_metadata_refresh(
+    request: Request, series_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    if not series or not container.metadata:
+        return await _metadata_redirect(
+            request, series_id, error="Manga series not found."
+        )
+    try:
+        await run_in_threadpool(container.metadata.refresh, series)
+    except MetadataError as error:
+        return await _metadata_redirect(request, series_id, error=str(error))
+    return await _metadata_redirect(
+        request, series_id, message="Metadata refreshed; local edits were preserved."
+    )
+
+
+@router.post("/series/{series_id}/metadata/edit")
+async def series_metadata_edit(request: Request, series_id: str):
+    session = await _require_admin(request)
+    form = await request.form()
+    _verify_csrf(request, session, str(form.get("csrf_token", "")))
+    service = _container(request).metadata
+    if not service:
+        return await _metadata_redirect(
+            request, series_id, error="Metadata service unavailable."
+        )
+    values = {name: str(form.get(name, "")) for name in EDITABLE_FIELDS}
+    try:
+        await run_in_threadpool(service.update, series_id, values)
+    except MetadataError as error:
+        return await _metadata_redirect(request, series_id, error=str(error))
+    return await _metadata_redirect(
+        request, series_id, message="Series metadata saved."
+    )
+
+
+@router.post("/series/{series_id}/metadata/cover")
+async def series_metadata_cover(
+    request: Request,
+    series_id: str,
+    cover: Annotated[UploadFile, File()],
+    csrf_token: str = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    service = container.metadata
+    if not series or series.category.casefold() != "manga" or not service:
+        return RedirectResponse("/", status_code=303)
+    payload = await cover.read(MAX_COVER_BYTES + 1)
+    try:
+        await run_in_threadpool(service.covers.save_custom, series_id, payload)
+    except MetadataError as error:
+        return await _metadata_redirect(request, series_id, error=str(error))
+    return await _metadata_redirect(
+        request, series_id, message="Custom series cover uploaded."
+    )
+
+
+@router.post("/series/{series_id}/metadata/cover/remove")
+async def remove_series_metadata_cover(
+    request: Request, series_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    service = container.metadata
+    if not series or series.category.casefold() != "manga" or not service:
+        return RedirectResponse("/", status_code=303)
+    await run_in_threadpool(service.covers.remove_custom, series_id)
+    return await _metadata_redirect(request, series_id, message="Custom cover removed.")
+
+
+@router.post("/series/{series_id}/metadata/unlink")
+async def series_metadata_unlink(
+    request: Request, series_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    service = container.metadata
+    if not series or series.category.casefold() != "manga" or not service:
+        return RedirectResponse("/", status_code=303)
+    await run_in_threadpool(service.unlink, series_id)
+    return await _metadata_redirect(
+        request,
+        series_id,
+        message="MangaBaka metadata unlinked; custom cover preserved.",
+    )
 
 
 @router.post("/admin/settings")
@@ -447,20 +857,25 @@ async def admin_update_settings(request: Request):
     try:
         await run_in_threadpool(service.update, values)
     except ValueError as error:
-        return _admin_redirect("settings", error=str(error))
+        return await _admin_redirect(request, "settings", error=str(error))
     if form.get("action") == "restart":
         restarter = _container(request).restarter
         if not restarter.enabled:
-            return _admin_redirect(
+            return await _admin_redirect(
+                request,
                 "settings",
                 error="Settings saved, but automatic restart is not enabled.",
             )
         restarter.request_restart()
-        return _admin_redirect(
-            "settings", message="Settings saved. Nineveh is restarting."
+        return await _admin_redirect(
+            request, "settings", message="Settings saved. Nineveh is restarting."
         )
-    return _admin_redirect(
-        "settings", message="Settings saved. Restart Nineveh to apply them."
+    if not service.pending_restart():
+        return await _admin_redirect(
+            request, "settings", message="Settings saved and applied."
+        )
+    return await _admin_redirect(
+        request, "settings", message="Settings saved. Restart Nineveh to apply them."
     )
 
 
@@ -469,24 +884,76 @@ async def admin_scan(request: Request, csrf_token: str = Form(...)):
     session = await _require_admin(request)
     _verify_csrf(request, session, csrf_token)
     if not request.app.state.start_scan():
-        return _admin_redirect(error="A catalog scan is already running.")
-    return _admin_redirect(message="Catalog scan started.")
+        return await _admin_redirect(
+            request, error="A catalog scan is already running."
+        )
+    return await _admin_redirect(request, message="Catalog scan started.")
 
 
-def _admin_redirect(
+async def _flash_redirect(
+    request: Request,
+    path: str,
+    *,
+    message: str | None = None,
+    error: str | None = None,
+):
+    """Park the notice on the session, then redirect to a clean URL.
+
+    Notices used to travel as query parameters, which put them in the access
+    log and let anyone forge a banner by handing an administrator a link.
+    """
+    await run_in_threadpool(
+        _container(request).auth.set_flash,
+        request.cookies.get(SESSION_COOKIE),
+        message,
+        error,
+    )
+    return RedirectResponse(path, status_code=303)
+
+
+async def _take_flash(request: Request) -> tuple[str | None, str | None]:
+    return await run_in_threadpool(
+        _container(request).auth.take_flash, request.cookies.get(SESSION_COOKIE)
+    )
+
+
+async def _admin_redirect(
+    request: Request,
     section: str = "overview",
     *,
     message: str | None = None,
     error: str | None = None,
 ):
-    parameters = {
-        key: value
-        for key, value in {"message": message, "error": error}.items()
-        if value
-    }
-    suffix = f"?{urlencode(parameters)}" if parameters else ""
     path = "/admin" if section == "overview" else f"/admin/{section}"
-    return RedirectResponse(f"{path}{suffix}", status_code=303)
+    return await _flash_redirect(request, path, message=message, error=error)
+
+
+async def _metadata_redirect(
+    request: Request,
+    series_id: str,
+    *,
+    message: str | None = None,
+    error: str | None = None,
+):
+    return await _flash_redirect(
+        request, f"/series/{series_id}/metadata", message=message, error=error
+    )
+
+
+async def _library_metadata_redirect(
+    request: Request,
+    library_id: str,
+    category: str,
+    *,
+    message: str | None = None,
+    error: str | None = None,
+):
+    return await _flash_redirect(
+        request,
+        f"/libraries/{library_id}/{category}/metadata",
+        message=message,
+        error=error,
+    )
 
 
 def _decode_grant(user_id: str, value: str) -> AccessGrant:
@@ -508,7 +975,36 @@ def _grant_key(grant: AccessGrant) -> str:
     return f"library|{grant.library_id}"
 
 
-def _catalog_url(filters: dict[str, str], page: int) -> str:
-    parameters = {key: value for key, value in filters.items() if value}
-    parameters["page"] = str(page)
-    return f"/?{urlencode(parameters)}"
+async def _managed_library_named(container, name: str, scope):
+    visible = dict(await run_in_threadpool(container.repository.libraries, scope))
+    if name not in visible:
+        return None
+    libraries = await run_in_threadpool(container.repository.managed_libraries)
+    return next((item for item in libraries if item.name == name), None)
+
+
+def _series_title(series, metadata) -> str:
+    """`metadata` is a summary on listing pages, a full record on detail pages."""
+    title = None
+    if metadata is not None:
+        title = getattr(metadata, "title", None)
+        if title is None:
+            title = metadata.effective.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return series.name
+
+
+def _series_cards(series_items, metadata_by_series) -> list[dict[str, object]]:
+    return [
+        {
+            "series": item,
+            "metadata": metadata_by_series.get(item.id),
+            "title": _series_title(item, metadata_by_series.get(item.id)),
+        }
+        for item in series_items
+    ]
+
+
+def _search_url(query: str, page: int) -> str:
+    return f"/?{urlencode({'q': query, 'page': page})}"

@@ -148,3 +148,14 @@ def test_persisted_text_settings_are_normalized():
 def test_the_public_base_url_is_not_editable_from_the_user_interface():
     """It gates the login origin check, so a bad value locks the admin out."""
     assert "public_base_url" not in Settings().editable_values()
+
+
+def test_mangabaka_limit_is_editable_but_hard_capped():
+    assert (
+        Settings()
+        .with_overrides({"mangabaka_requests_per_minute": "12"})
+        .mangabaka_requests_per_minute
+        == 12
+    )
+    with pytest.raises(ValueError, match="between 1 and 30"):
+        Settings().with_overrides({"mangabaka_requests_per_minute": "31"})

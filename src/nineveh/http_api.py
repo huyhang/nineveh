@@ -26,6 +26,7 @@ from .catalog import InvalidLibrary
 from .deployment import memory_limit_text
 from .domain import (
     AccessGrant,
+    CatalogSeries,
     LibraryUsage,
     ManagedLibrary,
     Page,
@@ -33,6 +34,7 @@ from .domain import (
     Session,
     User,
 )
+from .metadata import MetadataError
 from .opds import CBZ_MEDIA_TYPE, NAVIGATION_PATH, PUBLICATIONS_PATH
 from .opds import url as opds_url
 
@@ -77,6 +79,22 @@ class LibraryCreate(BaseModel):
 
 class SettingsUpdate(BaseModel):
     values: dict[str, str]
+
+
+class MetadataLookupInput(BaseModel):
+    query: str | None = Field(default=None, max_length=200)
+
+
+class MetadataMatchInput(BaseModel):
+    provider_id: int = Field(gt=0)
+
+
+class MetadataEditInput(BaseModel):
+    values: dict[str, str | int | float | list[str] | None]
+
+
+class MetadataBatchInput(BaseModel):
+    series_ids: list[str] = Field(min_length=1, max_length=500)
 
 
 def _container(request: Request) -> Container:
@@ -284,6 +302,79 @@ async def publication_detail(
 ) -> dict[str, object]:
     publication = await _publication_or_404(request, publication_id, identity)
     return _container(request).opds.publication(base_url(request), publication)
+
+
+@router.get("/api/v1/series/{series_id}", tags=["series"])
+async def series_detail(
+    request: Request,
+    series_id: str,
+    identity: Annotated[Identity, Depends(authenticated)],
+) -> dict[str, object]:
+    item = await _series_or_404(request, series_id, identity)
+    metadata = await run_in_threadpool(
+        _container(request).repository.series_metadata, series_id
+    )
+    return _public_series(item, metadata)
+
+
+@router.get(
+    "/api/v1/series/{series_id}/cover",
+    tags=["series"],
+    operation_id="readSeriesCover",
+)
+@router.head(
+    "/api/v1/series/{series_id}/cover",
+    tags=["series"],
+    operation_id="headSeriesCover",
+)
+async def series_cover(
+    request: Request,
+    series_id: str,
+    identity: Annotated[Identity, Depends(authenticated)],
+    revision: str | None = None,
+):
+    del revision  # The URL changes with the local fallback; ETag covers overrides.
+    container = _container(request)
+    series = await _series_or_404(request, series_id, identity)
+    custom = container.metadata.covers.cover(series_id) if container.metadata else None
+    if custom:
+        stat = custom.stat()
+        return FileResponse(
+            custom,
+            media_type="image/webp",
+            headers={
+                "ETag": _etag(f"{stat.st_mtime_ns}-{stat.st_size}"),
+                "Cache-Control": "private, no-cache",
+            },
+        )
+    publication = await run_in_threadpool(
+        container.repository.publication_by_id,
+        series.first_publication_id,
+        container.authorization.read_scope(identity.user),
+    )
+    if not publication:
+        raise HTTPException(status_code=404, detail="Series cover not found")
+    page = await run_in_threadpool(
+        container.repository.page, publication.id, publication.cover_page
+    )
+    if not page:
+        raise HTTPException(status_code=404, detail="Series cover not found")
+    try:
+        path = await run_in_threadpool(
+            container.thumbnails.cover, publication, page.page, 640
+        )
+    except ArchiveChanged as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ArchiveUnavailable as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return FileResponse(
+        path,
+        media_type="image/webp",
+        headers={
+            "ETag": _etag(f"{publication.revision}-series-cover"),
+            "Cache-Control": "private, no-cache",
+        },
+    )
 
 
 # One handler, registered once per verb so each OpenAPI operation carries a
@@ -785,6 +876,168 @@ async def admin_settings(
     return await _settings_response(request)
 
 
+@router.get("/api/v1/admin/metadata", tags=["administration"])
+async def admin_metadata(
+    request: Request, _: Annotated[Identity, Depends(administrator)]
+) -> dict[str, object]:
+    container = _container(request)
+    items = await run_in_threadpool(
+        container.repository.catalog_series, category="manga"
+    )
+    metadata = await run_in_threadpool(container.repository.all_series_metadata)
+    return {
+        "series": [_public_series(item, metadata.get(item.id)) for item in items],
+        "lookup": request.app.state.metadata_status,
+        "requestsPerMinute": container.configuration.mangabaka_request_limit(),
+        "maximumRequestsPerMinute": 30,
+    }
+
+
+@router.post("/api/v1/admin/metadata/lookup", status_code=202, tags=["administration"])
+async def admin_metadata_batch_lookup(
+    request: Request,
+    body: MetadataBatchInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    if not request.app.state.start_metadata_lookup(
+        list(dict.fromkeys(body.series_ids))
+    ):
+        raise HTTPException(
+            status_code=409, detail="A metadata lookup is already running"
+        )
+    return {"status": "accepted", "seriesCount": len(set(body.series_ids))}
+
+
+@router.post(
+    "/api/v1/admin/series/{series_id}/metadata/lookup",
+    tags=["administration"],
+)
+async def admin_series_metadata_lookup(
+    request: Request,
+    series_id: str,
+    body: MetadataLookupInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    series = await _admin_manga_series(request, series_id)
+    service = _metadata_service(container)
+    try:
+        lookup = await run_in_threadpool(service.lookup, series, body.query)
+    except MetadataError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return _public_lookup(lookup)
+
+
+@router.get(
+    "/api/v1/admin/series/{series_id}/metadata/candidates/{provider_id}/cover",
+    tags=["administration"],
+)
+async def admin_series_metadata_candidate_cover(
+    request: Request,
+    series_id: str,
+    provider_id: int,
+    _: Annotated[Identity, Depends(administrator)],
+):
+    container = _container(request)
+    await _admin_manga_series(request, series_id)
+    try:
+        path = await run_in_threadpool(
+            _metadata_service(container).candidate_cover, series_id, provider_id
+        )
+    except MetadataError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    stat = path.stat()
+    return FileResponse(
+        path,
+        media_type="image/webp",
+        headers={
+            "ETag": _etag(f"candidate-{provider_id}-{stat.st_mtime_ns}"),
+            "Cache-Control": "private, max-age=86400",
+        },
+    )
+
+
+@router.post(
+    "/api/v1/admin/series/{series_id}/metadata/match",
+    tags=["administration"],
+)
+async def admin_series_metadata_match(
+    request: Request,
+    series_id: str,
+    body: MetadataMatchInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    series = await _admin_manga_series(request, series_id)
+    try:
+        metadata = await run_in_threadpool(
+            _metadata_service(container).match, series, body.provider_id
+        )
+    except MetadataError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return _public_series(series, metadata)
+
+
+@router.post(
+    "/api/v1/admin/series/{series_id}/metadata/refresh",
+    tags=["administration"],
+)
+async def admin_series_metadata_refresh(
+    request: Request,
+    series_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    series = await _admin_manga_series(request, series_id)
+    try:
+        metadata = await run_in_threadpool(_metadata_service(container).refresh, series)
+    except MetadataError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    return _public_series(series, metadata)
+
+
+@router.patch("/api/v1/admin/series/{series_id}/metadata", tags=["administration"])
+async def admin_series_metadata_edit(
+    request: Request,
+    series_id: str,
+    body: MetadataEditInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    series = await _admin_manga_series(request, series_id)
+    try:
+        metadata = await run_in_threadpool(
+            _metadata_service(container).update, series_id, body.values
+        )
+    except MetadataError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _public_series(series, metadata)
+
+
+@router.delete("/api/v1/admin/series/{series_id}/metadata", tags=["administration"])
+async def admin_series_metadata_unlink(
+    request: Request,
+    series_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, str]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    await _admin_manga_series(request, series_id)
+    await run_in_threadpool(_metadata_service(container).unlink, series_id)
+    return {"status": "unlinked"}
+
+
 @router.put("/api/v1/admin/settings", tags=["administration"])
 async def update_settings(
     request: Request,
@@ -831,6 +1084,35 @@ async def _publication_or_404(
     return publication
 
 
+async def _series_or_404(
+    request: Request, series_id: str, identity: Identity
+) -> CatalogSeries:
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id,
+        series_id,
+        container.authorization.read_scope(identity.user),
+    )
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+    return series
+
+
+async def _admin_manga_series(request: Request, series_id: str) -> CatalogSeries:
+    series = await run_in_threadpool(
+        _container(request).repository.catalog_series_by_id, series_id
+    )
+    if not series or series.category.casefold() != "manga":
+        raise HTTPException(status_code=404, detail="Manga series not found")
+    return series
+
+
+def _metadata_service(container: Container):
+    if not container.metadata:
+        raise HTTPException(status_code=503, detail="Metadata service unavailable")
+    return container.metadata
+
+
 def _enrich_dimensions(
     container: Container, publication: Publication, pages: list[Page]
 ) -> list[Page]:
@@ -859,6 +1141,59 @@ def _public_user(user: User) -> dict[str, object]:
         "isAdmin": user.is_admin,
         "enabled": user.enabled,
         "createdAt": user.created_at.isoformat(),
+    }
+
+
+def _public_series(series: CatalogSeries, metadata) -> dict[str, object]:
+    values = metadata.effective if metadata else {}
+    title = values.get("title") or series.name
+    return {
+        "id": series.id,
+        "libraryId": series.library_id,
+        "library": series.library,
+        "category": series.category,
+        "localName": series.name,
+        "title": title,
+        "publicationCount": series.publication_count,
+        "cover": f"/api/v1/series/{series.id}/cover",
+        "metadata": {
+            "provider": metadata.provider,
+            "providerId": metadata.provider_id,
+            "sourceUrl": metadata.canonical_url,
+            "fetchedAt": metadata.fetched_at.isoformat(),
+            "providerUpdatedAt": metadata.provider_updated_at,
+            "values": values,
+            "editedFields": sorted(metadata.overrides),
+            "license": "CC BY-NC-SA 4.0",
+        }
+        if metadata
+        else None,
+    }
+
+
+def _public_lookup(lookup) -> dict[str, object]:
+    return {
+        "seriesId": lookup.series_id,
+        "searchedAt": lookup.searched_at.isoformat() if lookup.searched_at else None,
+        "error": lookup.error,
+        "candidates": [
+            {
+                "providerId": item.provider_id,
+                "title": item.title,
+                "alternativeTitles": item.alternative_titles,
+                "authors": item.authors,
+                "artists": item.artists,
+                "description": item.description,
+                "year": item.year,
+                "mediaType": item.media_type,
+                "status": item.status,
+                "rating": item.rating,
+                "publishers": item.publishers,
+                "tags": item.tags,
+                "sourceUrl": item.source_url,
+            }
+            for item in lookup.candidates
+        ],
     }
 
 

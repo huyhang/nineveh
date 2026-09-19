@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Manage {{ details.title or series.name }} · {{ service_title }}{% endblock %}
+{% block main_class %}metadata-page{% endblock %}
+{% block content %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><a href="/libraries/{{ series.library_id }}">{{ series.library }}</a><span>/</span><a href="/libraries/{{ series.library_id }}/{{ series.category }}">{{ series.category|title }}</a><span>/</span><a href="/series/{{ series.id }}">{{ details.title or series.name }}</a><span>/</span><span>Manage metadata</span></nav>
+  <section class="admin-section metadata-workspace">
+    <div class="section-heading">
+      <div><p class="eyebrow">{{ series.library }} · {{ series.category }}</p><h2>{{ details.title or series.name }}</h2><p class="muted">Local folder: {{ series.name }}</p></div>
+      <a class="button secondary" href="/series/{{ series.id }}">View series</a>
+    </div>
+
+    <div class="metadata-columns">
+      <div class="metadata-cover-editor">
+        <img src="/api/v1/series/{{ series.id }}/cover" alt="Cover for {{ details.title or series.name }}" width="320">
+        <form method="post" action="/series/{{ series.id }}/metadata/cover" enctype="multipart/form-data" class="stacked-form">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <label>Custom cover <input type="file" name="cover" accept="image/jpeg,image/png,image/webp,image/avif" required></label>
+          <button class="secondary" type="submit">Upload cover</button>
+        </form>
+        {% if has_custom_cover %}<form method="post" action="/series/{{ series.id }}/metadata/cover/remove"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit">Remove custom cover</button></form>{% endif %}
+      </div>
+
+      <div>
+        <form method="post" action="/series/{{ series.id }}/metadata/lookup" class="inline-form metadata-search">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <label>Search MangaBaka <input name="query" value="{{ series.name }}" maxlength="200" required></label>
+          <button type="submit">Find matches</button>
+        </form>
+        {% if lookup.error %}<p class="notice error">{{ lookup.error }}</p>{% endif %}
+        {% if lookup.candidates %}
+          <div class="candidate-list">
+            {% for candidate in lookup.candidates %}
+              <article class="candidate">
+                <div class="candidate-cover">
+                  {% if candidate.cover_url %}<img src="/api/v1/admin/series/{{ series.id }}/metadata/candidates/{{ candidate.provider_id }}/cover" alt="Cover for {{ candidate.title }}" width="120" loading="lazy">{% else %}<span aria-hidden="true">No cover</span>{% endif %}
+                </div>
+                <div class="candidate-body">
+                  <div class="candidate-heading"><div><h3>{{ candidate.title }}</h3>{% if candidate.alternative_titles %}<p class="candidate-aliases">{{ candidate.alternative_titles[:3]|join(' · ') }}</p>{% endif %}</div>{% if candidate.rating is not none %}<strong class="candidate-rating">{{ candidate.rating|round|int }}<small>/100</small></strong>{% endif %}</div>
+                  <div class="metadata-badges candidate-badges">{% if candidate.year %}<span>{{ candidate.year }}</span>{% endif %}<span>{{ candidate.media_type or 'Series' }}</span>{% if candidate.status %}<span>{{ candidate.status|replace('_', ' ')|title }}</span>{% endif %}</div>
+                  {% if candidate.authors or candidate.artists %}<p class="candidate-creators">{% if candidate.authors %}<strong>Story:</strong> {{ candidate.authors|join(', ') }}{% endif %}{% if candidate.authors and candidate.artists %}<br>{% endif %}{% if candidate.artists %}<strong>Art:</strong> {{ candidate.artists|join(', ') }}{% endif %}</p>{% endif %}
+                  {% if candidate.description %}<p class="candidate-synopsis">{{ candidate.description }}</p>{% endif %}
+                  {% if candidate.publishers %}<p class="candidate-publishers"><strong>Publisher:</strong> {{ candidate.publishers|join(', ') }}</p>{% endif %}
+                  {% if candidate.tags %}<div class="tag-list candidate-tags">{% for tag in candidate.tags[:6] %}<span>{{ tag }}</span>{% endfor %}</div>{% endif %}
+                  <div class="candidate-actions">{% if candidate.source_url %}<a href="{{ candidate.source_url }}" rel="external noreferrer">View on MangaBaka</a>{% else %}<span class="muted">Refresh suggestions for the source link</span>{% endif %}<form method="post" action="/series/{{ series.id }}/metadata/match"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="provider_id" value="{{ candidate.provider_id }}"><button type="submit">Use this match</button></form></div>
+                </div>
+              </article>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if metadata %}
+      <div class="metadata-editor-heading"><div><p class="eyebrow">Reader-facing information</p><h3>Edit metadata</h3></div><div class="inline-form"><form method="post" action="/series/{{ series.id }}/metadata/refresh"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit">Refresh now</button></form></div></div>
+      <form method="post" action="/series/{{ series.id }}/metadata/edit" class="metadata-editor">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label class="wide-field">Display title <input name="title" value="{{ details.title or '' }}" maxlength="1000"></label>
+        <label class="wide-field">Alternative titles <textarea name="alternative_titles" rows="3" placeholder="One per line">{{ details.alternative_titles|join('\n') }}</textarea></label>
+        <label>Authors <textarea name="authors" rows="3" placeholder="One per line">{{ details.authors|join('\n') }}</textarea></label>
+        <label>Artists <textarea name="artists" rows="3" placeholder="One per line">{{ details.artists|join('\n') }}</textarea></label>
+        <label>Publication start <input name="published_start" value="{{ details.published_start or '' }}" placeholder="YYYY-MM-DD"></label>
+        <label>Publication end <input name="published_end" value="{{ details.published_end or '' }}" placeholder="YYYY-MM-DD"></label>
+        <label>Status <input name="status" value="{{ details.status or '' }}"></label>
+        <label>Media type <input name="media_type" value="{{ details.media_type or '' }}"></label>
+        <label>Content rating <input name="content_rating" value="{{ details.content_rating or '' }}"></label>
+        <label>Rating (0–100) <input name="rating" type="number" min="0" max="100" step="any" value="{{ details.rating if details.rating is not none else '' }}"></label>
+        <label>Final volume <input name="final_volume" type="number" min="0" max="10000" step="1" value="{{ details.final_volume if details.final_volume is not none else '' }}"></label>
+        <label>Total chapters <input name="total_chapters" type="number" min="0" max="100000" step="1" value="{{ details.total_chapters if details.total_chapters is not none else '' }}"></label>
+        <label class="wide-field">Publishers <textarea name="publishers" rows="3" placeholder="One per line">{{ details.publishers|join('\n') }}</textarea></label>
+        <label class="wide-field">Tags <textarea name="tags" rows="3" placeholder="One per line">{{ details.tags|join('\n') }}</textarea></label>
+        <label class="wide-field">Description <textarea name="description" rows="8">{{ details.description or '' }}</textarea></label>
+        <div class="settings-actions"><span class="muted">Fields changed from MangaBaka are preserved on refresh.</span><button type="submit">Save changes</button></div>
+      </form>
+      <details class="provider-record"><summary>Retrieved MangaBaka record</summary><p>Fetched {{ metadata.fetched_at.strftime('%Y-%m-%d %H:%M UTC') }} · ID {{ metadata.provider_id }} · <a href="{{ metadata.canonical_url }}" rel="external noreferrer">View source</a></p><pre>{{ metadata.raw|tojson(indent=2) }}</pre></details>
+      <p class="attribution admin-attribution">Metadata provided by MangaBaka under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="external noreferrer">CC BY-NC-SA 4.0</a>{% if metadata.overrides %}; fields edited locally: {{ metadata.overrides.keys()|join(', ') }}{% endif %}.</p>
+      <div class="danger-zone">
+        <div><h4>Unlink from MangaBaka</h4><p class="muted">Readers fall back to the folder name and the first volume's cover. Your edits and any uploaded cover are kept.</p></div>
+        <form method="post" action="/series/{{ series.id }}/metadata/unlink" data-confirm="Unlink {{ details.title or series.name }} from MangaBaka? Your edits and uploaded cover are kept."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit">Unlink</button></form>
+      </div>
+    {% endif %}
+  </section>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', path='admin.js') }}" defer></script>{% endblock %}

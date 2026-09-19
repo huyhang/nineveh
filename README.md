@@ -11,6 +11,8 @@ The service is designed for a small Docker host such as a Synology NAS. Media re
 - Secure browser sessions and a responsive catalog
 - Local users and hierarchical read access managed through an administrator page or JSON API
 - Explicitly managed libraries with per-library scans and indexed-size reporting
+- Series-first browser navigation through libraries and comics/manga categories
+- Administrator-reviewed MangaBaka metadata with durable local edits and covers
 - Persisted application settings with a Docker-supervised restart action
 - System, light, paper, and dark display themes with a persistent header toggle
 - Original CBZ downloads with byte-range and cache support
@@ -74,6 +76,8 @@ All catalog and content endpoints require authentication.
 | `/opds/v2/navigation.json?library=&category=` | Category and series navigation feeds |
 | `/opds/v2/publications.json` | Paginated publication feed and search |
 | `/api/v1/publications/{id}` | Single publication as an OPDS entry |
+| `/api/v1/series/{id}` | Local series information and optional stored metadata |
+| `/api/v1/series/{id}/cover` | Admin, MangaBaka, or local fallback series cover |
 | `/api/v1/publications/{id}/file` | Original CBZ download |
 | `/api/v1/publications/{id}/cover?width=320` | Generated WebP cover (160, 320, or 640) |
 | `/api/v1/publications/{id}/pages?start=1&end=20` | Ordered page-range manifest |
@@ -82,6 +86,7 @@ All catalog and content endpoints require authentication.
 | `/api/v1/admin/libraries` | Managed libraries, indexed capacity, and available `/data` directories |
 | `/api/v1/admin/users/{id}/access` | Library, content-type, and series read grants |
 | `/api/v1/admin/settings`, `/api/v1/admin/restart` | Persisted application settings and restart control |
+| `/api/v1/admin/metadata` | Manga metadata status and manually initiated matching operations |
 | `/api/v1/health/live`, `/api/v1/health/ready` | Liveness and readiness with scan status |
 | `/docs` | Interactive OpenAPI documentation |
 | `/openapi.json` | The same contract this service serves, committed at [`docs/openapi.json`](docs/openapi.json) |
@@ -114,7 +119,13 @@ Archive safety limits can also be adjusted through the variables defined in [`co
 
 ### Settings owned by the admin UI
 
-Eleven settings are edited at **Admin → Settings** rather than in the environment: service title, session lifetime, scan interval, feed page size, page-range limit, archive cache size, thumbnail and page cache budgets, the two worker ceilings, and the image-pixel ceiling. They are deliberately absent from `docker/.env.example` — a value with two owners is a value that eventually disagrees with itself.
+Twelve settings are edited at **Admin → Settings** rather than in the environment: service title, session lifetime, scan interval, feed page size, page-range limit, archive cache size, thumbnail and page cache budgets, the two worker ceilings, the image-pixel ceiling, and the MangaBaka request limit. They are deliberately absent from `docker/.env.example` — a value with two owners is a value that eventually disagrees with itself.
+
+The MangaBaka request limit defaults to 30 per rolling 60-second window and may only be lowered. Unlike the other settings, it takes effect immediately. Request reservations are persisted, so a restart cannot reset the limit. Browsing and catalog scans use stored metadata and never contact MangaBaka; an administrator must explicitly request suggestions, confirm a match, or refresh one. MangaBaka-derived data is attributed in the interface under its CC BY-NC-SA 4.0 license.
+
+Metadata management lives alongside the collection: administrators can open a manga category to perform selected batch lookups, or use **Manage metadata** on an individual series. It is intentionally absent from the general administration console.
+
+Reader-facing lists — alternative titles, creators, publishers, tags — are capped at twenty entries, because MangaBaka returns every tag it holds and a popular series carries hundreds. The untruncated response stays in the retained provider record. In the editor, list fields take **one entry per line**: titles and credits contain commas often enough ("Oh, My Sweet Alien!", "Smith, John") that splitting on them corrupted the value the moment the form was saved.
 
 `NINEVEH_PUBLIC_BASE_URL` stays deployment-owned and is shown read-only on the settings page. It decides which origin may sign in, so an administrator who mistyped it in the UI would be locked out of the page needed to correct it. An override left in the database by an older release is discarded at startup rather than rejected, so retiring a setting never leaves an existing install unbootable.
 
@@ -122,7 +133,7 @@ Each has the same environment variable as before (`NINEVEH_FEED_PAGE_SIZE` and f
 
 Nineveh's resident set is roughly 80–120 MB and does not grow with library size; the archive, thumbnail, and page caches are bounded on disk under `/state`, not in memory. The two worker ceilings and `NINEVEH_MAX_IMAGE_PIXELS` are what actually bound peak RAM. See [the deployment guide](docker/synology-deployment.md#resource-tuning) for sizing.
 
-`/state` holds four things: `nineveh.sqlite3`, `thumbnails/`, `page-cache/`, and `ranges/`. Only the database needs backing up; the other three are regenerated on demand. Generated range archives are deleted as soon as their response completes, and any left behind by an unclean shutdown are cleared at startup.
+`/state` holds the database and generated caches, including `thumbnails/`, `page-cache/`, `ranges/`, and `series-covers/`. Back up `nineveh.sqlite3` plus `series-covers/` if you use custom series artwork; the remaining caches are regenerated on demand. Inside `series-covers/`, only the top level is owned data — `series-covers/candidates/` holds throwaway thumbnails from suggestion lists and is bounded like every other cache under `/state`. Generated range archives are deleted as soon as their response completes, and any left behind by an unclean shutdown are cleared at startup.
 
 The bootstrap password is used only when `/state` contains no users. Afterwards, users, access grants, libraries, scans, and application settings are managed at `/admin`. New readers have no catalog access until an administrator grants it. Existing readers are granted access to their currently indexed libraries when upgrading from the original schema.
 
@@ -152,6 +163,12 @@ Run `pytest` for the suite (it enforces 90% branch coverage), and `ruff check sr
 `create_app(settings, container)` takes every I/O seam as an argument, so tests can substitute any of them; see [`tests/fakes.py`](tests/fakes.py) and [`tests/test_container.py`](tests/test_container.py) for the whole HTTP surface driven without a single CBZ on disk.
 
 The application uses one process intentionally; blocking archive and password work runs through bounded framework worker threads while SQLite and in-process caches remain singular.
+
+## MangaBaka attribution
+
+Manga metadata in Nineveh is provided by [MangaBaka](https://mangabaka.org/) through its [public API](https://api.mangabaka.org/). MangaBaka data is available under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+
+Nineveh is not affiliated with or endorsed by MangaBaka. Cover images referenced by the metadata may remain subject to the rights of their respective owners.
 
 ## Security notes
 

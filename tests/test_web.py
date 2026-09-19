@@ -108,7 +108,12 @@ def test_signing_out_requires_a_valid_csrf_token(client: TestClient):
 
 def test_the_admin_page_is_administrator_only(client: TestClient, reader: dict):
     _login(client, "reader", READER_PASSWORD)
-    for path in ("/admin", "/admin/users", "/admin/libraries", "/admin/settings"):
+    for path in (
+        "/admin",
+        "/admin/users",
+        "/admin/libraries",
+        "/admin/settings",
+    ):
         assert client.get(path).status_code == 403
 
 
@@ -475,3 +480,88 @@ def test_an_honoured_proxy_header_raises_no_warning(client: TestClient):
     _login(client)
     client.get("/api/v1/health/live", headers={"X-Forwarded-Proto": "http"})
     assert "Forwarded headers are being ignored" not in client.get("/admin").text
+
+
+def test_a_notice_reaches_the_next_page_without_entering_the_url(client: TestClient):
+    """Notices used to ride in the query string, so they leaked into the
+    access log and any link could forge one. They now live on the session."""
+    _login(client)
+    response = client.post(
+        "/admin/scan", data={"csrf_token": _csrf(client)}, follow_redirects=False
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin"
+    assert "message=" not in response.headers["location"]
+    assert "Catalog scan started." in client.get("/admin").text
+
+
+def test_a_notice_is_shown_once_and_then_cleared(client: TestClient):
+    _login(client)
+    client.post(
+        "/admin/scan", data={"csrf_token": _csrf(client)}, follow_redirects=False
+    )
+
+    assert "Catalog scan started." in client.get("/admin").text
+    assert "Catalog scan started." not in client.get("/admin").text
+
+
+def test_a_notice_cannot_be_forged_through_the_url(client: TestClient):
+    _login(client)
+    forged = "Your session expired. Sign in again at http://evil.example"
+
+    page = client.get(f"/admin/settings?error={forged}&message=anything")
+
+    assert forged not in page.text
+    assert "anything" not in page.text
+
+
+def test_notices_do_not_cross_between_sessions(client: TestClient):
+    _login(client)
+    client.post(
+        "/admin/scan", data={"csrf_token": _csrf(client)}, follow_redirects=False
+    )
+    client.cookies.clear()
+
+    _login(client)
+
+    assert "Catalog scan started." not in client.get("/admin").text
+
+
+def test_destructive_actions_confirm_without_the_native_browser_prompt(
+    client: TestClient,
+):
+    """`window.confirm` cannot be themed and is announced as "<host> says"."""
+    script = client.get("/static/admin.js").text
+
+    assert "showModal()" in script
+    assert 'document.createElement("dialog")' in script
+    # Retained only as the fallback for browsers without <dialog>.
+    assert script.count("window.confirm(") == 1
+    assert "confirm-dialog" in client.get("/static/style.css").text
+
+
+def test_search_still_finds_a_series_by_a_volume_title(client: TestClient):
+    """Browsing became series-first; searching a volume title must still work."""
+    _login(client)
+
+    page = client.get("/?q=First")
+
+    assert "Example Series" in page.text
+    assert "No publications found" not in page.text
+
+
+def test_a_library_page_lists_its_categories(client: TestClient):
+    _login(client)
+    library_id = client.get("/api/v1/admin/libraries").json()["libraries"][0]["id"]
+
+    page = client.get(f"/libraries/{library_id}")
+
+    assert page.status_code == 200
+    assert "Comics" in page.text
+    assert f'href="/libraries/{library_id}/comics"' in page.text
+
+
+def test_an_unknown_library_page_is_not_found(client: TestClient):
+    _login(client)
+    assert client.get("/libraries/missing").status_code == 404

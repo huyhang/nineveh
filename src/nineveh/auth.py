@@ -143,6 +143,18 @@ class AuthService:
         if token:
             self._repository.delete_session(self._token_hash(token))
 
+    def set_flash(
+        self, token: str | None, message: str | None, error: str | None
+    ) -> None:
+        """Park one notice on the session for the page that renders next."""
+        if token and (message or error):
+            self._repository.set_session_flash(self._token_hash(token), message, error)
+
+    def take_flash(self, token: str | None) -> tuple[str | None, str | None]:
+        if not token:
+            return None, None
+        return self._repository.take_session_flash(self._token_hash(token))
+
     @staticmethod
     def valid_csrf(session: Session, supplied: str | None) -> bool:
         return bool(supplied) and hmac.compare_digest(session.csrf_token, supplied)
