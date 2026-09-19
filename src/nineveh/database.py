@@ -22,6 +22,7 @@ from .domain import (
     ReadScope,
     ScannedPublication,
     SeriesMetadata,
+    SeriesMetadataState,
     SeriesMetadataSummary,
     SeriesUsage,
     User,
@@ -545,6 +546,52 @@ class SQLiteRepository:
                 series_id=row["series_id"],
                 provider_id=row["provider_id"],
                 title=row["title"],
+            )
+            for row in rows
+        }
+
+    def series_metadata_states(self) -> dict[str, SeriesMetadataState]:
+        """Match, edit and failure state per series, without the payloads.
+
+        Keyed off both tables: a series can have a failed lookup and no stored
+        metadata at all. `UNION` rather than `FULL OUTER JOIN`, which needs
+        SQLite 3.39 and this release does not pin an interpreter that new.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                WITH recorded AS (
+                    SELECT series_id FROM series_metadata
+                    UNION
+                    SELECT series_id FROM metadata_lookups
+                )
+                SELECT recorded.series_id AS series_id,
+                       COALESCE(
+                           json_extract(sm.overrides_json, '$.title'),
+                           json_extract(sm.values_json, '$.title')
+                       ) AS title,
+                       sm.provider_id AS provider_id,
+                       sm.series_id IS NOT NULL AS matched,
+                       COALESCE(sm.overrides_json, '{}') != '{}' AS edited,
+                       lookups.error IS NOT NULL AS failed,
+                       sm.fetched_at AS fetched_at
+                FROM recorded
+                LEFT JOIN series_metadata sm ON sm.series_id = recorded.series_id
+                LEFT JOIN metadata_lookups lookups
+                    ON lookups.series_id = recorded.series_id
+                """
+            ).fetchall()
+        return {
+            row["series_id"]: SeriesMetadataState(
+                series_id=row["series_id"],
+                title=row["title"],
+                provider_id=row["provider_id"],
+                matched=bool(row["matched"]),
+                edited=bool(row["edited"]),
+                failed=bool(row["failed"]),
+                fetched_at=datetime.fromisoformat(row["fetched_at"])
+                if row["fetched_at"]
+                else None,
             )
             for row in rows
         }

@@ -20,6 +20,7 @@ from .domain import (
     ScanReport,
     ScanStatus,
     SeriesMetadata,
+    SeriesMetadataState,
     SeriesMetadataSummary,
     User,
 )
@@ -117,6 +118,8 @@ class MetadataRepository(Protocol):
     def all_series_metadata(self) -> dict[str, SeriesMetadata]: ...
 
     def series_metadata_summaries(self) -> dict[str, SeriesMetadataSummary]: ...
+
+    def series_metadata_states(self) -> dict[str, SeriesMetadataState]: ...
 
     def save_series_metadata(
         self,

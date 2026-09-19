@@ -100,6 +100,24 @@ class SeriesMetadataSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class SeriesMetadataState:
+    """Everything the administration list filters on, in one cheap row.
+
+    Deliberately separate from `SeriesMetadataSummary`: a series whose only
+    record is a failed lookup belongs here but has no metadata, and letting it
+    into the summary would mark it as matched on the reader-facing pages.
+    """
+
+    series_id: str
+    title: str | None = None
+    provider_id: int | None = None
+    matched: bool = False
+    edited: bool = False
+    failed: bool = False
+    fetched_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SeriesMetadata:
     """Provider data plus sparse administrator-owned field overrides."""
 
@@ -116,6 +134,12 @@ class SeriesMetadata:
     @property
     def effective(self) -> dict[str, Any]:
         return {**self.values, **self.overrides}
+
+    @property
+    def title(self) -> str | None:
+        """The display title, so summaries, states and records all read alike."""
+        value = self.effective.get("title")
+        return value if isinstance(value, str) else None
 
 
 @dataclass(frozen=True, slots=True)

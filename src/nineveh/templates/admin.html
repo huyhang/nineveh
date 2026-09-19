@@ -25,7 +25,7 @@
       <span class="status-dot"></span>
       {% if scan_status.running %}Scan in progress.
       {% elif scan_status.error %}Last scan failed: {{ scan_status.error }}
-      {% elif scan_status.completed_at %}Last scan completed {{ scan_status.completed_at }}.
+      {% elif scan_status.completed_at %}Last scan completed <time datetime="{{ scan_status.completed_at }}" title="{{ scan_status.completed_at|timestamp }}">{{ scan_status.completed_at|since }}</time>.
       {% else %}No scan has completed yet.{% endif %}
     </div>
   </section>

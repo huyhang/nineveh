@@ -608,3 +608,45 @@ def test_the_quiet_destructive_buttons_are_unchanged(client: TestClient):
     assert "button.danger { border-color: transparent; color: var(--danger); }" in (
         stylesheet
     )
+
+
+def test_quiet_buttons_stay_readable_while_hovered(client: TestClient):
+    """The shared hover repainted the background to --accent-strong without
+    touching the foreground, so every outline button fell to ~1.3:1 mid-hover."""
+    stylesheet = client.get("/static/style.css").text
+
+    # The blanket repaint is gone; the lift is still shared.
+    assert (
+        "button:hover:not(:disabled), .button:hover { transform: translateY(-1px); }"
+        in stylesheet
+    )
+    assert "button:not(.secondary):not(.ghost):hover:not(:disabled)" in stylesheet
+    assert "button.secondary:hover:not(:disabled)" in stylesheet
+
+    accents = re.findall(r"--accent:\s*(#[0-9a-fA-F]{6})", stylesheet)
+    softs = re.findall(r"--accent-soft:\s*(#[0-9a-fA-F]{6})", stylesheet)
+    assert len(accents) == len(softs) == 4  # paper, light, dark, dark via media query
+    for accent, soft in zip(accents, softs, strict=True):
+        assert _contrast(accent, soft) >= 4.5, (
+            f"hovered outline button {accent} on {soft} fails WCAG AA"
+        )
+
+
+def test_the_last_scan_time_reads_as_a_phrase_not_an_iso_string(client: TestClient):
+    _login(client)
+    client.post("/admin/scan", data={"csrf_token": _csrf(client)})
+    for _ in range(200):
+        if not client.app.state.container.scanner.status.running:
+            break
+        time.sleep(0.01)
+
+    page = client.get("/admin").text
+    completed = client.app.state.container.scanner.status.completed_at
+    assert completed is not None
+
+    assert f"Last scan completed {completed}." not in page
+    assert "Last scan completed <time" in page
+    # The exact value stays available, machine-readable and on hover.
+    assert f'datetime="{completed}"' in page
+    assert re.search(r">(just now|\d+ seconds? ago)</time>", page)
+    assert re.search(r'title="\d{2} \w{3} \d{4}, \d{2}:\d{2} UTC"', page)

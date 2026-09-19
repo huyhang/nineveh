@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -19,7 +20,13 @@ from urllib.request import Request, urlopen
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .archives import DiskCacheBudget
-from .domain import CatalogSeries, MetadataCandidate, MetadataLookup, SeriesMetadata
+from .domain import (
+    CatalogSeries,
+    MetadataCandidate,
+    MetadataLookup,
+    SeriesMetadata,
+    SeriesMetadataState,
+)
 from .ports import MetadataRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -61,6 +68,12 @@ NUMBER_BOUNDS = {
 # buries the synopsis under a wall of chips. The untruncated payload stays in
 # the stored raw record; only the reader-facing list is bounded.
 MAX_LIST_VALUES = 20
+# Refreshing costs a request against a 30/minute budget, so the console flags
+# what has gone unvisited rather than pretending to know upstream has changed:
+# the stored `provider_updated_at` is only what MangaBaka reported at the time
+# of the last fetch, and confirming it moved means fetching again.
+REFRESH_REMINDER_DAYS = 30
+METADATA_STATES = ("all", "unmatched", "matched", "edited", "failed", "unrefreshed")
 
 
 class MetadataError(RuntimeError):
@@ -620,3 +633,34 @@ def _normalize_override(field: str, value: object) -> object:
             )
         return int(number) if number.is_integer() else number
     return _optional_text(value)
+
+
+def matches_state(
+    state: str | None,
+    record: SeriesMetadataState | None,
+    now: datetime | None = None,
+) -> bool:
+    """Whether a series belongs under the administration list's status filter.
+
+    `record` is None for a series MangaBaka has never been asked about, which
+    counts as unmatched and nothing else.
+    """
+    if state not in METADATA_STATES or state in (None, "all"):
+        return True
+    if state == "unmatched":
+        return record is None or not record.matched
+    if record is None:
+        return False
+    if state == "matched":
+        return record.matched
+    if state == "edited":
+        return record.edited
+    if state == "failed":
+        return record.failed
+    if not record.matched or record.fetched_at is None:
+        return False
+    fetched = record.fetched_at
+    if fetched.tzinfo is None:
+        fetched = fetched.replace(tzinfo=UTC)
+    age = (now or datetime.now(UTC)) - fetched
+    return age >= timedelta(days=REFRESH_REMINDER_DAYS)

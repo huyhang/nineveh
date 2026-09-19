@@ -71,7 +71,7 @@
         <label class="wide-field">Description <textarea name="description" rows="8">{{ details.description or '' }}</textarea></label>
         <div class="settings-actions"><span class="muted">Fields changed from MangaBaka are preserved on refresh.</span><button type="submit">Save changes</button></div>
       </form>
-      <details class="provider-record"><summary>Retrieved MangaBaka record</summary><p>Fetched {{ metadata.fetched_at.strftime('%Y-%m-%d %H:%M UTC') }} · ID {{ metadata.provider_id }} · <a href="{{ metadata.canonical_url }}" rel="external noreferrer">View source</a></p><pre>{{ metadata.raw|tojson(indent=2) }}</pre></details>
+      <details class="provider-record"><summary>Retrieved MangaBaka record</summary><p>Fetched <time datetime="{{ metadata.fetched_at.isoformat() }}" title="{{ metadata.fetched_at|timestamp }}">{{ metadata.fetched_at|since }}</time> · ID {{ metadata.provider_id }} · <a href="{{ metadata.canonical_url }}" rel="external noreferrer">View source</a></p><pre>{{ metadata.raw|tojson(indent=2) }}</pre></details>
       <p class="attribution admin-attribution">Metadata provided by MangaBaka under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="external noreferrer">CC BY-NC-SA 4.0</a>{% if metadata.overrides %}; fields edited locally: {{ metadata.overrides.keys()|join(', ') }}{% endif %}.</p>
       <div class="danger-zone">
         <div><h4>Unlink from MangaBaka</h4><p class="muted">Readers fall back to the folder name and the first volume's cover. Your edits and any uploaded cover are kept.</p></div>

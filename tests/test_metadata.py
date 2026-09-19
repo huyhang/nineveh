@@ -4,6 +4,7 @@ import json
 import re
 import time
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -22,6 +23,7 @@ from nineveh.app import build_container, create_app
 from nineveh.catalog import ArchiveInspector, CatalogScanner
 from nineveh.config import Settings
 from nineveh.database import SQLiteRepository
+from nineveh.domain import SeriesMetadataState
 from nineveh.metadata import (
     MangaBakaProvider,
     MetadataCoverStore,
@@ -30,6 +32,7 @@ from nineveh.metadata import (
     PersistentRateLimiter,
     ProviderSeries,
     UrllibTransport,
+    matches_state,
 )
 
 
@@ -949,3 +952,81 @@ def test_out_of_range_numbers_are_refused_by_the_service_not_just_the_browser(
 
     with pytest.raises(MetadataError, match=message):
         service.update(series.id, {field: value})
+
+
+_NOW = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+
+
+def _state(**overrides) -> SeriesMetadataState:
+    base = {"series_id": "s", "matched": True}
+    return SeriesMetadataState(**{**base, **overrides})
+
+
+@pytest.mark.parametrize(
+    ("state", "record", "expected"),
+    [
+        ("all", None, True),
+        ("all", _state(), True),
+        (None, None, True),
+        ("nonsense", None, True),  # an unknown filter must not hide everything
+        ("unmatched", None, True),
+        ("unmatched", _state(matched=False), True),
+        ("unmatched", _state(), False),
+        ("matched", _state(), True),
+        ("matched", None, False),
+        ("edited", _state(edited=True), True),
+        ("edited", _state(), False),
+        ("failed", _state(matched=False, failed=True), True),
+        ("failed", _state(), False),
+    ],
+)
+def test_the_status_filter_selects_the_right_series(
+    state: str | None, record: SeriesMetadataState | None, expected: bool
+):
+    assert matches_state(state, record, _NOW) is expected
+
+
+@pytest.mark.parametrize(
+    ("days", "expected"),
+    [(0, False), (29, False), (30, True), (400, True)],
+)
+def test_unrefreshed_counts_from_the_last_fetch(days: int, expected: bool):
+    """MangaBaka's stored `provider_updated_at` is only what it reported at
+    fetch time, so this measures neglect, not upstream change."""
+    record = _state(fetched_at=_NOW - timedelta(days=days))
+    assert matches_state("unrefreshed", record, _NOW) is expected
+
+
+def test_an_unmatched_series_is_never_unrefreshed():
+    assert matches_state("unrefreshed", _state(matched=False), _NOW) is False
+    assert matches_state("unrefreshed", _state(fetched_at=None), _NOW) is False
+
+
+def test_the_states_query_reports_edits_failures_and_fetch_times(library):
+    settings, _ = library
+    repository, series = _manga_repository(settings)
+
+    assert repository.series_metadata_states() == {}
+
+    repository.replace_metadata_lookup(series.id, [], "MangaBaka could not be reached")
+    failed = repository.series_metadata_states()[series.id]
+    assert (failed.matched, failed.failed, failed.edited) == (False, True, False)
+
+    repository.save_series_metadata(
+        series.id, 12, "https://mangabaka.org/series/12", {"title": "Alchemy"}, {}, None
+    )
+    matched = repository.series_metadata_states()[series.id]
+    assert (matched.matched, matched.edited) == (True, False)
+    assert matched.title == "Alchemy"
+    assert matched.fetched_at is not None
+
+    repository.replace_metadata_overrides(series.id, {"title": "Mine"})
+    edited = repository.series_metadata_states()[series.id]
+    assert (edited.matched, edited.edited, edited.title) == (True, True, "Mine")
+
+
+def test_a_fetch_time_without_an_offset_is_read_as_utc():
+    """Stored timestamps carry an offset today, but a hand-edited or older row
+    may not, and subtracting a naive datetime would raise."""
+    naive = datetime.fromisoformat("2026-01-01T00:00:00")
+    assert matches_state("unrefreshed", _state(fetched_at=naive), _NOW) is True

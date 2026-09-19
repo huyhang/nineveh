@@ -13,7 +13,14 @@
     {% endif %}
     <form method="get" action="/libraries/{{ library.id }}/{{ category }}/metadata" class="filters compact-filters">
       <label>Search <input name="q" value="{{ query }}" placeholder="Local or metadata title"></label>
-      <label>Status <select name="state"><option value="all">All manga</option><option value="unmatched" {% if state_filter == 'unmatched' %}selected{% endif %}>Needs a match</option><option value="matched" {% if state_filter == 'matched' %}selected{% endif %}>Matched</option></select></label>
+      <label>Status <select name="state">
+        <option value="all">All manga</option>
+        <option value="unmatched" {% if state_filter == 'unmatched' %}selected{% endif %}>Needs a match</option>
+        <option value="matched" {% if state_filter == 'matched' %}selected{% endif %}>Matched</option>
+        <option value="edited" {% if state_filter == 'edited' %}selected{% endif %}>Edited locally</option>
+        <option value="failed" {% if state_filter == 'failed' %}selected{% endif %}>Last lookup failed</option>
+        <option value="unrefreshed" {% if state_filter == 'unrefreshed' %}selected{% endif %}>Not refreshed in {{ refresh_reminder_days }} days</option>
+      </select></label>
       <button class="secondary" type="submit">Filter</button>
     </form>
     {% if rows %}
@@ -25,7 +32,7 @@
               <label class="metadata-select"><input type="checkbox" name="series_id" value="{{ row.series.id }}" {% if metadata_status.running %}disabled{% endif %}><span class="sr-only">Select {{ row.title }}</span></label>
               <img src="/api/v1/series/{{ row.series.id }}/cover?revision={{ row.series.first_publication_revision }}" alt="" width="72" loading="lazy">
               <div><h3><a href="/series/{{ row.series.id }}/metadata">{{ row.title }}</a></h3><p>{{ row.series.library }} · {{ row.series.publication_count }} volume{% if row.series.publication_count != 1 %}s{% endif %}</p>{% if row.title != row.series.name %}<small>Folder: {{ row.series.name }}</small>{% endif %}</div>
-              {% if row.metadata %}<span class="badge success">Matched</span>{% else %}<span class="badge warning">Unmatched</span>{% endif %}
+              <span class="row-states">{% if row.metadata and row.metadata.matched %}<span class="badge success">Matched</span>{% else %}<span class="badge warning">Unmatched</span>{% endif %}{% if row.metadata and row.metadata.edited %}<span class="badge">Edited</span>{% endif %}{% if row.metadata and row.metadata.failed %}<span class="badge danger-badge">Lookup failed</span>{% endif %}</span>
               <a class="button secondary" href="/series/{{ row.series.id }}/metadata">Manage</a>
             </article>
           {% endfor %}

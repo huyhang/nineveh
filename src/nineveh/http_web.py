@@ -16,14 +16,22 @@ from .catalog import InvalidLibrary
 from .deployment import memory_limit_text
 from .domain import AccessGrant, Session
 from .http_api import SESSION_COOKIE, scan_active
-from .metadata import EDITABLE_FIELDS, MAX_COVER_BYTES, MetadataError
-from .units import gibibytes
+from .metadata import (
+    EDITABLE_FIELDS,
+    MAX_COVER_BYTES,
+    REFRESH_REMINDER_DAYS,
+    MetadataError,
+    matches_state,
+)
+from .units import gibibytes, since, timestamp
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 router = APIRouter(include_in_schema=False)
 
 
 templates.env.filters["gib"] = gibibytes
+templates.env.filters["since"] = since
+templates.env.filters["timestamp"] = timestamp
 
 
 def _container(request: Request):
@@ -373,16 +381,15 @@ async def library_metadata_page(
         category="manga",
         query=(q or "").strip() or None,
     )
-    metadata = await run_in_threadpool(container.repository.series_metadata_summaries)
+    states = await run_in_threadpool(container.repository.series_metadata_states)
     rows = [
         {
             "series": item,
-            "metadata": metadata.get(item.id),
-            "title": _series_title(item, metadata.get(item.id)),
+            "metadata": states.get(item.id),
+            "title": _series_title(item, states.get(item.id)),
         }
         for item in items
-        if state not in {"matched", "unmatched"}
-        or (state == "matched") == (item.id in metadata)
+        if matches_state(state, states.get(item.id))
     ]
     return templates.TemplateResponse(
         request,
@@ -395,6 +402,7 @@ async def library_metadata_page(
             "rows": rows,
             "query": q or "",
             "state_filter": state or "all",
+            "refresh_reminder_days": REFRESH_REMINDER_DAYS,
             "metadata_status": request.app.state.metadata_status,
             "request_limit": container.configuration.mangabaka_request_limit(),
             "message": message,
@@ -984,12 +992,8 @@ async def _managed_library_named(container, name: str, scope):
 
 
 def _series_title(series, metadata) -> str:
-    """`metadata` is a summary on listing pages, a full record on detail pages."""
-    title = None
-    if metadata is not None:
-        title = getattr(metadata, "title", None)
-        if title is None:
-            title = metadata.effective.get("title")
+    """Summaries, state rows and full records all expose `.title`."""
+    title = metadata.title if metadata is not None else None
     if isinstance(title, str) and title.strip():
         return title.strip()
     return series.name

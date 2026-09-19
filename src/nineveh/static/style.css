@@ -98,9 +98,17 @@ label { display: grid; gap: .4rem; font-size: .88rem; font-weight: 680; }
 input, select, button, .button { min-height: 42px; border: 1px solid var(--line-strong); border-radius: 9px; padding: .58rem .82rem; background: var(--raised); color: var(--text); font: inherit; }
 input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 35%, transparent); outline-offset: 2px; }
 button, .button { border-color: var(--accent); background: var(--accent); color: white; cursor: pointer; font-weight: 720; text-decoration: none; text-align: center; transition: transform .14s ease, background .14s ease; }
-button:hover:not(:disabled), .button:hover { background: var(--accent-strong); transform: translateY(-1px); }
+/* The lift is shared; the repaint is not. Filling every button with
+   `--accent-strong` on hover left the outline and quiet variants showing their
+   own foreground on top of it -- around 1.3:1 in every palette -- because they
+   set a colour but the hover only set a background. */
+button:hover:not(:disabled), .button:hover { transform: translateY(-1px); }
+button:not(.secondary):not(.ghost):hover:not(:disabled),
+.button:not(.secondary):hover { background: var(--accent-strong); }
 button.secondary, .button.secondary { background: transparent; color: var(--accent); }
+button.secondary:hover:not(:disabled), .button.secondary:hover { background: var(--accent-soft); }
 button.ghost { background: transparent; }
+button.ghost:hover:not(:disabled) { background: var(--accent-soft); }
 button.danger { border-color: transparent; color: var(--danger); }
 /* `.danger` only ever recoloured the text, so on its own it left danger-red
    lettering on the default accent fill -- 1.04:1, effectively invisible. Paired
@@ -108,6 +116,8 @@ button.danger { border-color: transparent; color: var(--danger); }
    it looks like: a filled destructive button. */
 button.danger:not(.ghost) { border-color: var(--danger); background: var(--danger); color: var(--on-danger); }
 button.danger:not(.ghost):hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 85%, black); }
+/* A destructive action tints with its own colour, not the accent. */
+button.danger.ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 12%, var(--surface)); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 .link-button { min-height: auto; padding: 0; border: 0; background: none; color: var(--accent); }
 .inline-form { display: inline-flex; gap: .65rem; align-items: end; }
@@ -137,6 +147,9 @@ th, td { padding: .75rem; border-bottom: 1px solid var(--line); text-align: left
 .confirm-dialog::backdrop { background: rgb(0 0 0 / 45%); }
 .confirm-dialog p { margin: 0 0 1.25rem; }
 .confirm-actions { display: flex; justify-content: flex-end; gap: .6rem; }
+.row-states { display: flex; flex-wrap: wrap; gap: .35rem; justify-content: flex-end; }
+.badge.danger-badge { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, var(--surface)); }
+time[title] { cursor: help; text-decoration: underline dotted color-mix(in srgb, currentColor 35%, transparent); text-underline-offset: 3px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .admin-page { width: min(1180px, calc(100% - 2rem)); }
 .admin-heading { margin-bottom: 1.25rem; }
