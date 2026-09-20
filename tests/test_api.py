@@ -211,6 +211,27 @@ def test_a_deleted_archive_stops_being_served(
     )
 
 
+def test_a_changed_archive_conflicts_instead_of_disappearing(
+    client: TestClient, library, publication_id: str
+):
+    """A rescan conflict must not be reported as a missing archive.
+
+    `ArchiveChanged` subclasses `ArchiveUnavailable`, so measuring page
+    dimensions used to downgrade it to 404 and the reader's "reload me" path
+    could never run.
+    """
+    _, archive = library
+    with archive.open("ab") as handle:
+        handle.write(b"junk")
+
+    assert (
+        client.get(
+            f"/api/v1/publications/{publication_id}/pages", headers=authorization()
+        ).status_code
+        == 409
+    )
+
+
 def test_covers_are_rendered_at_the_allowed_widths(
     client: TestClient, publication_id: str
 ):

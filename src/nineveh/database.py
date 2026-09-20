@@ -30,6 +30,9 @@ from .domain import (
 )
 
 SCHEMA_VERSION = 4
+# The release that began recording `ComicInfo.xml` spread markers. Databases
+# older than this need one reinspection pass to pick them up.
+SPREAD_MARKER_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -212,7 +215,7 @@ class SQLiteRepository:
             self._ensure_session_flash_columns(connection)
             self._ensure_page_spread_column(connection)
             connection.executescript(SCOPE_INDEX)
-            if 0 < version < 4:
+            if 0 < version < SPREAD_MARKER_VERSION:
                 # Reinspect existing ComicInfo files once so the new spread
                 # marker is populated without changing publication identities.
                 connection.execute("UPDATE publications SET modified_ns = -1")
@@ -1112,7 +1115,7 @@ class SQLiteRepository:
     ) -> ReadingProgress:
         updated_at = _now_iso()
         with self._connect() as connection:
-            connection.execute(
+            row = connection.execute(
                 """
                 INSERT INTO reading_progress(
                     user_id, publication_id, page_number, mode, completed, updated_at
@@ -1122,12 +1125,11 @@ class SQLiteRepository:
                     mode=excluded.mode,
                     completed=excluded.completed,
                     updated_at=excluded.updated_at
+                RETURNING *
                 """,
                 (user_id, publication_id, page, mode, int(completed), updated_at),
-            )
-        saved = self.reading_progress(user_id, publication_id)
-        assert saved is not None
-        return saved
+            ).fetchone()
+        return self._reading_progress(row)
 
     def delete_reading_progress(self, user_id: str, publication_id: str) -> None:
         with self._connect() as connection:

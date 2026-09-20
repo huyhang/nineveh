@@ -14,6 +14,7 @@
       class="reader-shell direction-{{ reading_direction }}"
       data-reader
       data-reading-direction="{{ reading_direction }}"
+      data-default-direction="{{ reading_direction }}"
       data-publication-id="{{ publication.id }}"
       data-user-id="{{ session.user.id }}"
       data-revision="{{ publication.revision }}"
@@ -54,6 +55,7 @@
           <button type="button" data-mode="double" aria-pressed="false">Double</button>
           <button type="button" data-mode="scroll" aria-pressed="false">Continuous</button>
         </div>
+        <button class="reader-direction" type="button" data-direction-toggle>Auto</button>
         <button class="reader-fullscreen" type="button" data-fullscreen aria-label="Toggle fullscreen" title="Toggle fullscreen">⛶</button>
       </header>
 
@@ -64,9 +66,9 @@
 
       <section class="reader-stage" data-reader-stage aria-label="Comic pages">
         <noscript><p class="reader-noscript">The browser reader requires JavaScript. <a href="/api/v1/publications/{{ publication.id }}/file">Download the CBZ instead.</a></p></noscript>
-        <button class="reader-page-nav previous" type="button" data-previous aria-label="Previous page">‹</button>
+        <button class="reader-page-nav previous" type="button" data-previous aria-label="Previous page"></button>
         <div class="reader-pages" data-reader-pages></div>
-        <button class="reader-page-nav next" type="button" data-next aria-label="Next page">›</button>
+        <button class="reader-page-nav next" type="button" data-next aria-label="Next page"></button>
         <div class="reader-loading" data-reader-loading role="status">Loading pages…</div>
         <div class="reader-error" data-reader-error role="alert" hidden>
           <strong>That page could not be loaded.</strong>

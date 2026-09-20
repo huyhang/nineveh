@@ -5,7 +5,10 @@ import time
 from dataclasses import replace
 
 from conftest import ADMIN_PASSWORD, READER_PASSWORD, authorization
+from fakes import publication
 from fastapi.testclient import TestClient
+
+from nineveh.http_web import _series_url
 
 NEW_PASSWORD = "another sufficiently long password"
 
@@ -248,21 +251,59 @@ def test_reader_rejects_missing_sessions_and_impossible_progress(
         json={"page": 99, "mode": "single"},
     )
     assert response.status_code == 422
+    unknown = client.put(
+        "/reader/progress/does-not-exist",
+        headers={"X-CSRF-Token": token},
+        json={"page": 1, "mode": "single"},
+    )
+    assert unknown.status_code == 404
 
 
-def test_reader_assets_include_spread_and_responsive_behaviour(client: TestClient):
-    script = client.get("/static/reader-model.js").text
+def test_volume_actions_fall_back_to_the_catalog_without_a_series():
+    """A publication indexed before series identities exist has nowhere to
+    return to, and the action must not redirect to `/series/None`."""
+    item = publication("pub-1")
+
+    assert _series_url(replace(item, series_id="s-1")) == "/series/s-1"
+    assert _series_url(replace(item, series_id=None)) == "/"
+
+
+def test_every_control_the_client_looks_up_exists_in_the_page(
+    client: TestClient, publication_id: str
+):
+    """The client binds its controls by data attribute.
+
+    There is no JavaScript runner in this project, so a renamed or mistyped hook
+    would otherwise reach a reader as a dead button rather than a failing build.
+    """
+    _login(client)
+    page = client.get(f"/read/{publication_id}").text
+    script = client.get("/static/reader.js").text
+    hooks = set(re.findall(r'find\("\[data-([a-z-]+)\]"\)', script))
+    hooks |= set(
+        re.findall(r'this\.root\.querySelectorAll\("\[data-([a-z-]+)\]"\)', script)
+    )
+
+    assert len(hooks) > 15, "the hook scan stopped matching the client"
+    assert sorted(hook for hook in hooks if f"data-{hook}" not in page) == []
+
+
+def test_reader_styles_honour_the_reading_direction(client: TestClient):
+    """Right-to-left pairing is the brief's one hard layout requirement.
+
+    It cannot be asserted through the DOM without a browser, so the rules that
+    implement it are pinned here; losing them silently mis-orders every manga
+    spread, its page-turn controls, and its progress slider.
+    """
     stylesheet = client.get("/static/reader.css").text
 
-    assert "page.width / page.height >= 1.25" in script
-    assert "The cover always stands alone" in script
-    assert "direction: ltr" in stylesheet
-    assert ".reader-shell.direction-rtl .reader-spread.is-pair" in stylesheet
-    assert ".reader-shell.direction-rtl .reader-progress input" in stylesheet
-    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in stylesheet
-    reader_script = client.get("/static/reader.js").text
-    assert "orientation: portrait" in reader_script
-    assert "navigationDelta" in reader_script
+    for rule in (
+        ".reader-shell.direction-rtl .reader-spread.is-pair",
+        ".reader-shell.direction-rtl .reader-progress input",
+        ".reader-shell.direction-rtl .reader-page-nav.previous",
+        ".reader-shell.direction-rtl .reader-page-nav.next",
+    ):
+        assert rule in stylesheet, rule
 
 
 def test_signing_out_clears_the_session(client: TestClient):

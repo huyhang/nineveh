@@ -9,6 +9,11 @@ import {
   visiblePages,
 } from "/static/reader-model.js";
 
+// "auto" follows the publication's category; the other two are the reader's
+// explicit override, remembered per browser.
+const DIRECTION_CYCLE = ["auto", "ltr", "rtl"];
+const DIRECTION_LABELS = { auto: "Auto", ltr: "LTR", rtl: "RTL" };
+
 class ReaderController {
   constructor(root, dependencies = {}) {
     this.root = root;
@@ -24,6 +29,7 @@ class ReaderController {
     this.chromeTimer = null;
     this.renderVersion = 0;
     this.pointerStart = null;
+    this.chromeLocked = false;
     this.forcePair = false;
     this.finished = false;
     this.visiblePageNumbers = [];
@@ -31,6 +37,7 @@ class ReaderController {
     this.portraitPhone = window.matchMedia(
       "(max-width: 640px) and (orientation: portrait)",
     );
+    this.direction = this.readLocalDirection();
     this.state = this.initialState();
   }
 
@@ -54,6 +61,7 @@ class ReaderController {
       forcePair: find("[data-force-pair]"),
       savedMessage: find("[data-saved-message]"),
       picker: find("[data-publication-picker]"),
+      direction: find("[data-direction-toggle]"),
       fullscreen: find("[data-fullscreen]"),
       stage: find("[data-reader-stage]"),
       modes: [...this.root.querySelectorAll("[data-mode]")],
@@ -106,6 +114,55 @@ class ReaderController {
     return `nineveh-reader-mode:${this.root.dataset.userId}`;
   }
 
+  get directionStorageKey() {
+    return `nineveh-reader-direction:${this.root.dataset.userId}`;
+  }
+
+  get defaultDirection() {
+    return this.root.dataset.defaultDirection === "rtl" ? "rtl" : "ltr";
+  }
+
+  get readingDirection() {
+    return this.direction === "auto" ? this.defaultDirection : this.direction;
+  }
+
+  readLocalDirection() {
+    const saved = this.readStorage(this.directionStorageKey);
+    return DIRECTION_CYCLE.includes(saved?.direction) ? saved.direction : "auto";
+  }
+
+  cycleDirection() {
+    const next = DIRECTION_CYCLE.indexOf(this.direction) + 1;
+    this.direction = DIRECTION_CYCLE[next % DIRECTION_CYCLE.length];
+    try {
+      this.storage.setItem(
+        this.directionStorageKey,
+        JSON.stringify({ direction: this.direction }),
+      );
+    } catch (_error) {
+      // The override still applies to this tab when storage is unavailable.
+    }
+    this.applyDirection();
+    return this.render();
+  }
+
+  applyDirection() {
+    const effective = this.readingDirection;
+    const explicit = this.direction !== "auto";
+    const spelled = effective === "rtl" ? "right to left" : "left to right";
+    this.root.dataset.readingDirection = effective;
+    this.root.classList.toggle("direction-rtl", effective === "rtl");
+    this.root.classList.toggle("direction-ltr", effective !== "rtl");
+    this.elements.slider.dir = effective;
+    this.elements.direction.textContent = DIRECTION_LABELS[this.direction];
+    this.elements.direction.dataset.explicit = String(explicit);
+    const label = explicit
+      ? `Reading ${spelled}. Change reading direction.`
+      : `Reading ${spelled}, matching this publication. Change reading direction.`;
+    this.elements.direction.title = label;
+    this.elements.direction.setAttribute("aria-label", label);
+  }
+
   readStorage(key) {
     try {
       return JSON.parse(this.storage.getItem(key));
@@ -124,6 +181,7 @@ class ReaderController {
 
   async start() {
     this.bindEvents();
+    this.applyDirection();
     this.updateControls();
     try {
       await this.ensurePage(this.state.page);
@@ -150,6 +208,9 @@ class ReaderController {
     );
     this.elements.fullscreen.addEventListener("click", () =>
       this.perform(() => this.toggleFullscreen()),
+    );
+    this.elements.direction.addEventListener("click", () =>
+      this.perform(() => this.cycleDirection()),
     );
     this.elements.forcePair.addEventListener("click", () => {
       this.forcePair = true;
@@ -183,7 +244,7 @@ class ReaderController {
     document.addEventListener("pointermove", (event) => {
       if (event.pointerType === "mouse") this.showChrome();
     });
-    document.addEventListener("focusin", () => this.showChrome(false));
+    document.addEventListener("focusin", () => this.revealChrome());
     this.portraitPhone.addEventListener("change", () => {
       this.forcePair = false;
       if (this.state.mode === "double") this.perform(() => this.render());
@@ -361,11 +422,17 @@ class ReaderController {
     const image = document.createElement("img");
     image.src = page.href;
     image.alt = `Page ${page.number} of ${this.totalPages}`;
+    // Without this the browser starts its own image drag, which fires
+    // `pointercancel` and swallows the swipe before it can turn the page.
+    image.draggable = false;
     image.loading = lazy ? "lazy" : "eager";
     image.decoding = "async";
     if (page.width && page.height) {
       image.width = page.width;
       image.height = page.height;
+      // An explicit ratio is what lets a width limit shrink the height, and a
+      // height limit shrink the width, instead of one of them letterboxing.
+      image.style.aspectRatio = `${page.width} / ${page.height}`;
     }
     image.addEventListener("error", () =>
       this.showError(new Error(`Page ${page.number} could not be loaded.`)),
@@ -427,8 +494,16 @@ class ReaderController {
     await this.goToPage(target, true);
   }
 
-  async goToPage(page, smooth = false) {
+  setPage(page) {
     this.state.page = clampPage(page, this.totalPages);
+    // Leaving the last page un-completes the volume. The server refuses a
+    // completed flag on any other page, and that rejection can never clear
+    // itself — every later save for this publication would fail too.
+    if (this.state.page !== this.totalPages) this.state.completed = false;
+  }
+
+  async goToPage(page, smooth = false) {
+    this.setPage(page);
     this.finished = false;
     if (this.state.mode === "scroll") {
       await this.ensureAllPages();
@@ -486,7 +561,7 @@ class ReaderController {
   }
 
   recordPage(page) {
-    this.state.page = clampPage(page, this.totalPages);
+    this.setPage(page);
     this.visiblePageNumbers = [this.state.page];
     this.updateControls();
     this.updateLocation();
@@ -550,6 +625,7 @@ class ReaderController {
   async saveRemote(keepalive = false) {
     window.clearTimeout(this.saveTimer);
     window.clearTimeout(this.retryTimer);
+    let retryable = true;
     try {
       const response = await this.fetch(
         `/reader/progress/${encodeURIComponent(this.root.dataset.publicationId)}`,
@@ -568,7 +644,11 @@ class ReaderController {
           }),
         },
       );
-      if (!response.ok) throw new Error(`Progress sync returned ${response.status}`);
+      if (!response.ok) {
+        // A refused payload stays refused; only retry a server-side failure.
+        retryable = response.status >= 500;
+        throw new Error(`Progress sync returned ${response.status}`);
+      }
       const saved = await response.json();
       this.persistLocal(Date.parse(saved.updatedAt));
       this.elements.sync.textContent = "Saved";
@@ -577,7 +657,7 @@ class ReaderController {
       this.elements.sync.textContent = "Saved locally";
       this.elements.savedMessage.textContent =
         "Progress is saved on this device and will sync when the connection returns.";
-      if (!keepalive) {
+      if (retryable && !keepalive) {
         this.retryTimer = window.setTimeout(() => this.saveRemote(), 5000);
       }
     }
@@ -590,6 +670,9 @@ class ReaderController {
         .then((page) => {
           if (page) new Image().src = page.href;
         })
+        // Prefetching is an optimisation. A neighbour that cannot be fetched
+        // will report itself when the reader actually navigates to it, and
+        // surfacing it here would fire an error over a page being read fine.
         .catch(() => {});
     }
   }
@@ -624,15 +707,29 @@ class ReaderController {
     const vertical = event.clientY - this.pointerStart.y;
     this.pointerStart = null;
     if (Math.abs(horizontal) < 55 || Math.abs(horizontal) < Math.abs(vertical)) return;
-    this.perform(() => this.move(horizontal < 0 ? 1 : -1));
+    // Dragging the page the way it is bound: leftwards advances a comic,
+    // rightwards advances manga, matching the arrow keys and the chevrons.
+    const forward =
+      this.readingDirection === "rtl" ? horizontal > 0 : horizontal < 0;
+    this.perform(() => this.move(forward ? 1 : -1));
   }
 
   onStageClick(event) {
     if (event.target.closest("button, a, input") || this.state.mode === "scroll") return;
-    this.root.classList.toggle("chrome-hidden");
+    this.chromeLocked = !this.chromeLocked;
+    if (this.chromeLocked) this.hideChrome();
+    else this.showChrome();
+  }
+
+  hideChrome() {
+    window.clearTimeout(this.chromeTimer);
+    this.root.classList.add("chrome-hidden");
   }
 
   showChrome(scheduleHide = true) {
+    // Asking for the chrome to go away has to outlast the next mouse twitch,
+    // or the page grows and shrinks again before the reader can read it.
+    if (this.chromeLocked) return;
     this.root.classList.remove("chrome-hidden");
     window.clearTimeout(this.chromeTimer);
     if (scheduleHide && this.state.mode !== "scroll") {
@@ -641,6 +738,12 @@ class ReaderController {
         3200,
       );
     }
+  }
+
+  revealChrome() {
+    // Focus reaching a control the reader cannot see overrides their request.
+    this.chromeLocked = false;
+    this.showChrome(false);
   }
 
   async toggleFullscreen() {

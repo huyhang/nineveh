@@ -16,6 +16,10 @@ class ReaderService:
         self._catalog = catalog
         self._progress = progress
 
+    def publication(self, publication_id: str, scope: ReadScope) -> Publication | None:
+        """The authorized publication, without its series neighbours."""
+        return self._catalog.publication_by_id(publication_id, scope)
+
     def context(self, publication_id: str, scope: ReadScope) -> ReaderContext | None:
         publication = self._catalog.publication_by_id(publication_id, scope)
         if not publication or not publication.series_id:

@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from .auth import AuthenticationError, InvalidUserInput, LastAdministratorError
 from .catalog import InvalidLibrary
 from .deployment import memory_limit_text
-from .domain import AccessGrant, Session
+from .domain import AccessGrant, Publication, Session
 from .http_api import SESSION_COOKIE, scan_active
 from .metadata import (
     EDITABLE_FIELDS,
@@ -361,6 +361,29 @@ async def _reader_context(request: Request, session: Session, publication_id: st
     return context
 
 
+def _series_url(publication: Publication) -> str:
+    """Where a volume's actions return to. An unindexed volume has no series."""
+    return f"/series/{publication.series_id}" if publication.series_id else "/"
+
+
+async def _reader_publication(request: Request, session: Session, publication_id: str):
+    """The publication alone, for writes that do not need its neighbours.
+
+    Progress is saved on a debounce while the reader turns pages, so loading
+    and sorting the whole series on each write would be the expensive part of
+    an otherwise single-row update.
+    """
+    container = _container(request)
+    publication = await run_in_threadpool(
+        container.reader.publication,
+        publication_id,
+        container.authorization.read_scope(session.user),
+    )
+    if not publication:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    return publication
+
+
 @router.get("/read/{publication_id}", response_class=HTMLResponse)
 async def reader(
     request: Request,
@@ -416,12 +439,12 @@ async def update_reading_progress(
         raise HTTPException(status_code=401, detail="Authentication required")
     _verify_csrf(request, session, csrf_token)
     container = _container(request)
-    context = await _reader_context(request, session, publication_id)
+    publication = await _reader_publication(request, session, publication_id)
     try:
         saved = await run_in_threadpool(
             container.reader.save_progress,
             session.user.id,
-            context.publication,
+            publication,
             body.page,
             body.mode,
             body.completed,
@@ -444,13 +467,13 @@ async def mark_publication_read(
     session = await _require_browser_session(request)
     _verify_csrf(request, session, csrf_token)
     container = _container(request)
-    context = await _reader_context(request, session, publication_id)
+    publication = await _reader_publication(request, session, publication_id)
     await run_in_threadpool(
         container.reader.mark_as_read,
         session.user.id,
-        context.publication,
+        publication,
     )
-    return RedirectResponse(f"/series/{context.publication.series_id}", status_code=303)
+    return RedirectResponse(_series_url(publication), status_code=303)
 
 
 @router.post("/reader/progress/{publication_id}/unread")
@@ -460,13 +483,13 @@ async def mark_publication_unread(
     session = await _require_browser_session(request)
     _verify_csrf(request, session, csrf_token)
     container = _container(request)
-    context = await _reader_context(request, session, publication_id)
+    publication = await _reader_publication(request, session, publication_id)
     await run_in_threadpool(
         container.reader.mark_as_unread,
         session.user.id,
-        context.publication.id,
+        publication.id,
     )
-    return RedirectResponse(f"/series/{context.publication.series_id}", status_code=303)
+    return RedirectResponse(_series_url(publication), status_code=303)
 
 
 @router.get("/admin", response_class=HTMLResponse)

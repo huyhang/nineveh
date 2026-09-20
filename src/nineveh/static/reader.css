@@ -9,6 +9,7 @@
   --reader-accent: #ec806d;
   --reader-toolbar-height: 68px;
   --reader-progress-height: 62px;
+  --reader-scroll-page: 980px;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -27,7 +28,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   inset: 0 0 auto;
   z-index: 20;
   display: grid;
-  grid-template-columns: auto minmax(120px, 1fr) minmax(140px, 280px) auto auto auto;
+  grid-template-columns: auto minmax(120px, 1fr) minmax(140px, 280px) auto auto auto auto;
   gap: .7rem;
   align-items: center;
   min-height: var(--reader-toolbar-height);
@@ -37,7 +38,7 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   backdrop-filter: blur(16px);
   transition: transform .2s ease, opacity .2s ease;
 }
-.reader-back, .reader-volume-nav a, .reader-volume-nav span, .reader-fullscreen, .reader-modes button {
+.reader-back, .reader-volume-nav a, .reader-volume-nav span, .reader-fullscreen, .reader-direction, .reader-modes button {
   display: inline-grid;
   place-items: center;
   min-width: 44px;
@@ -60,6 +61,8 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .reader-modes button { min-width: auto; min-height: 38px; padding: 0 .65rem; border-color: transparent; cursor: pointer; font-size: .82rem; }
 .reader-modes button[aria-pressed="true"] { border-color: var(--reader-accent); color: #fff; background: #873d31; }
 .reader-fullscreen { cursor: pointer; }
+.reader-direction { min-width: 60px; padding: 0 .6rem; cursor: pointer; font-size: .78rem; font-weight: 700; letter-spacing: .04em; }
+.reader-direction[data-explicit="true"] { border-color: var(--reader-accent); color: #fff; }
 
 .reader-adaptive-note {
   position: fixed;
@@ -100,14 +103,28 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   margin: 0 auto;
 }
 .reader-page { display: flex; justify-content: center; align-items: center; min-width: 0; height: 100%; margin: 0; }
-.reader-spread.is-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+/* The row is sized explicitly, not from content. Without it the grid area is
+   indefinite, `max-height: 100%` on the image resolves to nothing, and a pair
+   grows to column-width x aspect — taller than the viewport, behind a fixed
+   footer, with `overflow: hidden` making the lost strip unreachable. */
+.reader-spread.is-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: 100%; }
 .reader-shell.direction-rtl .reader-spread.is-pair { direction: rtl; }
 .reader-spread.is-pair .reader-page { width: 100%; }
-.reader-page img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; background: #111; box-shadow: 0 3px 22px rgb(0 0 0 / 45%); }
+/* The element must hug the artwork, not letterbox inside a larger box: that
+   keeps the shadow on the page edge, the hit area off the empty margins, and
+   lets a pair meet with no gutter. Both axes are `auto` so whichever limit
+   binds shrinks the other through the page's `aspect-ratio`, set from the
+   indexed dimensions. `object-fit` is the fallback for a page whose size is
+   not known yet. */
+.reader-page img { display: block; width: auto; height: auto; max-width: 100%; max-height: 100%; object-fit: contain; background: #111; box-shadow: 0 3px 22px rgb(0 0 0 / 45%); }
+/* Each half hugs the gutter, so the pair meets in the middle with no seam.
+   `flex-end`/`flex-start` follow the inherited direction, so RTL mirrors. */
 .reader-spread.is-pair .reader-page:first-child { justify-content: flex-end; }
 .reader-spread.is-pair .reader-page:last-child { justify-content: flex-start; }
-.reader-spread.is-pair .reader-page img { width: 100%; height: 100%; box-shadow: none; }
-.reader-spread.is-stitched { max-width: min(96vw, 1500px); }
+.reader-spread.is-pair .reader-page img { box-shadow: none; }
+/* A stitched spread is two pages joined, so it gets exactly the box a pair of
+   its neighbours would get. Capping it separately made it render smaller than
+   the spreads either side of it, which reads as the page shrinking mid-scene. */
 
 .reader-page-nav {
   position: fixed;
@@ -130,8 +147,17 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 }
 .reader-page-nav:hover { background: rgb(55 55 55 / 88%); }
 .reader-page-nav:disabled { opacity: .25; cursor: default; }
+/* Both the edge a control sits on and the chevron it shows follow the reading
+   direction, so the forward control is always on the side the reader is moving
+   towards — matching the arrow keys and swipes. */
 .reader-page-nav.previous { left: max(.5rem, env(safe-area-inset-left)); }
 .reader-page-nav.next { right: max(.5rem, env(safe-area-inset-right)); }
+.reader-page-nav.previous::before { content: "\2039"; }
+.reader-page-nav.next::before { content: "\203A"; }
+.reader-shell.direction-rtl .reader-page-nav.previous { right: max(.5rem, env(safe-area-inset-right)); left: auto; }
+.reader-shell.direction-rtl .reader-page-nav.next { left: max(.5rem, env(safe-area-inset-left)); right: auto; }
+.reader-shell.direction-rtl .reader-page-nav.previous::before { content: "\203A"; }
+.reader-shell.direction-rtl .reader-page-nav.next::before { content: "\2039"; }
 
 .reader-loading, .reader-error { position: absolute; display: grid; gap: .7rem; justify-items: center; color: var(--reader-muted); text-align: center; }
 .reader-noscript { padding: 1rem; border: 1px solid var(--reader-line); border-radius: 12px; background: var(--reader-panel); }
@@ -191,25 +217,33 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 
 .reader-shell.mode-scroll .reader-stage { display: block; padding-inline: 0; }
 .reader-shell.mode-scroll .reader-pages { display: grid; gap: clamp(.25rem, 1vw, .8rem); }
-.reader-shell.mode-scroll .reader-spread { display: block; width: fit-content; max-width: min(100%, 980px); height: auto; }
-.reader-shell.mode-scroll .reader-spread.is-stitched { max-width: min(100%, 1500px); }
+.reader-shell.mode-scroll .reader-spread { display: block; width: fit-content; max-width: min(100%, var(--reader-scroll-page)); height: auto; }
+/* Twice the single-page width, so each half of a stitched spread is read at
+   the same scale as the pages around it. */
+.reader-shell.mode-scroll .reader-spread.is-stitched { max-width: min(100%, calc(var(--reader-scroll-page) * 2)); }
 .reader-shell.mode-scroll .reader-page { display: block; width: fit-content; max-width: 100%; height: auto; scroll-margin-top: calc(var(--reader-toolbar-height) + .75rem); }
 .reader-shell.mode-scroll .reader-page img { width: auto; max-width: 100%; height: auto; max-height: none; margin: 0 auto; }
 .reader-shell.mode-scroll .reader-page-nav { display: none; }
 .reader-shell.mode-scroll .reader-end-card { margin: 3rem auto 1rem; }
 
+/* Hiding the chrome has to hand its space back, or the page stays the size it
+   was and the reader gets nothing for the tap but emptier margins. Both bars
+   are fixed and translated away, so zeroing the reserve only affects the
+   padding and the spread height that are derived from it. */
+.reader-shell.chrome-hidden:not(.mode-scroll) { --reader-toolbar-height: 0px; --reader-progress-height: 0px; }
 .reader-shell.chrome-hidden:not(.mode-scroll) .reader-toolbar { opacity: 0; pointer-events: none; transform: translateY(-100%); }
 .reader-shell.chrome-hidden:not(.mode-scroll) .reader-progress { opacity: 0; pointer-events: none; transform: translateY(100%); }
 .reader-shell.chrome-hidden:not(.mode-scroll) .reader-page-nav { opacity: 0; pointer-events: none; }
 
 @media (max-width: 900px) {
   :root { --reader-toolbar-height: 116px; }
-  .reader-toolbar { grid-template-columns: auto minmax(100px, 1fr) auto auto; grid-template-rows: 44px 40px; }
+  .reader-toolbar { grid-template-columns: auto minmax(100px, 1fr) auto auto auto; grid-template-rows: 44px 40px; }
   .reader-title { display: none; }
   .reader-back { grid-column: 1; grid-row: 1; }
   .reader-publication-picker { grid-column: 2; grid-row: 1; }
   .reader-volume-nav { grid-column: 3; grid-row: 1; }
-  .reader-fullscreen { grid-column: 4; grid-row: 1; }
+  .reader-direction { grid-column: 4; grid-row: 1; }
+  .reader-fullscreen { grid-column: 5; grid-row: 1; }
   .reader-modes { grid-column: 1 / -1; grid-row: 2; justify-self: center; }
   .reader-modes button { min-width: 92px; }
 }
@@ -226,9 +260,14 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   .reader-page-nav { width: 40px; height: 64px; border-radius: 9px; }
   .reader-page-nav.previous { left: .2rem; }
   .reader-page-nav.next { right: .2rem; }
+  .reader-shell.direction-rtl .reader-page-nav.previous { right: .2rem; left: auto; }
+  .reader-shell.direction-rtl .reader-page-nav.next { left: .2rem; right: auto; }
   .reader-progress { grid-template-columns: auto minmax(70px, 1fr); gap: .5rem; }
   .reader-sync { display: none; }
   .reader-end-actions { flex-direction: column; }
+  /* Side by side the message collapses into a column a few characters wide. */
+  .reader-adaptive-note { flex-direction: column; gap: .4rem; width: calc(100% - 1rem); max-width: none; padding: .5rem .7rem; }
+  .reader-adaptive-note button { width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

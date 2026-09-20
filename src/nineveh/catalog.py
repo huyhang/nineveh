@@ -124,10 +124,10 @@ class ArchiveInspector:
         publication = self._publication(
             path, relative_path, publication_id, after, revision, image_infos, metadata
         )
-        spread_pages = metadata.get("spread_pages", set())
-        if not isinstance(spread_pages, set):
-            spread_pages = set()
-        return ScannedPublication(publication, self._pages(image_infos, spread_pages))
+        return ScannedPublication(
+            publication,
+            self._pages(image_infos, frozenset(metadata.get("spread_pages", ()))),
+        )
 
     def _ordered_images(self, infos: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
         image_infos = [
@@ -175,7 +175,7 @@ class ArchiveInspector:
         )
 
     def _pages(
-        self, image_infos: list[zipfile.ZipInfo], spread_pages: set[int]
+        self, image_infos: list[zipfile.ZipInfo], spread_pages: frozenset[int]
     ) -> tuple[Page, ...]:
         return tuple(
             Page(

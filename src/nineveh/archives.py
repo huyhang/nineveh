@@ -151,6 +151,10 @@ class ArchiveService:
                         width, height = image.size
                     self._validate_pixels(width, height)
                     dimensions[page.number] = (width, height)
+        except ArchiveUnavailable:
+            # `ArchiveChanged` is a `RuntimeError`, so the catch-all below would
+            # otherwise downgrade a rescan conflict into "archive is missing".
+            raise
         except (
             OSError,
             KeyError,
