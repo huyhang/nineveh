@@ -19,6 +19,7 @@ from .domain import (
     Page,
     Publication,
     PublicationPage,
+    ReadingProgress,
     ReadScope,
     ScannedPublication,
     SeriesMetadata,
@@ -28,7 +29,7 @@ from .domain import (
     User,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -101,8 +102,21 @@ CREATE TABLE IF NOT EXISTS pages (
     crc INTEGER NOT NULL,
     width INTEGER,
     height INTEGER,
+    is_spread INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(publication_id, number)
 );
+
+CREATE TABLE IF NOT EXISTS reading_progress (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    publication_id TEXT NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL CHECK(page_number > 0),
+    mode TEXT NOT NULL CHECK(mode IN ('single', 'double', 'scroll')),
+    completed INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, publication_id)
+);
+CREATE INDEX IF NOT EXISTS reading_progress_recent
+    ON reading_progress(user_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS access_grants (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -196,7 +210,12 @@ class SQLiteRepository:
             connection.executescript(SCHEMA)
             self._ensure_scope_columns(connection)
             self._ensure_session_flash_columns(connection)
+            self._ensure_page_spread_column(connection)
             connection.executescript(SCOPE_INDEX)
+            if 0 < version < 4:
+                # Reinspect existing ComicInfo files once so the new spread
+                # marker is populated without changing publication identities.
+                connection.execute("UPDATE publications SET modified_ns = -1")
             if 0 < version < SCHEMA_VERSION:
                 self._backfill_scope(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -229,6 +248,18 @@ class SQLiteRepository:
         for column in ("flash_message", "flash_error"):
             if column not in present:
                 connection.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
+
+    @staticmethod
+    def _ensure_page_spread_column(connection: sqlite3.Connection) -> None:
+        """Pages indexed before v4 did not retain ComicInfo spread markers."""
+        present = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(pages)").fetchall()
+        }
+        if "is_spread" not in present:
+            connection.execute(
+                "ALTER TABLE pages ADD COLUMN is_spread INTEGER NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _backfill_scope(connection: sqlite3.Connection) -> None:
@@ -1001,6 +1032,7 @@ class SQLiteRepository:
             crc=row["crc"],
             width=row["width"],
             height=row["height"],
+            is_spread=bool(row["is_spread"]),
         )
 
     def pages(self, publication_id: str, start: int, end: int) -> list[Page]:
@@ -1026,6 +1058,97 @@ class SQLiteRepository:
                     for number, width, height in dimensions
                 ],
             )
+
+    def reading_progress(
+        self, user_id: str, publication_id: str
+    ) -> ReadingProgress | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM reading_progress
+                WHERE user_id = ? AND publication_id = ?
+                """,
+                (user_id, publication_id),
+            ).fetchone()
+        return self._reading_progress(row) if row else None
+
+    def reading_progress_for_publications(
+        self, user_id: str, publication_ids: list[str]
+    ) -> dict[str, ReadingProgress]:
+        identifiers = list(dict.fromkeys(publication_ids))
+        if not identifiers:
+            return {}
+        placeholders = ", ".join("?" for _ in identifiers)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM reading_progress
+                WHERE user_id = ? AND publication_id IN ({placeholders})
+                """,
+                (user_id, *identifiers),
+            ).fetchall()
+        return {row["publication_id"]: self._reading_progress(row) for row in rows}
+
+    def latest_reading_progress(self, user_id: str) -> ReadingProgress | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM reading_progress
+                WHERE user_id = ?
+                ORDER BY updated_at DESC, publication_id
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+        return self._reading_progress(row) if row else None
+
+    def save_reading_progress(
+        self,
+        user_id: str,
+        publication_id: str,
+        page: int,
+        mode: str,
+        completed: bool,
+    ) -> ReadingProgress:
+        updated_at = _now_iso()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO reading_progress(
+                    user_id, publication_id, page_number, mode, completed, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, publication_id) DO UPDATE SET
+                    page_number=excluded.page_number,
+                    mode=excluded.mode,
+                    completed=excluded.completed,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, publication_id, page, mode, int(completed), updated_at),
+            )
+        saved = self.reading_progress(user_id, publication_id)
+        assert saved is not None
+        return saved
+
+    def delete_reading_progress(self, user_id: str, publication_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM reading_progress
+                WHERE user_id = ? AND publication_id = ?
+                """,
+                (user_id, publication_id),
+            )
+
+    @staticmethod
+    def _reading_progress(row: sqlite3.Row) -> ReadingProgress:
+        return ReadingProgress(
+            user_id=row["user_id"],
+            publication_id=row["publication_id"],
+            page=row["page_number"],
+            mode=row["mode"],
+            completed=bool(row["completed"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
 
     def upsert_publication(self, scanned: ScannedPublication) -> None:
         with self._connect() as connection:
@@ -1130,8 +1253,8 @@ class SQLiteRepository:
             """
             INSERT INTO pages(
                 publication_id, number, member_name, media_type, compressed_size,
-                uncompressed_size, crc, width, height
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                uncompressed_size, crc, width, height, is_spread
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1144,6 +1267,7 @@ class SQLiteRepository:
                     page.crc,
                     page.width,
                     page.height,
+                    int(page.is_spread),
                 )
                 for page in pages
             ],
@@ -1254,6 +1378,20 @@ class SQLiteRepository:
     ) -> CatalogSeries | None:
         items = self.catalog_series(series_id=series_id, scope=scope)
         return items[0] if items else None
+
+    def publications_in_series(
+        self, series_id: str, scope: ReadScope | None = None
+    ) -> list[Publication]:
+        scope_clause, parameters = _scope_predicate(scope)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM publications
+                WHERE series_id = ? AND ({scope_clause})
+                """,
+                (series_id, *parameters),
+            ).fetchall()
+        return [self._publication(row) for row in rows]
 
     @staticmethod
     def _catalog_series(row: sqlite3.Row) -> CatalogSeries:

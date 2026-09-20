@@ -3,13 +3,23 @@ from __future__ import annotations
 import math
 import sqlite3
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 from .auth import AuthenticationError, InvalidUserInput, LastAdministratorError
 from .catalog import InvalidLibrary
@@ -23,10 +33,17 @@ from .metadata import (
     MetadataError,
     matches_state,
 )
+from .reader import reading_direction
 from .units import gibibytes, since, timestamp
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 router = APIRouter(include_in_schema=False)
+
+
+class ReadingProgressUpdate(BaseModel):
+    page: int = Field(ge=1)
+    mode: Literal["single", "double", "scroll"]
+    completed: bool = False
 
 
 templates.env.filters["gib"] = gibibytes
@@ -58,7 +75,7 @@ async def _require_admin(request: Request) -> Session:
     return session
 
 
-def _verify_csrf(request: Request, session: Session, token: str) -> None:
+def _verify_csrf(request: Request, session: Session, token: str | None) -> None:
     if not _container(request).auth.valid_csrf(session, token):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
 
@@ -305,13 +322,15 @@ async def series_detail(request: Request, series_id: str):
     if not item:
         raise HTTPException(status_code=404, detail="Series not found")
     metadata = await run_in_threadpool(container.repository.series_metadata, series_id)
-    publications, _ = await run_in_threadpool(
-        container.repository.publications,
-        library=item.library,
-        category=item.category,
-        series=item.name,
-        limit=10_000,
-        scope=scope,
+    publications = await run_in_threadpool(
+        container.reader.series_publications,
+        item.id,
+        scope,
+    )
+    progress = await run_in_threadpool(
+        container.reader.progress_for_publications,
+        session.user.id,
+        publications,
     )
     return templates.TemplateResponse(
         request,
@@ -324,8 +343,130 @@ async def series_detail(request: Request, series_id: str):
             "details": metadata.effective if metadata else {},
             "display_title": _series_title(item, metadata),
             "publications": publications,
+            "progress": progress,
+            "reading_direction": reading_direction(item.category),
         },
     )
+
+
+async def _reader_context(request: Request, session: Session, publication_id: str):
+    container = _container(request)
+    context = await run_in_threadpool(
+        container.reader.context,
+        publication_id,
+        container.authorization.read_scope(session.user),
+    )
+    if not context:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    return context
+
+
+@router.get("/read/{publication_id}", response_class=HTMLResponse)
+async def reader(
+    request: Request,
+    publication_id: str,
+    page: int | None = Query(default=None, ge=1),
+    mode: Literal["single", "double", "scroll"] | None = None,
+):
+    session = await _require_browser_session(request)
+    container = _container(request)
+    context = await _reader_context(request, session, publication_id)
+    state = await run_in_threadpool(
+        container.reader.reading_state, session.user.id, publication_id
+    )
+    initial_page = min(
+        page or state.page,
+        context.publication.page_count,
+    )
+    initial_mode = mode or state.mode
+    return templates.TemplateResponse(
+        request,
+        "reader.html",
+        {
+            "service_title": container.settings.service_title,
+            "session": session,
+            "context": context,
+            "publication": context.publication,
+            "reading_direction": reading_direction(context.publication.category),
+            "initial_page": initial_page,
+            "initial_mode": initial_mode,
+            "explicit_page": page is not None,
+            "explicit_mode": mode is not None,
+            "completed": state.completed
+            and initial_page == context.publication.page_count,
+            "progress_updated_at": int(state.progress_updated_at.timestamp() * 1000)
+            if state.progress_updated_at
+            else 0,
+            "mode_updated_at": int(state.mode_updated_at.timestamp() * 1000)
+            if state.mode_updated_at
+            else 0,
+        },
+    )
+
+
+@router.put("/reader/progress/{publication_id}")
+async def update_reading_progress(
+    request: Request,
+    publication_id: str,
+    body: ReadingProgressUpdate,
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+):
+    session = await _browser_session(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    context = await _reader_context(request, session, publication_id)
+    try:
+        saved = await run_in_threadpool(
+            container.reader.save_progress,
+            session.user.id,
+            context.publication,
+            body.page,
+            body.mode,
+            body.completed,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {
+        "publicationId": saved.publication_id,
+        "page": saved.page,
+        "mode": saved.mode,
+        "completed": saved.completed,
+        "updatedAt": saved.updated_at.isoformat(),
+    }
+
+
+@router.post("/reader/progress/{publication_id}/read")
+async def mark_publication_read(
+    request: Request, publication_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_browser_session(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    context = await _reader_context(request, session, publication_id)
+    await run_in_threadpool(
+        container.reader.mark_as_read,
+        session.user.id,
+        context.publication,
+    )
+    return RedirectResponse(f"/series/{context.publication.series_id}", status_code=303)
+
+
+@router.post("/reader/progress/{publication_id}/unread")
+async def mark_publication_unread(
+    request: Request, publication_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_browser_session(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    context = await _reader_context(request, session, publication_id)
+    await run_in_threadpool(
+        container.reader.mark_as_unread,
+        session.user.id,
+        context.publication.id,
+    )
+    return RedirectResponse(f"/series/{context.publication.series_id}", status_code=303)
 
 
 @router.get("/admin", response_class=HTMLResponse)

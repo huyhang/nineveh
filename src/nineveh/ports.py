@@ -15,6 +15,7 @@ from .domain import (
     Page,
     Publication,
     PublicationPage,
+    ReadingProgress,
     ReadScope,
     ScannedPublication,
     ScanReport,
@@ -84,6 +85,33 @@ class CatalogRepository(Protocol):
     def catalog_series_by_id(
         self, series_id: str, scope: ReadScope | None = None
     ) -> CatalogSeries | None: ...
+
+    def publications_in_series(
+        self, series_id: str, scope: ReadScope | None = None
+    ) -> list[Publication]: ...
+
+
+class ReadingRepository(Protocol):
+    def reading_progress(
+        self, user_id: str, publication_id: str
+    ) -> ReadingProgress | None: ...
+
+    def reading_progress_for_publications(
+        self, user_id: str, publication_ids: list[str]
+    ) -> dict[str, ReadingProgress]: ...
+
+    def latest_reading_progress(self, user_id: str) -> ReadingProgress | None: ...
+
+    def save_reading_progress(
+        self,
+        user_id: str,
+        publication_id: str,
+        page: int,
+        mode: str,
+        completed: bool,
+    ) -> ReadingProgress: ...
+
+    def delete_reading_progress(self, user_id: str, publication_id: str) -> None: ...
 
 
 class LibraryRepository(Protocol):
@@ -195,6 +223,7 @@ class Repository(
     LibraryRepository,
     AccessRepository,
     MetadataRepository,
+    ReadingRepository,
     Protocol,
 ):
     """The single persistence seam the application composes against."""

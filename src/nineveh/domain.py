@@ -176,6 +176,7 @@ class Page:
     crc: int
     width: int | None = None
     height: int | None = None
+    is_spread: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +210,34 @@ class ScannedPublication:
 class PublicationPage:
     publication: Publication
     page: Page
+
+
+@dataclass(frozen=True, slots=True)
+class ReadingProgress:
+    user_id: str
+    publication_id: str
+    page: int
+    mode: str
+    completed: bool
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ReadingState:
+    page: int
+    mode: str
+    completed: bool
+    progress_updated_at: datetime | None
+    mode_updated_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReaderContext:
+    publication: Publication
+    publications: tuple[Publication, ...]
+    position: int
+    previous: Publication | None
+    next: Publication | None
 
 
 @dataclass(frozen=True, slots=True)

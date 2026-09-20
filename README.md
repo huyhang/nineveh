@@ -12,6 +12,8 @@ The service is designed for a small Docker host such as a Synology NAS. Media re
 - Local users and hierarchical read access managed through an administrator page or JSON API
 - Explicitly managed libraries with per-library scans and indexed-size reporting
 - Series-first browser navigation through libraries and comics/manga categories
+- Responsive browser reader with single-page, double-page, and continuous modes
+- Automatic per-user reading progress and reading-mode synchronization
 - Administrator-reviewed MangaBaka metadata with durable local edits and covers
 - Persisted application settings with a Docker-supervised restart action
 - System, light, paper, and dark display themes with a persistent header toggle
@@ -94,6 +96,8 @@ All catalog and content endpoints require authentication.
 The committed specification is generated with `python scripts/export-openapi.py`. `tests/test_contract.py` compares it against the live route table, so a route added, removed, or renamed without regenerating the file fails the build rather than silently shipping a stale contract.
 
 The page manifest and page-range download are Nineveh extensions, advertised from each OPDS publication under the `urn:nineveh:rel:page-manifest` and `urn:nineveh:rel:page-range` relations. Standard OPDS readers can use the full-CBZ acquisition link and ignore both; clients aware of the extensions can fetch individual pages or save an excerpt. A range may span at most `NINEVEH_PAGE_RANGE_LIMIT` pages and is generated on demand, never cached.
+
+The browser catalog also links every publication to an immersive reader. Its double-page mode keeps the cover separate, preserves stitched spreads declared in `ComicInfo.xml` or detected from image dimensions, and places separate pages right-to-left for manga or left-to-right for comics. On narrow portrait screens, paired pages temporarily adapt to a readable single-page view unless the reader explicitly requests the pair. Progress and mode are saved automatically per account, with a device-local fallback during transient connection failures.
 
 ## Configuration
 

@@ -39,12 +39,88 @@
     <div class="section-heading"><div><p class="eyebrow">On this server</p><h2>Volumes and issues</h2></div></div>
     <div class="card-grid publication-grid">
       {% for item in publications %}
+        {% set saved = progress.get(item.id) %}
         <article class="card publication-card">
           <img src="/api/v1/publications/{{ item.id }}/cover?width=320&amp;revision={{ item.revision }}" alt="Cover for {{ item.title }}" width="320" loading="lazy">
           <div class="card-body">
             <h3>{{ item.title }}</h3>
             <p>{% if item.number %}Volume {{ item.number }} · {% endif %}{{ item.page_count }} pages</p>
-            <a class="button" href="/api/v1/publications/{{ item.id }}/file">Download CBZ</a>
+            <div class="publication-progress{% if saved and saved.completed %} is-complete{% endif %}">
+              <div>
+                {% if saved and saved.completed %}
+                  <span>Completed</span><span>100%</span>
+                {% elif saved %}
+                  <span>Page {{ saved.page }} of {{ item.page_count }}</span><span>{{ (saved.page * 100 / item.page_count)|round|int }}%</span>
+                {% else %}
+                  <span>Not started</span><span>0%</span>
+                {% endif %}
+              </div>
+              <progress
+                value="{% if saved and saved.completed %}{{ item.page_count }}{% elif saved %}{{ saved.page }}{% else %}0{% endif %}"
+                max="{{ item.page_count }}"
+                dir="{{ reading_direction }}"
+                aria-label="{% if saved and saved.completed %}Completed{% elif saved %}Page {{ saved.page }} of {{ item.page_count }}{% else %}Not started{% endif %}"
+              ></progress>
+            </div>
+            <div class="publication-actions" aria-label="Actions for {{ item.title }}">
+              <a
+                class="publication-action{% if not saved or saved.completed %} is-primary{% endif %}"
+                href="/read/{{ item.id }}?page=1"
+                title="Read from start"
+                aria-label="Read {{ item.title }} from start"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14M18 6l-8 6 8 6z"/></svg>
+                <span class="sr-only">Read from start</span>
+              </a>
+              {% if saved and not saved.completed %}
+                <a
+                  class="publication-action is-primary"
+                  href="/read/{{ item.id }}"
+                  title="Resume at page {{ saved.page }}"
+                  aria-label="Resume {{ item.title }} at page {{ saved.page }}"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path class="filled" d="M8 5v14l11-7z"/></svg>
+                  <span class="sr-only">Resume</span>
+                </a>
+              {% endif %}
+              <a
+                class="publication-action"
+                href="/api/v1/publications/{{ item.id }}/file"
+                title="Download CBZ"
+                aria-label="Download {{ item.title }} as CBZ"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"/></svg>
+                <span class="sr-only">Download CBZ</span>
+              </a>
+              {% if not saved or not saved.completed %}
+                <form method="post" action="/reader/progress/{{ item.id }}/read">
+                  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+                  <button
+                    class="publication-action secondary"
+                    type="submit"
+                    title="Mark as read"
+                    aria-label="Mark {{ item.title }} as read"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l4 4L19 6"/></svg>
+                    <span class="sr-only">Mark as read</span>
+                  </button>
+                </form>
+              {% endif %}
+              {% if saved %}
+                <form method="post" action="/reader/progress/{{ item.id }}/unread">
+                  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+                  <button
+                    class="publication-action secondary"
+                    type="submit"
+                    title="Mark as unread"
+                    aria-label="Mark {{ item.title }} as unread"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10V4m0 0h6M5.5 15a7.5 7.5 0 1 0 .7-7.2"/></svg>
+                    <span class="sr-only">Mark as unread</span>
+                  </button>
+                </form>
+              {% endif %}
+            </div>
           </div>
         </article>
       {% endfor %}

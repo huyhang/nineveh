@@ -42,6 +42,24 @@ def test_scans_expected_hierarchy_and_metadata(library):
     ]
 
 
+def test_comicinfo_double_pages_are_retained(library):
+    settings, archive = library
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("1.png", image_bytes((1, 2, 3)))
+        handle.writestr("2.png", image_bytes((2, 3, 4), size=(120, 60)))
+        handle.writestr(
+            "ComicInfo.xml",
+            '<ComicInfo><Pages><Page Image="0" Type="FrontCover" />'
+            '<Page Image="1" DoublePage="true" /></Pages></ComicInfo>',
+        )
+
+    scanned = ArchiveInspector(settings).inspect(
+        archive, "Main Library/comics/Example Series/Issue 1.cbz", "pub-1"
+    )
+
+    assert [page.is_spread for page in scanned.pages] == [False, True]
+
+
 def test_a_second_scan_reports_everything_unchanged(library):
     settings, _ = library
     scanner, _ = _scanner(settings)

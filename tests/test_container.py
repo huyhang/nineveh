@@ -29,6 +29,7 @@ from nineveh.config import Settings, SettingsService
 from nineveh.database import SQLiteRepository
 from nineveh.domain import ScannedPublication
 from nineveh.opds import OpdsBuilder
+from nineveh.reader import ReaderService
 
 
 @pytest.fixture
@@ -57,6 +58,7 @@ def fake_container(tmp_path: Path) -> Container:
         libraries=LibraryService(settings.data_dir, repository),
         configuration=SettingsService(settings, repository),
         restarter=FakeRestartController(enabled=False),
+        reader=ReaderService(repository, repository),
     )
 
 

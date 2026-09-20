@@ -91,6 +91,180 @@ def test_the_catalog_filters_and_paginates(client: TestClient):
     assert "No publications found" in empty.text
 
 
+def test_a_publication_opens_in_the_browser_reader(
+    client: TestClient, publication_id: str
+):
+    _login(client)
+
+    page = client.get(f"/read/{publication_id}")
+
+    assert page.status_code == 200
+    assert "The First Issue" in page.text
+    assert 'data-reading-direction="ltr"' in page.text
+    assert 'data-page-slider type="range"' in page.text
+    assert 'dir="ltr"' in page.text
+    assert 'data-mode="single"' in page.text
+    assert 'data-mode="double"' in page.text
+    assert 'data-mode="scroll"' in page.text
+    assert "/static/reader.js" in page.text
+    assert "/static/reader.css" in page.text
+    series_url = next(
+        link
+        for link in re.findall(r'href="([^"]+)"', page.text)
+        if link.startswith("/series/")
+    )
+    assert f"/read/{publication_id}" in client.get(series_url).text
+
+
+def test_reader_progress_is_csrf_protected_and_restored(
+    client: TestClient, publication_id: str
+):
+    _login(client)
+    reader = client.get(f"/read/{publication_id}")
+    token = re.search(r'data-csrf-token="([^"]+)"', reader.text).group(1)
+
+    forged = client.put(
+        f"/reader/progress/{publication_id}",
+        headers={"X-CSRF-Token": "forged"},
+        json={"page": 2, "mode": "scroll", "completed": False},
+    )
+    assert forged.status_code == 403
+
+    saved = client.put(
+        f"/reader/progress/{publication_id}",
+        headers={"X-CSRF-Token": token},
+        json={"page": 3, "mode": "scroll", "completed": True},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["page"] == 3
+    assert saved.json()["mode"] == "scroll"
+
+    restored = client.get(f"/read/{publication_id}")
+    assert 'data-initial-page="3"' in restored.text
+    assert 'data-initial-mode="scroll"' in restored.text
+    assert 'data-completed="true"' in restored.text
+
+    linked = client.get(f"/read/{publication_id}?page=3&mode=double")
+    assert 'data-initial-page="3"' in linked.text
+    assert 'data-initial-mode="double"' in linked.text
+    assert 'data-explicit-page="true"' in linked.text
+
+
+def test_volume_cards_show_reader_actions_and_per_user_progress(
+    client: TestClient, publication_id: str
+):
+    _login(client)
+    reader = client.get(f"/read/{publication_id}")
+    token = re.search(r'data-csrf-token="([^"]+)"', reader.text).group(1)
+    series_url = next(
+        link
+        for link in re.findall(r'href="([^"]+)"', reader.text)
+        if link.startswith("/series/")
+    )
+
+    not_started = client.get(series_url)
+    assert "Not started" in not_started.text
+    assert 'aria-label="Read The First Issue from start"' in not_started.text
+    assert 'aria-label="Download The First Issue as CBZ"' in not_started.text
+    assert 'aria-label="Mark The First Issue as read"' in not_started.text
+    assert 'aria-label="Mark The First Issue as unread"' not in not_started.text
+    assert 'dir="ltr"' in not_started.text
+
+    forged = client.post(
+        f"/reader/progress/{publication_id}/read",
+        data={"csrf_token": "forged"},
+    )
+    assert forged.status_code == 403
+
+    client.put(
+        f"/reader/progress/{publication_id}",
+        headers={"X-CSRF-Token": token},
+        json={"page": 2, "mode": "single", "completed": False},
+    )
+    in_progress = client.get(series_url)
+    assert "Page 2 of 3" in in_progress.text
+    assert "67%" in in_progress.text
+    assert 'aria-label="Resume The First Issue at page 2"' in in_progress.text
+    assert 'aria-label="Mark The First Issue as read"' in in_progress.text
+    assert 'aria-label="Mark The First Issue as unread"' in in_progress.text
+
+    marked_read = client.post(
+        f"/reader/progress/{publication_id}/read",
+        data={"csrf_token": token},
+        follow_redirects=False,
+    )
+    assert marked_read.status_code == 303
+    assert marked_read.headers["location"] == series_url
+    completed = client.get(series_url)
+    assert "Completed" in completed.text
+    assert 'aria-label="Resume The First Issue' not in completed.text
+    assert 'aria-label="Mark The First Issue as read"' not in completed.text
+    assert 'aria-label="Mark The First Issue as unread"' in completed.text
+
+    restarted = client.get(f"/read/{publication_id}?page=1")
+    assert 'data-initial-page="1"' in restarted.text
+    assert 'data-completed="false"' in restarted.text
+
+    marked_unread = client.post(
+        f"/reader/progress/{publication_id}/unread",
+        data={"csrf_token": token},
+        follow_redirects=False,
+    )
+    assert marked_unread.status_code == 303
+    assert marked_unread.headers["location"] == series_url
+    unread = client.get(series_url)
+    assert "Not started" in unread.text
+    assert 'aria-label="Mark The First Issue as unread"' not in unread.text
+
+
+def test_reader_respects_catalog_access(
+    client: TestClient, publication_id: str, reader: dict
+):
+    _login(client, "reader", READER_PASSWORD)
+
+    assert client.get(f"/read/{publication_id}").status_code == 404
+
+
+def test_reader_rejects_missing_sessions_and_impossible_progress(
+    client: TestClient, publication_id: str
+):
+    assert (
+        client.get(f"/read/{publication_id}", follow_redirects=False).status_code == 303
+    )
+    assert (
+        client.put(
+            f"/reader/progress/{publication_id}",
+            json={"page": 1, "mode": "single"},
+        ).status_code
+        == 401
+    )
+
+    _login(client)
+    page = client.get(f"/read/{publication_id}")
+    token = re.search(r'data-csrf-token="([^"]+)"', page.text).group(1)
+    response = client.put(
+        f"/reader/progress/{publication_id}",
+        headers={"X-CSRF-Token": token},
+        json={"page": 99, "mode": "single"},
+    )
+    assert response.status_code == 422
+
+
+def test_reader_assets_include_spread_and_responsive_behaviour(client: TestClient):
+    script = client.get("/static/reader-model.js").text
+    stylesheet = client.get("/static/reader.css").text
+
+    assert "page.width / page.height >= 1.25" in script
+    assert "The cover always stands alone" in script
+    assert "direction: ltr" in stylesheet
+    assert ".reader-shell.direction-rtl .reader-spread.is-pair" in stylesheet
+    assert ".reader-shell.direction-rtl .reader-progress input" in stylesheet
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in stylesheet
+    reader_script = client.get("/static/reader.js").text
+    assert "orientation: portrait" in reader_script
+    assert "navigationDelta" in reader_script
+
+
 def test_signing_out_clears_the_session(client: TestClient):
     _login(client)
     token = _csrf(client, "/")

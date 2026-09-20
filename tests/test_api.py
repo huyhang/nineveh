@@ -110,6 +110,7 @@ def test_page_manifest_reports_ordered_pages_with_dimensions(
     assert manifest["end"] == 2
     assert manifest["totalPages"] == 3
     assert [(p["width"], p["height"]) for p in manifest["pages"]] == [(40, 60)] * 2
+    assert [p["spread"] for p in manifest["pages"]] == [False, False]
     assert manifest["next"].endswith("start=3&end=3")
 
 

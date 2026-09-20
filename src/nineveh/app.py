@@ -42,6 +42,7 @@ from .ports import (
     Repository,
     RestartController,
 )
+from .reader import ReaderService
 from .restart import DisabledRestartController, ProcessRestartController
 
 LOGGER = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ class Container:
     libraries: LibraryService
     configuration: SettingsService
     restarter: RestartController
+    reader: ReaderService
     metadata: MetadataService | None = None
 
 
@@ -99,6 +101,7 @@ def build_container(settings: Settings) -> Container:
         restarter=ProcessRestartController()
         if effective.restart_enabled
         else DisabledRestartController(),
+        reader=ReaderService(repository, repository),
         metadata=MetadataService(
             repository,
             MangaBakaProvider(UrllibTransport(), limiter),

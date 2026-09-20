@@ -124,7 +124,10 @@ class ArchiveInspector:
         publication = self._publication(
             path, relative_path, publication_id, after, revision, image_infos, metadata
         )
-        return ScannedPublication(publication, self._pages(image_infos))
+        spread_pages = metadata.get("spread_pages", set())
+        if not isinstance(spread_pages, set):
+            spread_pages = set()
+        return ScannedPublication(publication, self._pages(image_infos, spread_pages))
 
     def _ordered_images(self, infos: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
         image_infos = [
@@ -171,7 +174,9 @@ class ArchiveInspector:
             cover_page=cover_page,
         )
 
-    def _pages(self, image_infos: list[zipfile.ZipInfo]) -> tuple[Page, ...]:
+    def _pages(
+        self, image_infos: list[zipfile.ZipInfo], spread_pages: set[int]
+    ) -> tuple[Page, ...]:
         return tuple(
             Page(
                 number=index,
@@ -181,6 +186,7 @@ class ArchiveInspector:
                 compressed_size=info.compress_size,
                 uncompressed_size=info.file_size,
                 crc=info.CRC,
+                is_spread=index in spread_pages,
             )
             for index, info in enumerate(image_infos, start=1)
         )
@@ -240,19 +246,32 @@ class ArchiveInspector:
             if value and value not in authors:
                 authors.append(value)
         cover_page = 1
+        cover_found = False
+        spread_pages: set[int] = set()
         for page in root.findall("./Pages/Page"):
-            if "frontcover" in page.attrib.get("Type", "").casefold():
-                try:
-                    cover_page = int(page.attrib["Image"]) + 1
-                except (KeyError, ValueError):
-                    pass
-                break
+            try:
+                number = int(page.attrib["Image"]) + 1
+            except (KeyError, ValueError):
+                continue
+            if (
+                not cover_found
+                and "frontcover" in page.attrib.get("Type", "").casefold()
+            ):
+                cover_page = number
+                cover_found = True
+            if page.attrib.get("DoublePage", "").casefold() in {
+                "1",
+                "true",
+                "yes",
+            }:
+                spread_pages.add(number)
         return {
             "title": text("Title"),
             "number": text("Number"),
             "description": text("Summary"),
             "authors": authors,
             "cover_page": cover_page,
+            "spread_pages": spread_pages,
         }
 
     @staticmethod

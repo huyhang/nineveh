@@ -471,6 +471,7 @@ def _manifest_body(
                 "length": item.uncompressed_size,
                 "width": item.width,
                 "height": item.height,
+                "spread": item.is_spread,
             }
             for item in pages
         ],

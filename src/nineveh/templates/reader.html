@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en" class="reader-document">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#111111">
+    <title>{{ publication.title }} · {{ service_title }}</title>
+    <link rel="icon" href="{{ url_for('static', path='icon.svg') }}" type="image/svg+xml">
+    <script src="{{ url_for('static', path='theme.js') }}"></script>
+    <link rel="stylesheet" href="{{ url_for('static', path='reader.css') }}">
+  </head>
+  <body class="reader-body">
+    <main
+      class="reader-shell direction-{{ reading_direction }}"
+      data-reader
+      data-reading-direction="{{ reading_direction }}"
+      data-publication-id="{{ publication.id }}"
+      data-user-id="{{ session.user.id }}"
+      data-revision="{{ publication.revision }}"
+      data-page-count="{{ publication.page_count }}"
+      data-initial-page="{{ initial_page }}"
+      data-initial-mode="{{ initial_mode }}"
+      data-explicit-page="{{ 'true' if explicit_page else 'false' }}"
+      data-explicit-mode="{{ 'true' if explicit_mode else 'false' }}"
+      data-completed="{{ 'true' if completed else 'false' }}"
+      data-progress-updated-at="{{ progress_updated_at }}"
+      data-mode-updated-at="{{ mode_updated_at }}"
+      data-csrf-token="{{ session.csrf_token }}"
+      data-series-url="/series/{{ publication.series_id }}"
+    >
+      <header class="reader-toolbar" data-reader-toolbar>
+        <a class="reader-back" href="/series/{{ publication.series_id }}" aria-label="Back to {{ publication.series }}">← <span>Series</span></a>
+        <div class="reader-title">
+          <strong>{{ publication.title }}</strong>
+          <span>{{ publication.series }}</span>
+        </div>
+        <label class="reader-publication-picker">
+          <span class="sr-only">Publication</span>
+          <select data-publication-picker aria-label="Choose another publication">
+            {% for item in context.publications %}
+              <option value="/read/{{ item.id }}" {% if item.id == publication.id %}selected{% endif %}>
+                {% if item.number %}{{ item.number }} · {% endif %}{{ item.title }}
+              </option>
+            {% endfor %}
+          </select>
+        </label>
+        <nav class="reader-volume-nav" aria-label="Publications in this series">
+          {% if context.previous %}<a href="/read/{{ context.previous.id }}" aria-label="Previous publication: {{ context.previous.title }}">←</a>{% else %}<span aria-hidden="true">←</span>{% endif %}
+          <span>{{ context.position + 1 }} / {{ context.publications|length }}</span>
+          {% if context.next %}<a href="/read/{{ context.next.id }}" aria-label="Next publication: {{ context.next.title }}">→</a>{% else %}<span aria-hidden="true">→</span>{% endif %}
+        </nav>
+        <div class="reader-modes" role="group" aria-label="Reading mode">
+          <button type="button" data-mode="single" aria-pressed="false">Single</button>
+          <button type="button" data-mode="double" aria-pressed="false">Double</button>
+          <button type="button" data-mode="scroll" aria-pressed="false">Continuous</button>
+        </div>
+        <button class="reader-fullscreen" type="button" data-fullscreen aria-label="Toggle fullscreen" title="Toggle fullscreen">⛶</button>
+      </header>
+
+      <p class="reader-adaptive-note" data-adaptive-note hidden>
+        <span data-adaptive-message>Showing one page for readability. Rotate your device to restore the pair.</span>
+        <button type="button" data-force-pair>Show pair anyway</button>
+      </p>
+
+      <section class="reader-stage" data-reader-stage aria-label="Comic pages">
+        <noscript><p class="reader-noscript">The browser reader requires JavaScript. <a href="/api/v1/publications/{{ publication.id }}/file">Download the CBZ instead.</a></p></noscript>
+        <button class="reader-page-nav previous" type="button" data-previous aria-label="Previous page">‹</button>
+        <div class="reader-pages" data-reader-pages></div>
+        <button class="reader-page-nav next" type="button" data-next aria-label="Next page">›</button>
+        <div class="reader-loading" data-reader-loading role="status">Loading pages…</div>
+        <div class="reader-error" data-reader-error role="alert" hidden>
+          <strong>That page could not be loaded.</strong>
+          <span data-reader-error-message>Please try again.</span>
+          <button type="button" data-reader-retry>Retry</button>
+        </div>
+
+        <section class="reader-end-card" data-end-card hidden tabindex="-1">
+          <p class="reader-kicker">Finished</p>
+          <h1>{{ publication.title }}</h1>
+          <p data-saved-message>Saving your progress…</p>
+          {% if context.next %}
+            <a class="reader-next-card" href="/read/{{ context.next.id }}">
+              <img src="/api/v1/publications/{{ context.next.id }}/cover?width=160&amp;revision={{ context.next.revision }}" alt="" width="80" loading="lazy">
+              <span><small>Up next</small><strong>{{ context.next.title }}</strong><span>{{ context.next.page_count }} pages</span></span>
+            </a>
+            <a class="reader-primary-action" href="/read/{{ context.next.id }}">Read next</a>
+          {% else %}
+            <p class="reader-caught-up">You’re caught up with this series.</p>
+          {% endif %}
+          <div class="reader-end-actions">
+            <a href="/series/{{ publication.series_id }}">Back to series</a>
+            <button type="button" data-read-again>Read again</button>
+          </div>
+        </section>
+      </section>
+
+      <footer class="reader-progress" data-reader-progress>
+        <label for="reader-page-slider">Page <output data-page-output>{{ initial_page }} / {{ publication.page_count }}</output></label>
+        <input id="reader-page-slider" data-page-slider type="range" min="1" max="{{ publication.page_count }}" value="{{ initial_page }}" step="1" dir="{{ reading_direction }}">
+        <span class="reader-sync" data-sync-status role="status" aria-live="polite">Saved</span>
+      </footer>
+    </main>
+    <script type="module" src="{{ url_for('static', path='reader.js') }}"></script>
+  </body>
+</html>
