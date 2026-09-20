@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import replace
+from pathlib import Path
 
 from conftest import ADMIN_PASSWORD, READER_PASSWORD, authorization
 from fakes import publication
@@ -127,14 +128,14 @@ def test_reader_progress_is_csrf_protected_and_restored(
     token = re.search(r'data-csrf-token="([^"]+)"', reader.text).group(1)
 
     forged = client.put(
-        f"/reader/progress/{publication_id}",
+        f"/api/v1/publications/{publication_id}/progress",
         headers={"X-CSRF-Token": "forged"},
         json={"page": 2, "mode": "scroll", "completed": False},
     )
     assert forged.status_code == 403
 
     saved = client.put(
-        f"/reader/progress/{publication_id}",
+        f"/api/v1/publications/{publication_id}/progress",
         headers={"X-CSRF-Token": token},
         json={"page": 3, "mode": "scroll", "completed": True},
     )
@@ -180,7 +181,7 @@ def test_volume_cards_show_reader_actions_and_per_user_progress(
     assert forged.status_code == 403
 
     client.put(
-        f"/reader/progress/{publication_id}",
+        f"/api/v1/publications/{publication_id}/progress",
         headers={"X-CSRF-Token": token},
         json={"page": 2, "mode": "single", "completed": False},
     )
@@ -236,7 +237,7 @@ def test_reader_rejects_missing_sessions_and_impossible_progress(
     )
     assert (
         client.put(
-            f"/reader/progress/{publication_id}",
+            f"/api/v1/publications/{publication_id}/progress",
             json={"page": 1, "mode": "single"},
         ).status_code
         == 401
@@ -246,13 +247,13 @@ def test_reader_rejects_missing_sessions_and_impossible_progress(
     page = client.get(f"/read/{publication_id}")
     token = re.search(r'data-csrf-token="([^"]+)"', page.text).group(1)
     response = client.put(
-        f"/reader/progress/{publication_id}",
+        f"/api/v1/publications/{publication_id}/progress",
         headers={"X-CSRF-Token": token},
         json={"page": 99, "mode": "single"},
     )
     assert response.status_code == 422
     unknown = client.put(
-        "/reader/progress/does-not-exist",
+        "/api/v1/publications/does-not-exist/progress",
         headers={"X-CSRF-Token": token},
         json={"page": 1, "mode": "single"},
     )
@@ -304,6 +305,39 @@ def test_reader_styles_honour_the_reading_direction(client: TestClient):
         ".reader-shell.direction-rtl .reader-page-nav.next",
     ):
         assert rule in stylesheet, rule
+
+
+def test_the_overview_reports_what_the_last_scan_found(client: TestClient):
+    """A finished scan should say what it did, not just when it happened."""
+    _login(client)
+
+    overview = client.get("/admin").text
+
+    assert "data-scan-status" in overview
+    assert "Last scan completed" in overview
+    assert re.search(r"\d+ found · \d+ indexed · \d+ unchanged", overview)
+
+
+def test_every_scan_locked_control_carries_the_hook_that_releases_it():
+    """The poller frees each control the server locks while a scan runs.
+
+    A control gated on `scan_status.running` without the hook would stay
+    disabled until the administrator reloaded the page by hand — the bug this
+    replaced. Asserted against the templates because the locked state only
+    renders mid-scan.
+    """
+    templates = Path(__file__).resolve().parent.parent / "src/nineveh/templates"
+    gate = "{% if scan_status.running %}disabled{% endif %}"
+
+    gated = [
+        (source.name, tag)
+        for source in templates.glob("admin*.html")
+        for tag in re.findall(r"<button[^>]*>", source.read_text(encoding="utf-8"))
+        if gate in tag
+    ]
+
+    assert gated, "no scan-locked controls found — has the gate been renamed?"
+    assert [where for where, tag in gated if "data-scan-lock" not in tag] == []
 
 
 def test_signing_out_clears_the_session(client: TestClient):

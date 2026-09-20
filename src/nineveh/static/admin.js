@@ -89,3 +89,68 @@ for (const fieldset of document.querySelectorAll(".permission-library")) {
 if (document.querySelector("[data-metadata-progress]")) {
   window.setTimeout(() => window.location.reload(), 2000);
 }
+
+// A catalog scan runs in the background, so the page that started it is stale
+// the moment the scan ends. Poll the readiness endpoint instead of reloading:
+// an administrator may be part-way through a form on this page, and a scan of
+// a large library can run for minutes.
+const SCAN_POLL_MS = 5000;
+const SCAN_POLL_FAILURES = 3;
+
+function scanLocks() {
+  return [...document.querySelectorAll("[data-scan-lock]")];
+}
+
+function applyScanLocks(running) {
+  for (const control of scanLocks()) {
+    control.disabled = running;
+    const label = running
+      ? control.dataset.scanBusyLabel
+      : control.dataset.scanLabel;
+    if (label) control.textContent = label;
+  }
+}
+
+async function refreshScanStatus() {
+  // Re-render from the server rather than rebuilding the sentence here: the
+  // relative timestamp and the report already have one authoritative form.
+  const status = document.querySelector("[data-scan-status]");
+  if (!status) return;
+  const response = await fetch(window.location.href, {
+    credentials: "same-origin",
+    headers: { "X-Requested-With": "fetch" },
+  });
+  if (!response.ok) return;
+  const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+  const fresh = parsed.querySelector("[data-scan-status]");
+  if (!fresh) return;
+  status.replaceWith(fresh);
+}
+
+async function pollScan(failures = 0) {
+  let running = true;
+  try {
+    const response = await fetch("/api/v1/health/ready", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`Readiness returned ${response.status}`);
+    running = Boolean((await response.json()).catalog?.running);
+  } catch (_error) {
+    // A blip should not strand the controls disabled forever, but neither
+    // should it clear them while a scan may still be holding the catalog.
+    if (failures + 1 >= SCAN_POLL_FAILURES) return;
+    window.setTimeout(() => pollScan(failures + 1), SCAN_POLL_MS);
+    return;
+  }
+  applyScanLocks(running);
+  if (running) {
+    window.setTimeout(() => pollScan(), SCAN_POLL_MS);
+    return;
+  }
+  await refreshScanStatus();
+}
+
+if (document.querySelector("[data-scan-lock][disabled]")) {
+  window.setTimeout(() => pollScan(), SCAN_POLL_MS);
+}

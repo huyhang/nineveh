@@ -5,7 +5,7 @@
       <div><p class="eyebrow">At a glance</p><h2>Overview</h2></div>
       <form method="post" action="/admin/scan">
         <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-        <button type="submit" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan all libraries" }}</button>
+        <button type="submit" data-scan-lock data-scan-label="Scan all libraries" data-scan-busy-label="Scanning…" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan all libraries" }}</button>
       </form>
     </div>
     <div class="metric-grid">
@@ -21,12 +21,14 @@
         Set <code>NINEVEH_FORWARDED_ALLOW_IPS={{ untrusted_proxy }}</code> in <code>docker/.env</code> and recreate the container.
       </div>
     {% endif %}
-    <div class="status-line {% if scan_status.error %}status-error{% endif %}">
+    <div class="status-line {% if scan_status.error %}status-error{% endif %}" data-scan-status{% if scan_status.running %} data-scan-running{% endif %}>
       <span class="status-dot"></span>
-      {% if scan_status.running %}Scan in progress.
-      {% elif scan_status.error %}Last scan failed: {{ scan_status.error }}
-      {% elif scan_status.completed_at %}Last scan completed <time datetime="{{ scan_status.completed_at }}" title="{{ scan_status.completed_at|timestamp }}">{{ scan_status.completed_at|since }}</time>.
-      {% else %}No scan has completed yet.{% endif %}
+      {# One element for the whole sentence: the row is a flex container, so
+         loose text nodes become separate items and the gap lands mid-sentence. #}
+      <span>{% if scan_status.running %}Scan in progress.
+      {%- elif scan_status.error %}Last scan failed: {{ scan_status.error }}
+      {%- elif scan_status.completed_at %}Last scan completed <time datetime="{{ scan_status.completed_at }}" title="{{ scan_status.completed_at|timestamp }}">{{ scan_status.completed_at|since }}</time>.{% if scan_status.report %}<span class="scan-report">{{ scan_status.report.discovered }} found · {{ scan_status.report.indexed }} indexed · {{ scan_status.report.unchanged }} unchanged{% if scan_status.report.removed %} · {{ scan_status.report.removed }} removed{% endif %}{% if scan_status.report.failed %} · <strong>{{ scan_status.report.failed }} failed</strong>{% endif %}</span>{% endif %}
+      {%- else %}No scan has completed yet.{% endif %}</span>
     </div>
   </section>
 

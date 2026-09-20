@@ -3,7 +3,7 @@ from __future__ import annotations
 import zipfile
 from io import BytesIO
 
-from conftest import authorization
+from conftest import ADMIN_PASSWORD, authorization
 from fastapi.testclient import TestClient
 
 
@@ -230,6 +230,93 @@ def test_a_changed_archive_conflicts_instead_of_disappearing(
         ).status_code
         == 409
     )
+
+
+def _progress_url(publication_id: str) -> str:
+    return f"/api/v1/publications/{publication_id}/progress"
+
+
+def test_reading_progress_round_trips_for_an_api_client(
+    client: TestClient, publication_id: str
+):
+    """Basic auth carries no session, so no CSRF token is involved."""
+    url = _progress_url(publication_id)
+    assert client.get(url, headers=authorization()).status_code == 404
+
+    saved = client.put(
+        url,
+        headers=authorization(),
+        json={"page": 2, "mode": "double", "completed": False},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["publicationId"] == publication_id
+    assert (saved.json()["page"], saved.json()["mode"]) == (2, "double")
+
+    fetched = client.get(url, headers=authorization())
+    assert fetched.status_code == 200
+    assert fetched.json() == saved.json()
+
+    assert client.delete(url, headers=authorization()).status_code == 204
+    assert client.get(url, headers=authorization()).status_code == 404
+
+
+def test_reading_progress_validates_the_position(
+    client: TestClient, publication_id: str
+):
+    url = _progress_url(publication_id)
+    beyond = client.put(
+        url, headers=authorization(), json={"page": 99, "mode": "single"}
+    )
+    assert beyond.status_code == 422
+    assert "outside" in beyond.json()["detail"]
+
+    early = client.put(
+        url,
+        headers=authorization(),
+        json={"page": 1, "mode": "single", "completed": True},
+    )
+    assert early.status_code == 422
+
+    for body in ({"page": 0, "mode": "single"}, {"page": 1, "mode": "sideways"}):
+        assert client.put(url, headers=authorization(), json=body).status_code == 422
+
+
+def test_reading_progress_is_private_and_scoped(
+    client: TestClient, reader: dict, publication_id: str
+):
+    url = _progress_url(publication_id)
+    client.put(
+        url, headers=authorization(), json={"page": 2, "mode": "single"}
+    ).raise_for_status()
+
+    assert client.get(url, headers=reader).status_code == 404
+    assert (
+        client.put(url, headers=reader, json={"page": 1, "mode": "single"}).status_code
+        == 404
+    )
+    assert client.delete(url, headers=reader).status_code == 404
+    assert client.get(url, headers=authorization()).json()["page"] == 2
+
+
+def test_reading_progress_from_a_browser_session_needs_a_csrf_token(
+    client: TestClient, publication_id: str
+):
+    url = _progress_url(publication_id)
+    client.post(
+        "/login",
+        data={"username": "admin", "password": ADMIN_PASSWORD},
+        follow_redirects=False,
+    )
+
+    assert client.put(url, json={"page": 1, "mode": "single"}).status_code == 403
+    assert client.delete(url).status_code == 403
+
+    token = client.get("/").text.split('name="csrf_token" value="')[1].split('"')[0]
+    headers = {"X-CSRF-Token": token}
+    saved = client.put(url, headers=headers, json={"page": 1, "mode": "scroll"})
+    assert saved.status_code == 200
+    assert saved.json()["mode"] == "scroll"
+    assert client.delete(url, headers=headers).status_code == 204
 
 
 def test_covers_are_rendered_at_the_allowed_widths(

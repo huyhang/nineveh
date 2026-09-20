@@ -85,6 +85,7 @@ All catalog and content endpoints require authentication.
 | `/api/v1/publications/{id}/pages?start=1&end=20` | Ordered page-range manifest |
 | `/api/v1/publications/{id}/pages/{number}` | Original page image |
 | `/api/v1/publications/{id}/range?start=1&end=20` | That page range as a standalone CBZ |
+| `/api/v1/publications/{id}/progress` | Per-reader position and mode (`PUT` to save, `DELETE` to clear) |
 | `/api/v1/admin/libraries` | Managed libraries, indexed capacity, and available `/data` directories |
 | `/api/v1/admin/users/{id}/access` | Library, content-type, and series read grants |
 | `/api/v1/admin/settings`, `/api/v1/admin/restart` | Persisted application settings and restart control |
@@ -98,6 +99,8 @@ The committed specification is generated with `python scripts/export-openapi.py`
 The page manifest and page-range download are Nineveh extensions, advertised from each OPDS publication under the `urn:nineveh:rel:page-manifest` and `urn:nineveh:rel:page-range` relations. Standard OPDS readers can use the full-CBZ acquisition link and ignore both; clients aware of the extensions can fetch individual pages or save an excerpt. A range may span at most `NINEVEH_PAGE_RANGE_LIMIT` pages and is generated on demand, never cached.
 
 The browser catalog also links every publication to an immersive reader. Its double-page mode keeps the cover separate, preserves stitched spreads declared in `ComicInfo.xml` or detected from image dimensions, and places separate pages right-to-left for manga or left-to-right for comics. Everything that moves along that axis follows it: the arrow keys, swipes, the page-turn controls at the edges of the page, and the progress slider. A reader whose library disagrees with the category can override the direction from the toolbar, and that choice is remembered in their browser. On narrow portrait screens, paired pages temporarily adapt to a readable single-page view unless the reader explicitly requests the pair. Progress and mode are saved automatically per account, with a device-local fallback during transient connection failures.
+
+Reading position is API state rather than a private detail of the browser reader: `/api/v1/publications/{id}/progress` reads, writes, and clears it under the same authentication and read grants as the rest of the catalog, so a third-party client can resume where the browser left off. Only the final page may be marked completed, which keeps "finished" meaning the same thing whoever wrote it. The two buttons on a volume card stay ordinary form posts on the browser surface, so marking something read still works without JavaScript.
 
 ## Configuration
 

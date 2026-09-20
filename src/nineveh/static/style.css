@@ -190,6 +190,8 @@ time[title] { cursor: help; text-decoration: underline dotted color-mix(in srgb,
 .status-line { display: flex; gap: .65rem; align-items: center; margin-top: 1rem; color: var(--muted); }
 .status-dot { width: .55rem; height: .55rem; border-radius: 99px; background: var(--success); box-shadow: 0 0 0 4px color-mix(in srgb, var(--success) 14%, transparent); }
 .status-error .status-dot { background: var(--danger); }
+.status-line { flex-wrap: wrap; }
+.scan-report { margin-left: .5rem; color: var(--muted); font-size: .84rem; font-variant-numeric: tabular-nums; }
 .library-list, .user-list { display: grid; gap: .75rem; }
 .library-card, .user-card { border: 1px solid var(--line); border-radius: 12px; background: var(--raised); overflow: hidden; }
 .library-card > summary, .user-card > details > summary { cursor: pointer; list-style: none; }

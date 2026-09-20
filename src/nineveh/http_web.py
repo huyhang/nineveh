@@ -10,7 +10,6 @@ from fastapi import (
     APIRouter,
     File,
     Form,
-    Header,
     HTTPException,
     Query,
     Request,
@@ -19,7 +18,6 @@ from fastapi import (
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
 
 from .auth import AuthenticationError, InvalidUserInput, LastAdministratorError
 from .catalog import InvalidLibrary
@@ -38,12 +36,6 @@ from .units import gibibytes, since, timestamp
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 router = APIRouter(include_in_schema=False)
-
-
-class ReadingProgressUpdate(BaseModel):
-    page: int = Field(ge=1)
-    mode: Literal["single", "double", "scroll"]
-    completed: bool = False
 
 
 templates.env.filters["gib"] = gibibytes
@@ -427,39 +419,10 @@ async def reader(
     )
 
 
-@router.put("/reader/progress/{publication_id}")
-async def update_reading_progress(
-    request: Request,
-    publication_id: str,
-    body: ReadingProgressUpdate,
-    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
-):
-    session = await _browser_session(request)
-    if not session:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    _verify_csrf(request, session, csrf_token)
-    container = _container(request)
-    publication = await _reader_publication(request, session, publication_id)
-    try:
-        saved = await run_in_threadpool(
-            container.reader.save_progress,
-            session.user.id,
-            publication,
-            body.page,
-            body.mode,
-            body.completed,
-        )
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    return {
-        "publicationId": saved.publication_id,
-        "page": saved.page,
-        "mode": saved.mode,
-        "completed": saved.completed,
-        "updatedAt": saved.updated_at.isoformat(),
-    }
-
-
+# Saving a position is `PUT /api/v1/publications/{id}/progress`, on the
+# documented API so any client can sync, not just this one. The two actions
+# below stay here because they are HTML form posts that redirect: keeping them
+# server-side is what lets the series page work without JavaScript.
 @router.post("/reader/progress/{publication_id}/read")
 async def mark_publication_read(
     request: Request, publication_id: str, csrf_token: str = Form(...)

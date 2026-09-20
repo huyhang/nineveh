@@ -7,7 +7,7 @@
         <form method="post" action="/admin/libraries" class="inline-form add-library-form">
           <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
           <label><span class="sr-only">Available directory</span><select name="relative_path" required><option value="">Choose a directory…</option>{% for name in available_libraries %}<option value="{{ name }}">{{ name }}</option>{% endfor %}</select></label>
-          <button type="submit" {% if scan_status.running %}disabled{% endif %}>Add library</button>
+          <button type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Add library</button>
         </form>
       {% else %}
         <p class="muted add-library-hint">Every directory under the media root is already managed. Create another folder there to add one.</p>
@@ -28,8 +28,8 @@
                 {% endfor %}
               {% else %}<p class="muted">No indexed publications yet.</p>{% endif %}
               <div class="card-actions">
-                <form method="post" action="/admin/libraries/{{ usage.library.id }}/scan"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit" {% if scan_status.running %}disabled{% endif %}>Scan library</button></form>
-                <form method="post" action="/admin/libraries/{{ usage.library.id }}/remove" data-confirm="Remove {{ usage.library.name }} from Nineveh? Media files will not be deleted."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit" {% if scan_status.running %}disabled{% endif %}>Remove</button></form>
+                <form method="post" action="/admin/libraries/{{ usage.library.id }}/scan"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit" data-scan-lock data-scan-label="Scan library" data-scan-busy-label="Scanning…" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan library" }}</button></form>
+                <form method="post" action="/admin/libraries/{{ usage.library.id }}/remove" data-confirm="Remove {{ usage.library.name }} from Nineveh? Media files will not be deleted."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Remove</button></form>
               </div>
             </div>
           </details>

@@ -31,6 +31,7 @@ from .domain import (
     ManagedLibrary,
     Page,
     Publication,
+    ReadingProgress,
     Session,
     User,
 )
@@ -95,6 +96,12 @@ class MetadataEditInput(BaseModel):
 
 class MetadataBatchInput(BaseModel):
     series_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class ProgressUpdate(BaseModel):
+    page: int = Field(ge=1)
+    mode: Literal["single", "double", "scroll"]
+    completed: bool = False
 
 
 def _container(request: Request) -> Container:
@@ -662,6 +669,80 @@ async def publication_cover(
             "Cache-Control": "private, max-age=31536000, immutable",
         },
     )
+
+
+@router.get("/api/v1/publications/{publication_id}/progress", tags=["reader"])
+async def reading_progress(
+    request: Request,
+    publication_id: str,
+    identity: Annotated[Identity, Depends(authenticated)],
+) -> dict[str, object]:
+    """Where the authenticated reader left off in this publication."""
+    publication = await _publication_or_404(request, publication_id, identity)
+    progress = await run_in_threadpool(
+        _container(request).repository.reading_progress,
+        identity.user.id,
+        publication.id,
+    )
+    if not progress:
+        raise HTTPException(status_code=404, detail="Nothing has been read yet")
+    return _public_progress(progress)
+
+
+@router.put("/api/v1/publications/{publication_id}/progress", tags=["reader"])
+async def save_reading_progress(
+    request: Request,
+    publication_id: str,
+    body: ProgressUpdate,
+    identity: Annotated[Identity, Depends(authenticated)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    """Record a reading position. Only the final page may complete a volume."""
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    publication = await _publication_or_404(request, publication_id, identity)
+    try:
+        saved = await run_in_threadpool(
+            container.reader.save_progress,
+            identity.user.id,
+            publication,
+            body.page,
+            body.mode,
+            body.completed,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _public_progress(saved)
+
+
+@router.delete(
+    "/api/v1/publications/{publication_id}/progress",
+    status_code=204,
+    tags=["reader"],
+)
+async def clear_reading_progress(
+    request: Request,
+    publication_id: str,
+    identity: Annotated[Identity, Depends(authenticated)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+):
+    """Forget the reading position, returning the publication to unread."""
+    require_api_csrf(request, identity, csrf_token)
+    publication = await _publication_or_404(request, publication_id, identity)
+    await run_in_threadpool(
+        _container(request).reader.mark_as_unread, identity.user.id, publication.id
+    )
+    return Response(status_code=204)
+
+
+def _public_progress(progress: ReadingProgress) -> dict[str, object]:
+    return {
+        "publicationId": progress.publication_id,
+        "page": progress.page,
+        "mode": progress.mode,
+        "completed": progress.completed,
+        "updatedAt": progress.updated_at.isoformat(),
+    }
 
 
 @router.get("/api/v1/auth/me", tags=["authentication"])

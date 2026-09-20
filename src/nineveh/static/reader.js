@@ -628,7 +628,9 @@ class ReaderController {
     let retryable = true;
     try {
       const response = await this.fetch(
-        `/reader/progress/${encodeURIComponent(this.root.dataset.publicationId)}`,
+        `/api/v1/publications/${encodeURIComponent(
+          this.root.dataset.publicationId,
+        )}/progress`,
         {
           method: "PUT",
           credentials: "same-origin",
