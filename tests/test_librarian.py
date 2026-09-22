@@ -1422,3 +1422,33 @@ def test_the_page_offers_both_retention_windows(client: TestClient):
     assert "More than 1 month ago" in page
     assert "More than 1 year ago" in page
     assert "Permission changes are always kept." in page
+
+
+def test_a_clipping_card_still_lets_an_open_picker_escape():
+    """`.user-card` hides overflow to keep its rounded corners, which slices an
+    absolutely positioned dropdown down to an unusable sliver. If that clip is
+    ever present, the escape has to be too.
+
+    Conditional rather than a plain string match: drop the `overflow: hidden`
+    and this stops demanding a workaround for a problem that no longer exists.
+    """
+    from pathlib import Path
+
+    css = (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "nineveh"
+        / "static"
+        / "style.css"
+    ).read_text(encoding="utf-8")
+    clipping = [
+        rule
+        for rule in css.split("}")
+        if ".user-card" in rule.split("{")[0] and "overflow: hidden" in rule
+    ]
+    if not clipping:
+        return
+    assert ".user-card:has(.picker[open])" in css, (
+        ".user-card clips its children but nothing lifts the clip for an open "
+        "picker — the capability dropdown will render as a sliver"
+    )

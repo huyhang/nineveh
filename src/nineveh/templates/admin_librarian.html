@@ -112,16 +112,18 @@
       </nav>
     </div>
     <p class="access-note">Issued and revoked credentials appear here alongside what the agent read and wrote, so a permission change sits next to the first action it allowed. Revoked tokens leave the list above but keep their history here.</p>
-    <form method="post" action="/admin/librarian/activity/clear" class="activity-clear"
-          onsubmit="return confirm('Clear activity older than the selected age? Permission changes are kept.')">
-      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-      <label class="visually-hidden" for="clear-window">Clear activity older than</label>
-      <select id="clear-window" name="window">
-        {% for value, label in purge_options %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
-      </select>
-      <button class="secondary" type="submit">Clear activities</button>
-      <span class="picker-note">Permission changes are always kept.</span>
-    </form>
+    <div class="activity-controls">
+      <form method="post" action="/admin/librarian/activity/clear" class="activity-clear"
+            onsubmit="return confirm('Clear activity older than the selected age? Permission changes are kept.')">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label class="visually-hidden" for="clear-window">Clear activity older than</label>
+        <select id="clear-window" name="window">
+          {% for value, label in purge_options %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+        </select>
+        <button class="secondary" type="submit">Clear activities</button>
+      </form>
+      <p class="activity-clear-note">Permission changes are always kept.</p>
+    </div>
     <ol class="activity-feed">
       {% for event in events %}
         <li class="activity-row severity-{{ event.severity }} outcome-{{ event.outcome }}">
