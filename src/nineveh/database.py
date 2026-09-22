@@ -14,6 +14,7 @@ from .domain import (
     CategoryUsage,
     LibraryUsage,
     ManagedLibrary,
+    MetadataAutoMatchJob,
     MetadataCandidate,
     MetadataLookup,
     Page,
@@ -26,13 +27,19 @@ from .domain import (
     SeriesMetadataState,
     SeriesMetadataSummary,
     SeriesUsage,
+    SpreadAnalysis,
     User,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 # The release that began recording `ComicInfo.xml` spread markers. Databases
 # older than this need one reinspection pass to pick them up.
 SPREAD_MARKER_VERSION = 4
+# The release that replaced dimension-based spread detection with the gutter
+# reader. An anchor stored by the old heuristic was the first wide page, which
+# is not where pairing should start, so those rows have to be recomputed rather
+# than trusted.
+SEAM_DETECTION_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -162,6 +169,55 @@ CREATE TABLE IF NOT EXISTS metadata_rate_events (
 CREATE INDEX IF NOT EXISTS metadata_rate_events_time
     ON metadata_rate_events(requested_at);
 
+CREATE TABLE IF NOT EXISTS metadata_auto_match_jobs (
+    id TEXT PRIMARY KEY,
+    library_id TEXT NOT NULL REFERENCES managed_libraries(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('running', 'complete')),
+    total INTEGER NOT NULL,
+    completed INTEGER NOT NULL DEFAULT 0,
+    linked INTEGER NOT NULL DEFAULT 0,
+    review INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS metadata_auto_match_jobs_library
+    ON metadata_auto_match_jobs(library_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS metadata_auto_match_items (
+    job_id TEXT NOT NULL REFERENCES metadata_auto_match_jobs(id) ON DELETE CASCADE,
+    series_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'linked', 'review', 'failed')),
+    detail TEXT,
+    PRIMARY KEY(job_id, series_id)
+);
+
+CREATE TABLE IF NOT EXISTS series_reader_settings (
+    series_id TEXT PRIMARY KEY REFERENCES catalog_series(id) ON DELETE CASCADE,
+    auto_spread_detection INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publication_spread_analysis (
+    publication_id TEXT PRIMARY KEY REFERENCES publications(id) ON DELETE CASCADE,
+    revision TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('detected', 'none')),
+    anchor_page INTEGER,
+    -- Which detector answered. Null on rows written before it was recorded.
+    source TEXT,
+    updated_at TEXT NOT NULL
+);
+
+-- An administrator's own answer for one volume, kept apart from the detected
+-- one so re-analysis never overwrites it and clearing it restores detection.
+CREATE TABLE IF NOT EXISTS publication_spread_overrides (
+    publication_id TEXT PRIMARY KEY REFERENCES publications(id) ON DELETE CASCADE,
+    anchor_page INTEGER NOT NULL CHECK(anchor_page >= 2),
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS application_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -214,11 +270,16 @@ class SQLiteRepository:
             self._ensure_scope_columns(connection)
             self._ensure_session_flash_columns(connection)
             self._ensure_page_spread_column(connection)
+            self._ensure_spread_source_column(connection)
             connection.executescript(SCOPE_INDEX)
             if 0 < version < SPREAD_MARKER_VERSION:
                 # Reinspect existing ComicInfo files once so the new spread
                 # marker is populated without changing publication identities.
                 connection.execute("UPDATE publications SET modified_ns = -1")
+            if 0 < version < SEAM_DETECTION_VERSION:
+                # Administrator overrides survive: only the detected anchors
+                # are discarded, and the next scan recomputes them.
+                connection.execute("DELETE FROM publication_spread_analysis")
             if 0 < version < SCHEMA_VERSION:
                 self._backfill_scope(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -251,6 +312,20 @@ class SQLiteRepository:
         for column in ("flash_message", "flash_error"):
             if column not in present:
                 connection.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
+
+    @staticmethod
+    def _ensure_spread_source_column(connection: sqlite3.Connection) -> None:
+        """Anchors detected before this release did not record their evidence."""
+        present = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(publication_spread_analysis)"
+            ).fetchall()
+        }
+        if "source" not in present:
+            connection.execute(
+                "ALTER TABLE publication_spread_analysis ADD COLUMN source TEXT"
+            )
 
     @staticmethod
     def _ensure_page_spread_column(connection: sqlite3.Connection) -> None:
@@ -598,6 +673,8 @@ class SQLiteRepository:
                     SELECT series_id FROM series_metadata
                     UNION
                     SELECT series_id FROM metadata_lookups
+                    UNION
+                    SELECT series_id FROM metadata_auto_match_items
                 )
                 SELECT recorded.series_id AS series_id,
                        COALESCE(
@@ -607,12 +684,28 @@ class SQLiteRepository:
                        sm.provider_id AS provider_id,
                        sm.series_id IS NOT NULL AS matched,
                        COALESCE(sm.overrides_json, '{}') != '{}' AS edited,
-                       lookups.error IS NOT NULL AS failed,
-                       sm.fetched_at AS fetched_at
+                       (lookups.error IS NOT NULL OR auto_item.status = 'failed') AS failed,
+                       sm.fetched_at AS fetched_at,
+                       lookups.searched_at AS searched_at,
+                       json_array_length(
+                           COALESCE(lookups.candidates_json, '[]')
+                       ) AS candidate_count,
+                       lookups.error AS lookup_error,
+                       auto_item.status AS auto_match_status,
+                       auto_item.detail AS auto_match_detail
                 FROM recorded
                 LEFT JOIN series_metadata sm ON sm.series_id = recorded.series_id
                 LEFT JOIN metadata_lookups lookups
                     ON lookups.series_id = recorded.series_id
+                LEFT JOIN metadata_auto_match_items auto_item
+                    ON auto_item.rowid = (
+                        SELECT item.rowid
+                        FROM metadata_auto_match_items item
+                        JOIN metadata_auto_match_jobs job ON job.id = item.job_id
+                        WHERE item.series_id = recorded.series_id
+                        ORDER BY job.created_at DESC, item.position
+                        LIMIT 1
+                    )
                 """
             ).fetchall()
         return {
@@ -626,6 +719,13 @@ class SQLiteRepository:
                 fetched_at=datetime.fromisoformat(row["fetched_at"])
                 if row["fetched_at"]
                 else None,
+                searched_at=datetime.fromisoformat(row["searched_at"])
+                if row["searched_at"]
+                else None,
+                candidate_count=row["candidate_count"],
+                lookup_error=row["lookup_error"],
+                auto_match_status=row["auto_match_status"],
+                auto_match_detail=row["auto_match_detail"],
             )
             for row in rows
         }
@@ -802,6 +902,277 @@ class SQLiteRepository:
                 (timestamp,),
             )
         return 0.0
+
+    def create_metadata_auto_match_job(
+        self, library_id: str, series_ids: list[str]
+    ) -> MetadataAutoMatchJob:
+        job_id = str(uuid.uuid4())
+        now = _now_iso()
+        ordered = list(dict.fromkeys(series_ids))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM metadata_auto_match_jobs WHERE status = 'running'"
+            ).fetchone():
+                raise ValueError("A metadata job is already running")
+            if not connection.execute(
+                "SELECT 1 FROM managed_libraries WHERE id = ? AND enabled = 1",
+                (library_id,),
+            ).fetchone():
+                raise ValueError("Managed library not found")
+            connection.execute(
+                """
+                INSERT INTO metadata_auto_match_jobs(
+                    id, library_id, status, total, created_at, updated_at
+                ) VALUES (?, ?, 'running', ?, ?, ?)
+                """,
+                (job_id, library_id, len(ordered), now, now),
+            )
+            connection.executemany(
+                """
+                INSERT INTO metadata_auto_match_items(job_id, series_id, position)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (job_id, series_id, position)
+                    for position, series_id in enumerate(ordered)
+                ],
+            )
+        job = self._metadata_auto_match_job(job_id)
+        assert job is not None
+        return job
+
+    def active_metadata_auto_match_job(self) -> MetadataAutoMatchJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM metadata_auto_match_jobs
+                WHERE status = 'running' ORDER BY created_at LIMIT 1
+                """
+            ).fetchone()
+        return self._auto_match_job(row) if row else None
+
+    def latest_metadata_auto_match_job(
+        self, library_id: str
+    ) -> MetadataAutoMatchJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM metadata_auto_match_jobs
+                WHERE library_id = ? ORDER BY created_at DESC LIMIT 1
+                """,
+                (library_id,),
+            ).fetchone()
+        return self._auto_match_job(row) if row else None
+
+    def _metadata_auto_match_job(self, job_id: str) -> MetadataAutoMatchJob | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM metadata_auto_match_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._auto_match_job(row) if row else None
+
+    @staticmethod
+    def _auto_match_job(row: sqlite3.Row) -> MetadataAutoMatchJob:
+        return MetadataAutoMatchJob(
+            id=row["id"],
+            library_id=row["library_id"],
+            status=row["status"],
+            total=row["total"],
+            completed=row["completed"],
+            linked=row["linked"],
+            review=row["review"],
+            failed=row["failed"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def pending_metadata_auto_match_series(self, job_id: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT series_id FROM metadata_auto_match_items
+                WHERE job_id = ? AND status = 'pending' ORDER BY position
+                """,
+                (job_id,),
+            ).fetchall()
+        return [row["series_id"] for row in rows]
+
+    def finish_metadata_auto_match_item(
+        self, job_id: str, series_id: str, status: str, detail: str | None = None
+    ) -> None:
+        if status not in {"linked", "review", "failed"}:
+            raise ValueError("Invalid auto-match result")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE metadata_auto_match_items SET status = ?, detail = ?
+                WHERE job_id = ? AND series_id = ? AND status = 'pending'
+                """,
+                (status, detail, job_id, series_id),
+            ).rowcount
+            if changed:
+                connection.execute(
+                    f"""
+                    UPDATE metadata_auto_match_jobs
+                    SET completed = completed + 1, {status} = {status} + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_now_iso(), job_id),
+                )
+
+    def complete_metadata_auto_match_job(self, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE metadata_auto_match_jobs SET status = 'complete', updated_at = ?
+                WHERE id = ?
+                """,
+                (_now_iso(), job_id),
+            )
+
+    def series_spread_detection(self, series_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT auto_spread_detection FROM series_reader_settings
+                WHERE series_id = ?
+                """,
+                (series_id,),
+            ).fetchone()
+        return bool(row and row["auto_spread_detection"])
+
+    def set_series_spread_detection(self, series_id: str, enabled: bool) -> bool:
+        with self._connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM catalog_series WHERE id = ?", (series_id,)
+            ).fetchone():
+                return False
+            connection.execute(
+                """
+                INSERT INTO series_reader_settings(
+                    series_id, auto_spread_detection, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(series_id) DO UPDATE SET
+                    auto_spread_detection=excluded.auto_spread_detection,
+                    updated_at=excluded.updated_at
+                """,
+                (series_id, int(enabled), _now_iso()),
+            )
+        return True
+
+    def spread_detection_series_ids(self) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT series_id FROM series_reader_settings
+                WHERE auto_spread_detection = 1 ORDER BY series_id
+                """
+            ).fetchall()
+        return [row["series_id"] for row in rows]
+
+    def publication_spread_analysis(
+        self, publication_id: str, revision: str
+    ) -> SpreadAnalysis | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM publication_spread_analysis
+                WHERE publication_id = ? AND revision = ?
+                """,
+                (publication_id, revision),
+            ).fetchone()
+        return self._spread_analysis(row) if row else None
+
+    def save_publication_spread_analysis(
+        self,
+        publication_id: str,
+        revision: str,
+        anchor_page: int | None,
+        source: str | None = None,
+    ) -> SpreadAnalysis:
+        status = "detected" if anchor_page is not None else "none"
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO publication_spread_analysis(
+                    publication_id, revision, status, anchor_page, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(publication_id) DO UPDATE SET
+                    revision=excluded.revision, status=excluded.status,
+                    anchor_page=excluded.anchor_page, source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                (publication_id, revision, status, anchor_page, source, _now_iso()),
+            )
+        result = self.publication_spread_analysis(publication_id, revision)
+        assert result is not None
+        return result
+
+    def publication_spread_override(self, publication_id: str) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT anchor_page FROM publication_spread_overrides
+                WHERE publication_id = ?
+                """,
+                (publication_id,),
+            ).fetchone()
+        return row["anchor_page"] if row else None
+
+    def publication_spread_overrides(self, series_id: str) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT o.publication_id AS publication_id, o.anchor_page AS anchor_page
+                FROM publication_spread_overrides o
+                JOIN publications p ON p.id = o.publication_id
+                WHERE p.series_id = ?
+                """,
+                (series_id,),
+            ).fetchall()
+        return {row["publication_id"]: row["anchor_page"] for row in rows}
+
+    def set_publication_spread_override(
+        self, publication_id: str, anchor_page: int | None
+    ) -> bool:
+        if anchor_page is not None and anchor_page < 2:
+            raise ValueError("Pairing starts at page 2 or later")
+        with self._connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM publications WHERE id = ?", (publication_id,)
+            ).fetchone():
+                return False
+            if anchor_page is None:
+                connection.execute(
+                    "DELETE FROM publication_spread_overrides WHERE publication_id = ?",
+                    (publication_id,),
+                )
+                return True
+            connection.execute(
+                """
+                INSERT INTO publication_spread_overrides(
+                    publication_id, anchor_page, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(publication_id) DO UPDATE SET
+                    anchor_page=excluded.anchor_page, updated_at=excluded.updated_at
+                """,
+                (publication_id, anchor_page, _now_iso()),
+            )
+        return True
+
+    @staticmethod
+    def _spread_analysis(row: sqlite3.Row) -> SpreadAnalysis:
+        return SpreadAnalysis(
+            publication_id=row["publication_id"],
+            revision=row["revision"],
+            status=row["status"],
+            anchor_page=row["anchor_page"],
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            source=row["source"],
+        )
 
     @staticmethod
     def _series_metadata(row: sqlite3.Row) -> SeriesMetadata:

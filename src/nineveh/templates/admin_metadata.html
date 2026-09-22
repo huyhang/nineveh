@@ -5,9 +5,20 @@
   <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><a href="/libraries/{{ library.id }}">{{ library.name }}</a><span>/</span><a href="/libraries/{{ library.id }}/{{ category }}">{{ category|title }}</a><span>/</span><span>Manage metadata</span></nav>
   <section class="admin-section">
     <div class="section-heading">
-      <div><p class="eyebrow">MangaBaka</p><h2>Series metadata</h2><p class="muted">Review every match before it changes what readers see.</p></div>
-      <span class="badge">{{ request_limit }} requests/minute</span>
+      <div><p class="eyebrow">MangaBaka</p><h2>Series metadata</h2><p class="muted">Confident matches can be linked automatically; uncertain results stay here for review.</p></div>
+      <div class="metadata-bulk-actions">
+        <span class="badge">{{ request_limit }} requests/minute</span>
+        <form method="post" action="/admin/libraries/{{ library.id }}/metadata/auto-match" data-confirm="Auto-match {{ unmatched_count }} unmatched manga series in {{ library.name }}? Existing links and local edits will be preserved.">
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <button type="submit" {% if not unmatched_count or metadata_status.running or (auto_match_job and auto_match_job.status == 'running') %}disabled{% endif %}>Auto-match library</button>
+        </form>
+      </div>
     </div>
+    {% if auto_match_job and auto_match_job.status == 'running' %}
+      <div class="lookup-progress" role="status" data-metadata-progress><span class="status-dot"></span><strong>Auto-matching library</strong><span>{{ auto_match_job.completed }} of {{ auto_match_job.total }} complete · {{ auto_match_job.linked }} linked · {{ auto_match_job.review }} need review{% if auto_match_job.failed %} · {{ auto_match_job.failed }} failed{% endif %}</span></div>
+    {% elif auto_match_job %}
+      <div class="lookup-summary" role="status"><strong>Last auto-match:</strong> {{ auto_match_job.linked }} linked · {{ auto_match_job.review }} need review{% if auto_match_job.failed %} · {{ auto_match_job.failed }} failed{% endif %}</div>
+    {% endif %}
     {% if metadata_status.running %}
       <div class="lookup-progress" role="status" data-metadata-progress><span class="status-dot"></span><strong>Looking up suggestions</strong><span>{{ metadata_status.completed }} of {{ metadata_status.total }} complete{% if metadata_status.failed %} · {{ metadata_status.failed }} failed{% endif %}</span></div>
     {% endif %}
@@ -32,7 +43,7 @@
               <label class="metadata-select"><input type="checkbox" name="series_id" value="{{ row.series.id }}" {% if metadata_status.running %}disabled{% endif %}><span class="sr-only">Select {{ row.title }}</span></label>
               <img src="/api/v1/series/{{ row.series.id }}/cover?revision={{ row.series.first_publication_revision }}" alt="" width="72" loading="lazy">
               <div><h3><a href="/series/{{ row.series.id }}/metadata">{{ row.title }}</a></h3><p>{{ row.series.library }} · {{ row.series.publication_count }} volume{% if row.series.publication_count != 1 %}s{% endif %}</p>{% if row.title != row.series.name %}<small>Folder: {{ row.series.name }}</small>{% endif %}</div>
-              <span class="row-states">{% if row.metadata and row.metadata.matched %}<span class="badge success">Matched</span>{% else %}<span class="badge warning">Unmatched</span>{% endif %}{% if row.metadata and row.metadata.edited %}<span class="badge">Edited</span>{% endif %}{% if row.metadata and row.metadata.failed %}<span class="badge danger-badge">Lookup failed</span>{% endif %}</span>
+              <span class="row-states">{% if row.metadata and row.metadata.matched %}<span class="badge success">Matched</span>{% else %}<button class="badge warning unmatched-explanation" type="button" data-unmatched-explanation data-unmatched-heading="{{ row.unmatched_explanation.heading }}" data-unmatched-detail="{{ row.unmatched_explanation.detail }}" data-unmatched-next-step="{{ row.unmatched_explanation.next_step }}" data-unmatched-manage-url="/series/{{ row.series.id }}/metadata" aria-label="Explain why {{ row.title }} is unmatched">Unmatched <span aria-hidden="true">?</span></button>{% endif %}{% if row.metadata and row.metadata.edited %}<span class="badge">Edited</span>{% endif %}{% if row.metadata and row.metadata.failed %}<span class="badge danger-badge">Lookup failed</span>{% endif %}</span>
               <a class="button secondary" href="/series/{{ row.series.id }}/metadata">Manage</a>
             </article>
           {% endfor %}
@@ -42,7 +53,17 @@
     {% else %}
       <div class="empty-state"><h3>No manga series found</h3><p>Add manga archives or adjust the filters.</p></div>
     {% endif %}
-    <p class="attribution admin-attribution">Metadata provided by <a href="https://mangabaka.org/" rel="external noreferrer">MangaBaka</a> under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="external noreferrer">CC BY-NC-SA 4.0</a>. Requests occur only when an administrator asks.</p>
+    <dialog class="confirm-dialog unmatched-dialog" data-unmatched-dialog aria-labelledby="unmatched-dialog-title">
+      <p class="eyebrow">Unmatched series</p>
+      <h2 id="unmatched-dialog-title" data-unmatched-dialog-heading></h2>
+      <p data-unmatched-dialog-detail></p>
+      <div class="unmatched-next-step"><strong>What to do next</strong><p data-unmatched-dialog-next-step></p></div>
+      <div class="confirm-actions">
+        <form method="dialog"><button class="secondary" type="submit">Close</button></form>
+        <a class="button" data-unmatched-dialog-manage href="#">Review matches</a>
+      </div>
+    </dialog>
+    <p class="attribution admin-attribution">Metadata provided by <a href="https://mangabaka.org/" rel="external noreferrer">MangaBaka</a> under <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/" rel="external noreferrer">CC BY-NC-SA 4.0</a>. Requests occur only when an administrator starts a lookup or auto-match job.</p>
   </section>
 {% endblock %}
 {% block scripts %}<script src="{{ url_for('static', path='admin.js') }}" defer></script>{% endblock %}

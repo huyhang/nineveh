@@ -19,6 +19,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+  # Runs the reader's pure JavaScript under an embedded engine, so the pairing
+  # and windowing rules are covered by `pytest` without adding Node to CI.
+  "dukpy>=0.5,<1",
   "httpx>=0.28,<1",
   "pytest>=8.3,<9",
   "pytest-cov>=6,<8",

@@ -29,13 +29,18 @@ from .metadata import (
     MAX_COVER_BYTES,
     REFRESH_REMINDER_DAYS,
     MetadataError,
+    explain_unmatched,
     matches_state,
 )
-from .reader import reading_direction
+from .reader import FIRST_PAIRED_PAGE, clamp_anchor, reading_direction
 from .units import gibibytes, since, timestamp
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 router = APIRouter(include_in_schema=False)
+
+# Past this many volumes the spread panel starts collapsed, so a long series
+# does not bury the volumes the page is actually about.
+SPREAD_PANEL_OPEN_LIMIT = 6
 
 
 templates.env.filters["gib"] = gibibytes
@@ -306,6 +311,7 @@ async def category_detail(request: Request, library_id: str, category: str):
 @router.get("/series/{series_id}", response_class=HTMLResponse)
 async def series_detail(request: Request, series_id: str):
     session = await _require_browser_session(request)
+    message, error = await _take_flash(request)
     container = _container(request)
     scope = container.authorization.read_scope(session.user)
     item = await run_in_threadpool(
@@ -324,6 +330,12 @@ async def series_detail(request: Request, series_id: str):
         session.user.id,
         publications,
     )
+    spread = None
+    if container.authorization.can_administer(session.user):
+        spread = await run_in_threadpool(
+            _spread_panel, container, series_id, publications
+        )
+        spread["running"] = request.app.state.spread_detection_running(series_id)
     return templates.TemplateResponse(
         request,
         "series.html",
@@ -337,8 +349,70 @@ async def series_detail(request: Request, series_id: str):
             "publications": publications,
             "progress": progress,
             "reading_direction": reading_direction(item.category),
+            "spread": spread,
+            "message": message,
+            "error": error,
         },
     )
+
+
+def _spread_panel(container, series_id: str, publications: list) -> dict:
+    """Per-volume spread alignment: what was detected, and what an admin pinned.
+
+    Built in one worker hop rather than one per volume, because a long series
+    would otherwise cost a round trip per row just to render the page.
+    """
+    repository = container.repository
+    overrides = repository.publication_spread_overrides(series_id)
+    volumes = []
+    for publication in publications:
+        analysis = repository.publication_spread_analysis(
+            publication.id, publication.revision
+        )
+        override = overrides.get(publication.id)
+        detected = analysis.anchor_page if analysis else None
+        volumes.append(
+            {
+                "publication": publication,
+                "analyzed": analysis is not None,
+                "detected": detected,
+                "source": analysis.source if analysis else None,
+                # Pairing from page two is the default, so detecting it is not
+                # news; only a genuine shift is worth reporting.
+                "shifted": bool(detected and detected > FIRST_PAIRED_PAGE),
+                "override": override,
+                "anchor": clamp_anchor(
+                    override if override is not None else detected,
+                    publication.page_count,
+                ),
+            }
+        )
+    enabled = repository.series_spread_detection(series_id)
+    return {
+        "enabled": enabled,
+        "running": False,
+        "volumes": volumes,
+        "summary": _spread_summary(enabled, volumes),
+        # A long series would otherwise bury the volumes the page is actually
+        # about, so the panel only opens itself when the list is short.
+        "expanded": enabled and len(volumes) <= SPREAD_PANEL_OPEN_LIMIT,
+    }
+
+
+def _spread_summary(enabled: bool, volumes: list[dict]) -> str:
+    """One line describing the whole series, for the collapsed panel."""
+    if not enabled:
+        return "Off · every volume pairs from the cover"
+    counts = {
+        "shifted": sum(1 for volume in volumes if volume["shifted"]),
+        "set by hand": sum(1 for volume in volumes if volume["override"]),
+        "not analyzed": sum(1 for volume in volumes if not volume["analyzed"]),
+    }
+    parts = [f"{len(volumes)} volume{'s' if len(volumes) != 1 else ''}"]
+    parts += [f"{count} {label}" for label, count in counts.items() if count]
+    if len(parts) == 1:
+        parts.append("nothing misaligned")
+    return " · ".join(parts)
 
 
 async def _reader_context(request: Request, session: Session, publication_id: str):
@@ -499,6 +573,10 @@ async def library_metadata_page(
     session = await _require_admin(request)
     message, error = await _take_flash(request)
     container = _container(request)
+    if not container.metadata:
+        return await _admin_redirect(
+            request, "libraries", error="Metadata service unavailable."
+        )
     library = await run_in_threadpool(container.repository.managed_library, library_id)
     if not library or not library.enabled or category.casefold() != "manga":
         raise HTTPException(status_code=404, detail="Manga library not found")
@@ -509,11 +587,27 @@ async def library_metadata_page(
         query=(q or "").strip() or None,
     )
     states = await run_in_threadpool(container.repository.series_metadata_states)
+    all_items = await run_in_threadpool(
+        container.repository.catalog_series,
+        library_id=library_id,
+        category="manga",
+    )
+    unmatched_count = sum(
+        1
+        for item in all_items
+        if not states.get(item.id) or not states[item.id].matched
+    )
+    auto_match_job = await run_in_threadpool(
+        container.repository.latest_metadata_auto_match_job, library_id
+    )
+    if auto_match_job and auto_match_job.status == "running":
+        request.app.state.start_metadata_auto_match(auto_match_job.id)
     rows = [
         {
             "series": item,
             "metadata": states.get(item.id),
             "title": _series_title(item, states.get(item.id)),
+            "unmatched_explanation": explain_unmatched(states.get(item.id)),
         }
         for item in items
         if matches_state(state, states.get(item.id))
@@ -532,6 +626,8 @@ async def library_metadata_page(
             "refresh_reminder_days": REFRESH_REMINDER_DAYS,
             "metadata_status": request.app.state.metadata_status,
             "request_limit": container.configuration.mangabaka_request_limit(),
+            "unmatched_count": unmatched_count,
+            "auto_match_job": auto_match_job,
             "message": message,
             "error": error,
         },
@@ -818,6 +914,143 @@ async def library_bulk_metadata_lookup(
     return await _library_metadata_redirect(
         request, *target, message=f"Started looking up {len(series_ids)} series."
     )
+
+
+@router.post("/admin/libraries/{library_id}/metadata/auto-match")
+async def library_auto_match_metadata(
+    request: Request, library_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    if not container.metadata:
+        return await _admin_redirect(
+            request, "libraries", error="Metadata service unavailable."
+        )
+    library = await run_in_threadpool(container.repository.managed_library, library_id)
+    if not library or not library.enabled:
+        return await _admin_redirect(
+            request, "libraries", error="Managed library not found."
+        )
+    current = request.app.state.metadata_task
+    if current is not None and not current.done():
+        return await _library_metadata_redirect(
+            request, library_id, "manga", error="A metadata job is already running."
+        )
+    items = await run_in_threadpool(
+        container.repository.catalog_series, library_id=library_id, category="manga"
+    )
+    if not items:
+        return await _admin_redirect(
+            request, "libraries", error="This library has no manga series to match."
+        )
+    states = await run_in_threadpool(container.repository.series_metadata_states)
+    series_ids = [
+        item.id
+        for item in items
+        if not states.get(item.id) or not states[item.id].matched
+    ]
+    if not series_ids:
+        return await _library_metadata_redirect(
+            request,
+            library_id,
+            "manga",
+            message="Every manga series is already linked.",
+        )
+    try:
+        job = await run_in_threadpool(
+            container.repository.create_metadata_auto_match_job,
+            library_id,
+            series_ids,
+        )
+    except ValueError as error:
+        return await _library_metadata_redirect(
+            request, library_id, "manga", error=str(error)
+        )
+    request.app.state.start_metadata_auto_match(job.id)
+    return await _library_metadata_redirect(
+        request,
+        library_id,
+        "manga",
+        message=f"Started auto-matching {job.total} unmatched series.",
+    )
+
+
+@router.post("/series/{series_id}/spread-detection")
+async def update_series_spread_detection(request: Request, series_id: str):
+    session = await _require_admin(request)
+    form = await request.form()
+    _verify_csrf(request, session, str(form.get("csrf_token", "")))
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+    enabled = str(form.get("enabled", "")) == "true"
+    await run_in_threadpool(
+        container.repository.set_series_spread_detection, series_id, enabled
+    )
+    if enabled:
+        request.app.state.start_spread_detection([series_id], force=True)
+    return await _flash_redirect(
+        request,
+        f"/series/{series_id}",
+        message=(
+            "Automatic spread alignment started."
+            if enabled
+            else "Automatic spread alignment disabled."
+        ),
+    )
+
+
+@router.post("/publications/{publication_id}/spread-start")
+async def update_publication_spread_start(request: Request, publication_id: str):
+    """Pin, or clear, one volume's pairing start by hand."""
+    session = await _require_admin(request)
+    form = await request.form()
+    _verify_csrf(request, session, str(form.get("csrf_token", "")))
+    container = _container(request)
+    publication = await run_in_threadpool(
+        container.repository.publication_by_id, publication_id
+    )
+    if not publication:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    target = f"/series/{publication.series_id}"
+    raw = str(form.get("anchor_page", "")).strip()
+    try:
+        anchor_page = _spread_start_page(raw, publication.page_count)
+    except ValueError as error:
+        return await _flash_redirect(request, target, error=str(error))
+    await run_in_threadpool(
+        container.repository.set_publication_spread_override,
+        publication_id,
+        anchor_page,
+    )
+    return await _flash_redirect(
+        request,
+        target,
+        message=(
+            f"{publication.title} now pairs from page {anchor_page}."
+            if anchor_page
+            else f"{publication.title} is back to automatic detection."
+        ),
+    )
+
+
+def _spread_start_page(raw: str, page_count: int) -> int | None:
+    """An admin-typed pairing start, or None to fall back to detection."""
+    if not raw:
+        return None
+    try:
+        page = int(raw)
+    except ValueError:
+        raise ValueError("Start page must be a whole number.") from None
+    if not FIRST_PAIRED_PAGE <= page <= page_count:
+        raise ValueError(
+            f"Start page must be between {FIRST_PAIRED_PAGE} and {page_count}."
+        )
+    return page
 
 
 @router.post("/series/{series_id}/metadata/lookup")

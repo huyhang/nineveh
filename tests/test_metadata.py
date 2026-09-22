@@ -23,8 +23,9 @@ from nineveh.app import build_container, create_app
 from nineveh.catalog import ArchiveInspector, CatalogScanner
 from nineveh.config import Settings
 from nineveh.database import SQLiteRepository
-from nineveh.domain import SeriesMetadataState
+from nineveh.domain import MetadataCandidate, SeriesMetadataState
 from nineveh.metadata import (
+    ConfidentTitleMatcher,
     MangaBakaProvider,
     MetadataCoverStore,
     MetadataError,
@@ -32,6 +33,7 @@ from nineveh.metadata import (
     PersistentRateLimiter,
     ProviderSeries,
     UrllibTransport,
+    explain_unmatched,
     matches_state,
 )
 
@@ -316,6 +318,87 @@ def test_metadata_service_preserves_overrides_and_custom_covers(tmp_path: Path):
     assert covers.cover(series.id) is None
 
 
+def _candidate(identifier: int, title: str, *alternatives: str) -> MetadataCandidate:
+    return MetadataCandidate(
+        identifier,
+        title,
+        alternatives,
+        (),
+        (),
+        None,
+        None,
+        None,
+        None,
+        None,
+        (),
+        (),
+        None,
+        None,
+    )
+
+
+def test_auto_match_requires_a_clear_title_winner_and_preserves_existing_links(
+    tmp_path: Path,
+):
+    matcher = ConfidentTitleMatcher()
+    assert (
+        matcher.choose("Alchemy [Digital]", (_candidate(1, "Alchemy"),))[0].provider_id
+        == 1
+    )
+    assert (
+        matcher.choose("Alchemy", (_candidate(1, "Alchemy"), _candidate(2, "Alchemy")))
+        is None
+    )
+    assert matcher.choose("Something Else", (_candidate(1, "Alchemy"),)) is None
+
+    settings = Settings(data_dir=tmp_path / "data", state_dir=tmp_path / "state")
+    repository, series = _manga_repository(settings)
+    provider = StubProvider(image_bytes((10, 20, 30)))
+    provider.title = "Alchemy"
+    service = MetadataService(
+        repository,
+        provider,
+        MetadataCoverStore(settings.metadata_cover_dir, settings.max_image_pixels),
+    )
+
+    linked = service.auto_match(series)
+    assert (linked.status, linked.provider_id) == ("linked", 12)
+    assert service.auto_match(series).detail == "Existing match preserved"
+
+
+def test_auto_match_job_progress_is_transactional_and_resumable(tmp_path: Path):
+    settings = Settings(data_dir=tmp_path / "data", state_dir=tmp_path / "state")
+    repository, series = _manga_repository(settings)
+
+    job = repository.create_metadata_auto_match_job(series.library_id, [series.id])
+    assert repository.active_metadata_auto_match_job() == job
+    assert repository.pending_metadata_auto_match_series(job.id) == [series.id]
+    queued = repository.series_metadata_states()[series.id]
+    assert queued.auto_match_status == "pending"
+    with pytest.raises(ValueError, match="already running"):
+        repository.create_metadata_auto_match_job(series.library_id, [series.id])
+    with pytest.raises(ValueError, match="Invalid"):
+        repository.finish_metadata_auto_match_item(job.id, series.id, "maybe")
+
+    repository.finish_metadata_auto_match_item(job.id, series.id, "review", "Unclear")
+    repository.finish_metadata_auto_match_item(job.id, series.id, "review", "Duplicate")
+    repository.complete_metadata_auto_match_job(job.id)
+
+    finished = repository.latest_metadata_auto_match_job(series.library_id)
+    assert finished is not None
+    assert (finished.status, finished.completed, finished.review) == (
+        "complete",
+        1,
+        1,
+    )
+    assert repository.active_metadata_auto_match_job() is None
+    reviewed = repository.series_metadata_states()[series.id]
+    assert (reviewed.auto_match_status, reviewed.auto_match_detail) == (
+        "review",
+        "Unclear",
+    )
+
+
 def test_metadata_validation_and_failure_states(tmp_path: Path):
     settings = Settings(data_dir=tmp_path / "data", state_dir=tmp_path / "state")
     repository, manga = _manga_repository(settings)
@@ -426,6 +509,8 @@ def test_metadata_browser_and_api_workflow(library):
         library_id = series_body["libraryId"]
         page = client.get(f"/libraries/{library_id}/manga/metadata")
         assert "Alchemy" in page.text
+        assert "data-unmatched-dialog" in page.text
+        assert "This series has not been searched" in page.text
         assert client.get("/admin/metadata").status_code == 404
         category_page = client.get(f"/libraries/{library_id}/manga")
         assert f'href="/libraries/{library_id}/manga/metadata"' in category_page.text
@@ -457,6 +542,10 @@ def test_metadata_browser_and_api_workflow(library):
 
                 time.sleep(0.01)
         assert client.app.state.metadata_status["completed"] == 1
+        assert (
+            "Suggestions are ready for review"
+            in client.get(f"/libraries/{library_id}/manga/metadata").text
+        )
 
         admin_detail = client.get(f"/series/{series_id}/metadata")
         csrf = admin_detail.text.split('name="csrf_token" value="')[1].split('"')[0]
@@ -837,6 +926,97 @@ def test_the_browser_batch_lookup_matches_only_the_selected_series(library):
         )
 
 
+def test_library_auto_match_links_only_confident_unmatched_series(library):
+    settings, _ = library
+    archive = settings.data_dir / "Main Library" / "manga" / "Alchemy" / "01.cbz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    write_cbz(archive)
+
+    class MatchingProvider(StubProvider):
+        def search(self, query: str, limit: int = 5):
+            self.title = query
+            return super().search(query, limit)
+
+    provider = MatchingProvider(image_bytes((20, 40, 60)))
+    container = _metadata_client(settings, provider)
+    with TestClient(create_app(container=container)) as client:
+        wait_for_scan(client)
+        series = container.repository.catalog_series(category="manga")[0]
+
+        started = client.post(
+            f"/api/v1/admin/libraries/{series.library_id}/metadata/auto-match",
+            headers=authorization(),
+        )
+        assert started.status_code == 202
+        task = client.app.state.metadata_task
+        for _ in range(200):
+            if task.done():
+                break
+            time.sleep(0.01)
+
+        assert container.repository.series_metadata(series.id) is not None
+        job = container.repository.latest_metadata_auto_match_job(series.library_id)
+        assert job is not None
+        assert (job.status, job.linked, job.failed) == ("complete", 1, 0)
+        status = client.get(
+            f"/api/v1/admin/libraries/{series.library_id}/metadata/auto-match",
+            headers=authorization(),
+        ).json()["job"]
+        assert (status["status"], status["linked"]) == ("complete", 1)
+        repeated = client.post(
+            f"/api/v1/admin/libraries/{series.library_id}/metadata/auto-match",
+            headers=authorization(),
+        )
+        assert repeated.status_code == 409
+
+        client.post("/login", data={"username": "admin", "password": ADMIN_PASSWORD})
+        page = client.get(f"/libraries/{series.library_id}/manga/metadata")
+        assert "Last auto-match:" in page.text
+        assert "1 linked" in page.text
+
+
+def test_interrupted_auto_match_resumes_and_records_each_outcome(library):
+    settings, _ = library
+    for name in ("Alchemy", "Beacon", "Broken"):
+        archive = settings.data_dir / "Main Library" / "manga" / name / "01.cbz"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        write_cbz(archive)
+
+    class MixedProvider(StubProvider):
+        def search(self, query: str, limit: int = 5):
+            if query == "Broken":
+                raise MetadataError("Provider unavailable")
+            self.title = query if query == "Alchemy" else "Different title"
+            return super().search(query, limit)
+
+    container = _metadata_client(settings, MixedProvider(image_bytes((20, 40, 60))))
+    container.libraries.initialize()
+    container.scanner.scan()
+    series = container.repository.catalog_series(category="manga")
+    job = container.repository.create_metadata_auto_match_job(
+        series[0].library_id, [item.id for item in series]
+    )
+
+    with TestClient(create_app(container=container)) as client:
+        task = client.app.state.metadata_task
+        for _ in range(200):
+            if task.done():
+                break
+            time.sleep(0.01)
+
+        finished = container.repository.latest_metadata_auto_match_job(
+            series[0].library_id
+        )
+        assert finished is not None
+        assert finished.id == job.id
+        assert (finished.status, finished.linked, finished.review, finished.failed) == (
+            "complete",
+            1,
+            1,
+            1,
+        )
+
+
 def test_the_browser_batch_lookup_rejects_series_outside_the_library(library):
     settings, _ = library
     archive = settings.data_dir / "Main Library" / "manga" / "Alchemy" / "01.cbz"
@@ -987,6 +1167,45 @@ def test_the_status_filter_selects_the_right_series(
 
 
 @pytest.mark.parametrize(
+    ("record", "heading"),
+    [
+        (None, "has not been searched"),
+        (_state(matched=False, auto_match_status="pending"), "Waiting"),
+        (
+            _state(matched=False, failed=True, lookup_error="Provider unavailable"),
+            "failed",
+        ),
+        (
+            _state(matched=False, searched_at=_NOW, candidate_count=0),
+            "no results",
+        ),
+        (
+            _state(
+                matched=False,
+                searched_at=_NOW,
+                candidate_count=2,
+                auto_match_status="review",
+            ),
+            "not confident",
+        ),
+        (
+            _state(matched=False, searched_at=_NOW, candidate_count=1),
+            "ready for review",
+        ),
+    ],
+)
+def test_unmatched_explanations_identify_the_next_admin_action(record, heading):
+    explanation = explain_unmatched(record)
+    assert explanation is not None
+    assert heading.casefold() in explanation.heading.casefold()
+    assert explanation.next_step
+
+
+def test_matched_series_need_no_unmatched_explanation():
+    assert explain_unmatched(_state()) is None
+
+
+@pytest.mark.parametrize(
     ("days", "expected"),
     [(0, False), (29, False), (30, True), (400, True)],
 )
@@ -1011,6 +1230,9 @@ def test_the_states_query_reports_edits_failures_and_fetch_times(library):
     repository.replace_metadata_lookup(series.id, [], "MangaBaka could not be reached")
     failed = repository.series_metadata_states()[series.id]
     assert (failed.matched, failed.failed, failed.edited) == (False, True, False)
+    assert failed.lookup_error == "MangaBaka could not be reached"
+    assert failed.searched_at is not None
+    assert failed.candidate_count == 0
 
     repository.save_series_metadata(
         series.id, 12, "https://mangabaka.org/series/12", {"title": "Alchemy"}, {}, None

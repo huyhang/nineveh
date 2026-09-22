@@ -98,6 +98,16 @@ class MetadataBatchInput(BaseModel):
     series_ids: list[str] = Field(min_length=1, max_length=500)
 
 
+class SpreadDetectionInput(BaseModel):
+    enabled: bool
+
+
+class SpreadStartInput(BaseModel):
+    """`null` restores automatic detection for the volume."""
+
+    page: int | None = Field(default=None, ge=2)
+
+
 class ProgressUpdate(BaseModel):
     page: int = Field(ge=1)
     mode: Literal["single", "double", "scroll"]
@@ -434,6 +444,16 @@ async def page_manifest(
     start, effective_end = _resolve_range(
         publication, start, end, container.settings.page_range_limit
     )
+    pairing_anchor = None
+    if container.spreads:
+        try:
+            pairing_anchor = await run_in_threadpool(
+                container.spreads.anchor_for, publication
+            )
+        except ArchiveChanged as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except ArchiveUnavailable as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
     pages = await run_in_threadpool(
         container.repository.pages, publication.id, start, effective_end
     )
@@ -452,6 +472,7 @@ async def page_manifest(
         start,
         effective_end,
         container.settings.page_range_limit,
+        pairing_anchor,
     )
 
 
@@ -462,6 +483,7 @@ def _manifest_body(
     start: int,
     end: int,
     limit: int,
+    pairing_anchor: int | None = None,
 ) -> dict[str, object]:
     base = f"{root}/api/v1/publications/{publication.id}"
     body: dict[str, object] = {
@@ -486,6 +508,8 @@ def _manifest_body(
     if end < publication.page_count:
         next_end = min(publication.page_count, end + limit)
         body["next"] = f"{base}/pages?start={end + 1}&end={next_end}"
+    if pairing_anchor is not None:
+        body["pairingAnchor"] = pairing_anchor
     return body
 
 
@@ -585,6 +609,10 @@ async def publication_page(
     number: int,
     identity: Annotated[Identity, Depends(authenticated)],
     revision: str | None = None,
+    width: int | None = Query(
+        default=None,
+        description="Serve a copy no wider than this instead of the original.",
+    ),
 ):
     container = _container(request)
     scope = container.authorization.read_scope(identity.user)
@@ -595,6 +623,10 @@ async def publication_page(
         raise HTTPException(status_code=404, detail="Page not found")
     if revision and revision != item.publication.revision:
         raise HTTPException(status_code=409, detail="Publication revision has changed")
+    if width is not None:
+        resized = await _page_rendition(request, container, item, width, revision)
+        if resized is not None:
+            return resized
     etag = _etag(f"{item.publication.revision}-{item.page.crc:08x}")
     if _not_modified(request, etag):
         return _not_modified_response(etag)
@@ -621,6 +653,35 @@ async def publication_page(
     )
     headers["Content-Length"] = str(item.page.uncompressed_size)
     return StreamingResponse(content, media_type=item.page.media_type, headers=headers)
+
+
+async def _page_rendition(request: Request, container, item, width: int, revision):
+    """A width-bounded copy, or None when the original is the better answer."""
+    try:
+        path = await run_in_threadpool(
+            container.renditions.rendition, item.publication, item.page, width
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except ArchiveChanged as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ArchiveUnavailable as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    if path is None:
+        return None
+    etag = _etag(f"{item.publication.revision}-{item.page.crc:08x}-w{width}")
+    if _not_modified(request, etag):
+        return _not_modified_response(etag)
+    return FileResponse(
+        path,
+        media_type="image/webp",
+        headers={
+            "ETag": etag,
+            "Cache-Control": "private, max-age=31536000, immutable"
+            if revision
+            else "private, no-cache",
+        },
+    )
 
 
 # One handler, registered once per verb so each OpenAPI operation carries a
@@ -990,6 +1051,149 @@ async def admin_metadata_batch_lookup(
             status_code=409, detail="A metadata lookup is already running"
         )
     return {"status": "accepted", "seriesCount": len(set(body.series_ids))}
+
+
+@router.post(
+    "/api/v1/admin/libraries/{library_id}/metadata/auto-match",
+    status_code=202,
+    tags=["administration"],
+)
+async def admin_library_metadata_auto_match(
+    request: Request,
+    library_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    _metadata_service(container)
+    library = await run_in_threadpool(container.repository.managed_library, library_id)
+    if not library or not library.enabled:
+        raise HTTPException(status_code=404, detail="Managed library not found")
+    current = request.app.state.metadata_task
+    if current is not None and not current.done():
+        raise HTTPException(status_code=409, detail="A metadata job is already running")
+    items = await run_in_threadpool(
+        container.repository.catalog_series, library_id=library_id, category="manga"
+    )
+    if not items:
+        raise HTTPException(status_code=409, detail="This library has no manga series")
+    states = await run_in_threadpool(container.repository.series_metadata_states)
+    series_ids = [
+        item.id
+        for item in items
+        if not states.get(item.id) or not states[item.id].matched
+    ]
+    if not series_ids:
+        raise HTTPException(
+            status_code=409, detail="Every manga series is already linked"
+        )
+    try:
+        job = await run_in_threadpool(
+            container.repository.create_metadata_auto_match_job,
+            library_id,
+            series_ids,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    request.app.state.start_metadata_auto_match(job.id)
+    return {
+        "status": "accepted",
+        "jobId": job.id,
+        "seriesCount": job.total,
+        "statusUrl": f"/api/v1/admin/libraries/{library_id}/metadata/auto-match",
+    }
+
+
+@router.get(
+    "/api/v1/admin/libraries/{library_id}/metadata/auto-match",
+    tags=["administration"],
+)
+async def admin_library_metadata_auto_match_status(
+    request: Request,
+    library_id: str,
+    _: Annotated[Identity, Depends(administrator)],
+) -> dict[str, object]:
+    container = _container(request)
+    library = await run_in_threadpool(container.repository.managed_library, library_id)
+    if not library or not library.enabled:
+        raise HTTPException(status_code=404, detail="Managed library not found")
+    job = await run_in_threadpool(
+        container.repository.latest_metadata_auto_match_job, library_id
+    )
+    if not job:
+        return {"job": None}
+    return {
+        "job": {
+            "id": job.id,
+            "status": job.status,
+            "total": job.total,
+            "completed": job.completed,
+            "linked": job.linked,
+            "review": job.review,
+            "failed": job.failed,
+            "createdAt": job.created_at.isoformat(),
+            "updatedAt": job.updated_at.isoformat(),
+        }
+    }
+
+
+@router.post(
+    "/api/v1/admin/series/{series_id}/spread-detection",
+    tags=["administration"],
+)
+async def admin_series_spread_detection(
+    request: Request,
+    series_id: str,
+    body: SpreadDetectionInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.repository.catalog_series_by_id, series_id
+    )
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+    await run_in_threadpool(
+        container.repository.set_series_spread_detection, series_id, body.enabled
+    )
+    started = False
+    if body.enabled:
+        started = request.app.state.start_spread_detection([series_id], force=True)
+    return {"enabled": body.enabled, "analysisStarted": started}
+
+
+@router.put(
+    "/api/v1/admin/publications/{publication_id}/spread-start",
+    tags=["administration"],
+)
+async def admin_publication_spread_start(
+    request: Request,
+    publication_id: str,
+    body: SpreadStartInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    """Pin one volume's pairing start, or send null to restore detection."""
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    publication = await run_in_threadpool(
+        container.repository.publication_by_id, publication_id
+    )
+    if not publication:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    if body.page is not None and body.page > publication.page_count:
+        raise HTTPException(
+            status_code=422, detail="Start page is past the end of this volume"
+        )
+    await run_in_threadpool(
+        container.repository.set_publication_spread_override,
+        publication_id,
+        body.page,
+    )
+    return {"publicationId": publication_id, "page": body.page}
 
 
 @router.post(

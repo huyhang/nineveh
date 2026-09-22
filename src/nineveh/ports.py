@@ -10,6 +10,7 @@ from .domain import (
     CatalogSeries,
     LibraryUsage,
     ManagedLibrary,
+    MetadataAutoMatchJob,
     MetadataCandidate,
     MetadataLookup,
     Page,
@@ -23,6 +24,7 @@ from .domain import (
     SeriesMetadata,
     SeriesMetadataState,
     SeriesMetadataSummary,
+    SpreadAnalysis,
     User,
 )
 
@@ -178,6 +180,52 @@ class MetadataRepository(Protocol):
         self, limit: int, now: float, window_seconds: float = 60.0
     ) -> float: ...
 
+    def create_metadata_auto_match_job(
+        self, library_id: str, series_ids: list[str]
+    ) -> MetadataAutoMatchJob: ...
+
+    def active_metadata_auto_match_job(self) -> MetadataAutoMatchJob | None: ...
+
+    def latest_metadata_auto_match_job(
+        self, library_id: str
+    ) -> MetadataAutoMatchJob | None: ...
+
+    def pending_metadata_auto_match_series(self, job_id: str) -> list[str]: ...
+
+    def finish_metadata_auto_match_item(
+        self, job_id: str, series_id: str, status: str, detail: str | None = None
+    ) -> None: ...
+
+    def complete_metadata_auto_match_job(self, job_id: str) -> None: ...
+
+
+class SpreadRepository(Protocol):
+    def series_spread_detection(self, series_id: str) -> bool: ...
+
+    def set_series_spread_detection(self, series_id: str, enabled: bool) -> bool: ...
+
+    def spread_detection_series_ids(self) -> list[str]: ...
+
+    def publication_spread_analysis(
+        self, publication_id: str, revision: str
+    ) -> SpreadAnalysis | None: ...
+
+    def save_publication_spread_analysis(
+        self,
+        publication_id: str,
+        revision: str,
+        anchor_page: int | None,
+        source: str | None = None,
+    ) -> SpreadAnalysis: ...
+
+    def publication_spread_override(self, publication_id: str) -> int | None: ...
+
+    def publication_spread_overrides(self, series_id: str) -> dict[str, int]: ...
+
+    def set_publication_spread_override(
+        self, publication_id: str, anchor_page: int | None
+    ) -> bool: ...
+
 
 class UserRepository(Protocol):
     def user_count(self) -> int: ...
@@ -224,6 +272,7 @@ class Repository(
     AccessRepository,
     MetadataRepository,
     ReadingRepository,
+    SpreadRepository,
     Protocol,
 ):
     """The single persistence seam the application composes against."""
@@ -263,6 +312,12 @@ class ThumbnailRenderer(Protocol):
 
 class CoverSource(Protocol):
     def cover(self, publication: Publication, page: Page, width: int) -> Path: ...
+
+
+class RenditionSource(Protocol):
+    def rendition(
+        self, publication: Publication, page: Page, width: int
+    ) -> Path | None: ...
 
 
 class PageStore(Protocol):

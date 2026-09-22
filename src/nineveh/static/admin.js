@@ -70,6 +70,35 @@ function buildConfirmDialog() {
   return dialog;
 }
 
+const unmatchedDialog = document.querySelector("[data-unmatched-dialog]");
+
+for (const trigger of document.querySelectorAll("[data-unmatched-explanation]")) {
+  trigger.addEventListener("click", () => {
+    const heading = trigger.dataset.unmatchedHeading;
+    const detail = trigger.dataset.unmatchedDetail;
+    const nextStep = trigger.dataset.unmatchedNextStep;
+    if (!unmatchedDialog || typeof unmatchedDialog.showModal !== "function") {
+      window.alert(`${heading}\n\n${detail}\n\n${nextStep}`);
+      return;
+    }
+    unmatchedDialog.querySelector("[data-unmatched-dialog-heading]").textContent =
+      heading;
+    unmatchedDialog.querySelector("[data-unmatched-dialog-detail]").textContent =
+      detail;
+    unmatchedDialog.querySelector(
+      "[data-unmatched-dialog-next-step]",
+    ).textContent = nextStep;
+    unmatchedDialog.querySelector("[data-unmatched-dialog-manage]").href =
+      trigger.dataset.unmatchedManageUrl;
+    unmatchedDialog.showModal();
+    unmatchedDialog.querySelector("button").focus();
+  });
+}
+
+unmatchedDialog?.addEventListener("click", (event) => {
+  if (event.target === unmatchedDialog) unmatchedDialog.close();
+});
+
 function refreshPermissions(fieldset) {
   const library = fieldset.querySelector('[data-permission="library"]');
   for (const branch of fieldset.querySelectorAll(".permission-branch")) {
@@ -153,4 +182,34 @@ async function pollScan(failures = 0) {
 
 if (document.querySelector("[data-scan-lock][disabled]")) {
   window.setTimeout(() => pollScan(), SCAN_POLL_MS);
+}
+
+const SPREAD_POLL_MS = 1500;
+const SPREAD_POLL_FAILURES = 3;
+
+async function pollSpreadStatus(failures = 0) {
+  const current = document.querySelector("[data-spread-status]");
+  if (!current) return;
+  try {
+    const response = await fetch(window.location.href, {
+      credentials: "same-origin",
+      headers: { "X-Requested-With": "fetch" },
+    });
+    if (!response.ok) throw new Error(`Series status returned ${response.status}`);
+    const parsed = new DOMParser().parseFromString(await response.text(), "text/html");
+    const fresh = parsed.querySelector("[data-spread-status]");
+    if (!fresh) return;
+    current.replaceWith(fresh);
+    if (fresh.querySelector("[data-spread-progress]")) {
+      window.setTimeout(() => pollSpreadStatus(), SPREAD_POLL_MS);
+    }
+  } catch (_error) {
+    if (failures + 1 < SPREAD_POLL_FAILURES) {
+      window.setTimeout(() => pollSpreadStatus(failures + 1), SPREAD_POLL_MS);
+    }
+  }
+}
+
+if (document.querySelector("[data-spread-progress]")) {
+  window.setTimeout(() => pollSpreadStatus(), SPREAD_POLL_MS);
 }

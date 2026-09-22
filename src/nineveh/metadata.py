@@ -5,12 +5,15 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -173,6 +176,113 @@ class MetadataProvider(Protocol):
     def fetch(self, provider_id: int) -> ProviderSeries: ...
 
     def cover(self, url: str) -> bytes: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AutoMatchResult:
+    status: str
+    detail: str
+    provider_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UnmatchedExplanation:
+    heading: str
+    detail: str
+    next_step: str
+
+
+def explain_unmatched(
+    record: SeriesMetadataState | None,
+) -> UnmatchedExplanation | None:
+    """Translate persisted matching state into concise administrator guidance."""
+    if record and record.matched:
+        return None
+    if record and record.auto_match_status == "pending":
+        return UnmatchedExplanation(
+            "Waiting for automatic matching",
+            "This series is queued and has not been processed yet.",
+            "Leave this page open to watch progress, or return later; the job can resume after a restart.",
+        )
+    if record and record.failed:
+        return UnmatchedExplanation(
+            "The last match attempt failed",
+            record.lookup_error
+            or record.auto_match_detail
+            or "MangaBaka could not complete the request.",
+            "Open Manage to retry the search or adjust its title.",
+        )
+    if not record or record.searched_at is None:
+        return UnmatchedExplanation(
+            "This series has not been searched",
+            "Nineveh has not asked MangaBaka for suggestions for this series.",
+            "Select it and find suggestions, or run Auto-match library.",
+        )
+    if record.candidate_count == 0:
+        return UnmatchedExplanation(
+            "MangaBaka returned no results",
+            "The last search did not find a candidate for the local folder title.",
+            "Open Manage and try a shorter or alternative title.",
+        )
+    if record.auto_match_status == "review":
+        return UnmatchedExplanation(
+            "Automatic matching was not confident enough",
+            f"Nineveh kept {record.candidate_count} suggestion"
+            f"{'s' if record.candidate_count != 1 else ''} but did not risk linking the wrong series.",
+            "Open Manage to compare the suggestions and choose one.",
+        )
+    return UnmatchedExplanation(
+        "Suggestions are ready for review",
+        f"The last search found {record.candidate_count} suggestion"
+        f"{'s' if record.candidate_count != 1 else ''}, but no match has been selected.",
+        "Open Manage to compare the suggestions and choose one.",
+    )
+
+
+class CandidateMatcher(Protocol):
+    def choose(
+        self, local_title: str, candidates: tuple[MetadataCandidate, ...]
+    ) -> tuple[MetadataCandidate, float] | None: ...
+
+
+class ConfidentTitleMatcher:
+    """Select only an unambiguous, close title match."""
+
+    def __init__(self, minimum: float = 0.90, margin: float = 0.06) -> None:
+        self._minimum = minimum
+        self._margin = margin
+
+    def choose(
+        self, local_title: str, candidates: tuple[MetadataCandidate, ...]
+    ) -> tuple[MetadataCandidate, float] | None:
+        ranked = sorted(
+            (
+                (self._score(local_title, candidate), candidate)
+                for candidate in candidates
+            ),
+            key=lambda item: (-item[0], item[1].provider_id),
+        )
+        if not ranked or ranked[0][0] < self._minimum:
+            return None
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < self._margin:
+            return None
+        score, candidate = ranked[0]
+        return candidate, score
+
+    @staticmethod
+    def _score(local_title: str, candidate: MetadataCandidate) -> float:
+        local_forms = _title_forms(local_title)
+        remote = (candidate.title, *candidate.alternative_titles)
+        return max(
+            (
+                SequenceMatcher(None, left, right).ratio()
+                for left in local_forms
+                for title in remote
+                for right in _title_forms(title)
+                if left and right
+            ),
+            default=0.0,
+        )
 
 
 class MangaBakaProvider:
@@ -365,10 +475,12 @@ class MetadataService:
         repository: MetadataRepository,
         provider: MetadataProvider,
         covers: MetadataCoverStore,
+        matcher: CandidateMatcher | None = None,
     ) -> None:
         self._repository = repository
         self._provider = provider
         self.covers = covers
+        self._matcher = matcher or ConfidentTitleMatcher()
 
     def lookup(self, series: CatalogSeries, query: str | None = None) -> MetadataLookup:
         self._require_manga(series)
@@ -400,6 +512,25 @@ class MetadataService:
             except MetadataError as error:
                 LOGGER.warning("Could not cache cover for %s: %s", series.id, error)
         return metadata
+
+    def auto_match(self, series: CatalogSeries) -> AutoMatchResult:
+        """Look up and link one series only when its title is unambiguous."""
+        if self._repository.series_metadata(series.id):
+            return AutoMatchResult("review", "Existing match preserved")
+        lookup = self.lookup(series)
+        selected = self._matcher.choose(series.name, lookup.candidates)
+        if selected is None:
+            detail = "No confident title match"
+            if not lookup.candidates:
+                detail = "MangaBaka returned no candidates"
+            return AutoMatchResult("review", detail)
+        candidate, score = selected
+        self.match(series, candidate.provider_id)
+        return AutoMatchResult(
+            "linked",
+            f"Matched {candidate.title} ({score:.0%})",
+            candidate.provider_id,
+        )
 
     def candidate_cover(self, series_id: str, provider_id: int) -> Path:
         cached = self.covers.candidate(provider_id)
@@ -485,6 +616,22 @@ def _ranked_titles(data: dict[str, Any]) -> list[str]:
         if candidate and candidate not in ordered:
             ordered.append(candidate)
     return ordered
+
+
+def _title_forms(value: str) -> tuple[str, ...]:
+    """Comparable Unicode title forms, including a release-tag-free variant."""
+
+    def normalize(candidate: str) -> str:
+        text = unicodedata.normalize("NFKC", candidate).casefold()
+        return " ".join(
+            "".join(
+                character if character.isalnum() else " " for character in text
+            ).split()
+        )
+
+    full = normalize(value)
+    without_release_tags = normalize(re.sub(r"(?:\s*[\[(][^\])]+[\])])+$", "", value))
+    return tuple(dict.fromkeys(item for item in (full, without_release_tags) if item))
 
 
 def _normalized_values(data: dict[str, Any]) -> dict[str, Any]:

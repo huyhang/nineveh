@@ -35,7 +35,8 @@
           <strong>{{ publication.title }}</strong>
           <span>{{ publication.series }}</span>
         </div>
-        <label class="reader-publication-picker">
+        <label class="reader-publication-picker" title="Choose another publication">
+          <svg class="reader-publication-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg>
           <span class="sr-only">Publication</span>
           <select data-publication-picker aria-label="Choose another publication">
             {% for item in context.publications %}
@@ -51,11 +52,11 @@
           {% if context.next %}<a href="/read/{{ context.next.id }}" aria-label="Next publication: {{ context.next.title }}">→</a>{% else %}<span aria-hidden="true">→</span>{% endif %}
         </nav>
         <div class="reader-modes" role="group" aria-label="Reading mode">
-          <button type="button" data-mode="single" aria-pressed="false">Single</button>
-          <button type="button" data-mode="double" aria-pressed="false">Double</button>
-          <button type="button" data-mode="scroll" aria-pressed="false">Continuous</button>
+          <button type="button" data-mode="single" aria-pressed="false" aria-label="Single-page mode" title="Single-page mode"><svg class="reader-mode-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="3" width="10" height="18" rx="1"/></svg><span class="reader-mode-label">Single</span></button>
+          <button type="button" data-mode="double" aria-pressed="false" aria-label="Double-page mode" title="Double-page mode"><svg class="reader-mode-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="9" height="16" rx="1"/><rect x="13" y="4" width="9" height="16" rx="1"/></svg><span class="reader-mode-label">Double</span></button>
+          <button type="button" data-mode="scroll" aria-pressed="false" aria-label="Continuous-scroll mode" title="Continuous-scroll mode"><svg class="reader-mode-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="5" rx="1"/><rect x="5" y="9.5" width="14" height="5" rx="1"/><rect x="5" y="17" width="14" height="5" rx="1"/></svg><span class="reader-mode-label">Continuous</span></button>
         </div>
-        <button class="reader-direction" type="button" data-direction-toggle>Auto</button>
+        <button class="reader-direction" type="button" data-direction-toggle><span class="reader-direction-icon" data-direction-icon aria-hidden="true">↔</span><span class="reader-direction-label" data-direction-label>Auto</span></button>
         <button class="reader-fullscreen" type="button" data-fullscreen aria-label="Toggle fullscreen" title="Toggle fullscreen">⛶</button>
       </header>
 

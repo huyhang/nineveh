@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from conftest import image_bytes, write_cbz
+from PIL import Image
 
 from nineveh.archives import (
     ArchiveChanged,
@@ -14,6 +15,7 @@ from nineveh.archives import (
     ArchiveUnavailable,
     DiskCacheBudget,
     PageCacheService,
+    PageRenditionService,
     PillowThumbnailRenderer,
     ThumbnailService,
 )
@@ -242,3 +244,101 @@ def test_renderer_refuses_an_oversized_image(tmp_path: Path):
     renderer = PillowThumbnailRenderer(max_image_pixels=10)
     with pytest.raises(ArchiveUnavailable):
         renderer.render(BytesIO(image_bytes((1, 2, 3))), tmp_path / "out.webp", 160)
+
+
+# --- PageRenditionService --------------------------------------------------
+
+
+def _wide_library(tmp_path: Path, settings):
+    """A library whose pages are larger than any rendition width."""
+    archive = settings.data_dir / "Main Library" / "comics" / "Big" / "Issue 1.cbz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "w") as handle:
+        for number in (1, 2):
+            handle.writestr(f"{number}.png", image_bytes((10, 20, 30), (2000, 3000)))
+    return archive
+
+
+def _renditions(settings):
+    return PageRenditionService(
+        settings, ArchiveService(settings), PillowThumbnailRenderer(100_000_000)
+    )
+
+
+def test_a_rendition_is_narrower_and_smaller_than_the_original(tmp_path, library):
+    settings, _ = library
+    archive = _wide_library(tmp_path, settings)
+    publication, pages = _scan(settings, archive)
+    settings.rendition_dir.mkdir(parents=True, exist_ok=True)
+
+    path = _renditions(settings).rendition(publication, pages[0], width=640)
+
+    assert path is not None and path.is_file()
+    with Image.open(path) as rendered:
+        assert rendered.width == 640
+        assert rendered.format == "WEBP"
+    assert path.stat().st_size < pages[0].uncompressed_size
+
+
+def test_a_rendition_is_rendered_once_and_then_reused(tmp_path, library):
+    settings, _ = library
+    archive = _wide_library(tmp_path, settings)
+    publication, pages = _scan(settings, archive)
+    settings.rendition_dir.mkdir(parents=True, exist_ok=True)
+    service = _renditions(settings)
+
+    first = service.rendition(publication, pages[0], width=960)
+    assert first == service.rendition(publication, pages[0], width=960)
+
+
+def test_a_page_already_small_enough_is_served_as_the_original(library):
+    settings, archive = library
+    publication, pages = _scan(settings, archive)
+    settings.rendition_dir.mkdir(parents=True, exist_ok=True)
+    # Re-encoding a measured 40x60 page at 640 wide costs bytes and gains
+    # nothing, so the caller is told to serve the original instead.
+    measured = replace(pages[0], width=40, height=60)
+
+    assert _renditions(settings).rendition(publication, measured, width=640) is None
+
+
+def test_a_page_of_unknown_size_is_resized_rather_than_guessed_about(tmp_path, library):
+    """Dimensions are filled in lazily, so a page can arrive unmeasured."""
+    settings, _ = library
+    archive = _wide_library(tmp_path, settings)
+    publication, pages = _scan(settings, archive)
+    settings.rendition_dir.mkdir(parents=True, exist_ok=True)
+    assert pages[0].width is None
+
+    assert _renditions(settings).rendition(publication, pages[0], width=640) is not None
+
+
+def test_renditions_can_be_switched_off_with_a_zero_budget(tmp_path, library):
+    settings, _ = library
+    archive = _wide_library(tmp_path, settings)
+    disabled = replace(settings, rendition_cache_mb=0)
+    publication, pages = _scan(disabled, archive)
+
+    assert _renditions(disabled).rendition(publication, pages[0], width=640) is None
+
+
+@pytest.mark.parametrize("width", [0, 320, 999, 2048])
+def test_an_unsupported_rendition_width_is_refused(library, width):
+    settings, archive = library
+    publication, pages = _scan(settings, archive)
+    with pytest.raises(ValueError):
+        _renditions(settings).rendition(publication, pages[0], width=width)
+
+
+def test_an_unreadable_page_reports_the_archive_as_unavailable(tmp_path, library):
+    settings, _ = library
+    archive = settings.data_dir / "Main Library" / "comics" / "Bad" / "Issue 1.cbz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("1.png", image_bytes((1, 2, 3), (2000, 3000)))
+    publication, pages = _scan(settings, archive)
+    settings.rendition_dir.mkdir(parents=True, exist_ok=True)
+    archive.write_bytes(b"not an archive at all")
+
+    with pytest.raises(ArchiveUnavailable):
+        _renditions(settings).rendition(publication, pages[0], width=640)

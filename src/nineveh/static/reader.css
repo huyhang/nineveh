@@ -9,7 +9,6 @@
   --reader-accent: #ec806d;
   --reader-toolbar-height: 68px;
   --reader-progress-height: 62px;
-  --reader-scroll-page: 980px;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -54,6 +53,8 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .reader-title strong, .reader-title span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reader-title span { margin-top: .2rem; color: var(--reader-muted); font-size: .78rem; }
 .reader-publication-picker select { width: 100%; min-height: 44px; padding: 0 2rem 0 .7rem; overflow: hidden; border: 1px solid var(--reader-line); border-radius: 9px; color: var(--reader-text); background: var(--reader-raised); text-overflow: ellipsis; }
+.reader-publication-icon, .reader-mode-icon, .reader-direction-icon { display: none; }
+.reader-publication-icon, .reader-mode-icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; }
 .reader-volume-nav { display: flex; align-items: center; gap: .3rem; }
 .reader-volume-nav > span { min-width: auto; padding: 0 .35rem; border: 0; color: var(--reader-muted); background: transparent; font-size: .78rem; white-space: nowrap; }
 .reader-volume-nav > span:first-child, .reader-volume-nav > span:last-child { min-width: 44px; color: #67635e; }
@@ -215,14 +216,28 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 .reader-end-actions { display: flex; justify-content: center; gap: .65rem; margin-top: .8rem; }
 .reader-end-actions a, .reader-end-actions button { display: inline-grid; place-items: center; min-height: 44px; padding: .55rem .8rem; border: 0; color: var(--reader-muted); background: transparent; text-decoration: underline; }
 
-.reader-shell.mode-scroll .reader-stage { display: block; padding-inline: 0; }
-.reader-shell.mode-scroll .reader-pages { display: grid; gap: clamp(.25rem, 1vw, .8rem); }
-.reader-shell.mode-scroll .reader-spread { display: block; width: fit-content; max-width: min(100%, var(--reader-scroll-page)); height: auto; }
-/* Twice the single-page width, so each half of a stitched spread is read at
-   the same scale as the pages around it. */
-.reader-shell.mode-scroll .reader-spread.is-stitched { max-width: min(100%, calc(var(--reader-scroll-page) * 2)); }
-.reader-shell.mode-scroll .reader-page { display: block; width: fit-content; max-width: 100%; height: auto; scroll-margin-top: calc(var(--reader-toolbar-height) + .75rem); }
-.reader-shell.mode-scroll .reader-page img { width: auto; max-width: 100%; height: auto; max-height: none; margin: 0 auto; }
+/* Continuous mode keeps only a handful of images loaded, so the box each page
+   occupies has to come from its known dimensions rather than from the image
+   itself. An unloaded `img` has no intrinsic size: sizing off it collapsed
+   released pages to a quarter of their height and moved the whole document
+   under the reader's scroll position. The figure reserves the box instead. */
+.reader-shell.mode-scroll .reader-stage { display: block; }
+.reader-shell.mode-scroll .reader-pages { display: grid; min-width: 0; justify-items: center; gap: clamp(.25rem, 1vw, .8rem); }
+/* The single column has to be explicitly `1fr`. Left to `auto` it is sized by
+   its own content, which makes the page's `100%` width cyclic: the browser
+   falls back to shrink-to-fit and an unloaded page collapses to nothing. */
+.reader-shell.mode-scroll .reader-spread { display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; width: 100%; min-width: 0; height: auto; }
+.reader-shell.mode-scroll .reader-page {
+  --page-ratio: 2 / 3; /* Until the manifest says otherwise. */
+  --page-box: calc(100dvh - var(--reader-toolbar-height) - var(--reader-progress-height) - 2rem);
+  display: block;
+  width: min(100%, calc(var(--page-box) * var(--page-ratio)));
+  aspect-ratio: var(--page-ratio);
+  height: auto;
+  scroll-margin-top: calc(var(--reader-toolbar-height) + .75rem);
+}
+.reader-shell.mode-scroll .reader-page img { display: block; width: 100%; height: 100%; max-width: none; max-height: none; object-fit: contain; margin: 0; }
+.reader-shell.mode-scroll .reader-page img.is-deferred { color: transparent; background: linear-gradient(110deg, #111 25%, #1d1d1d 45%, #111 65%); }
 .reader-shell.mode-scroll .reader-page-nav { display: none; }
 .reader-shell.mode-scroll .reader-end-card { margin: 3rem auto 1rem; }
 
@@ -249,13 +264,22 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
 }
 
 @media (max-width: 640px) {
+  :root { --reader-toolbar-height: 48px; }
+  .reader-toolbar { display: flex; flex-wrap: nowrap; justify-content: center; gap: .2rem; min-height: var(--reader-toolbar-height); padding: .25rem max(.25rem, env(safe-area-inset-right)) .25rem max(.25rem, env(safe-area-inset-left)); }
+  .reader-title { display: none; }
   .reader-back span { display: none; }
-  .reader-back { padding: 0; }
-  .reader-publication-picker select { font-size: .82rem; }
+  .reader-back, .reader-direction, .reader-fullscreen { flex: 0 0 32px; width: 32px; min-width: 32px; min-height: 32px; padding: 0; border-radius: 7px; }
+  .reader-publication-picker { position: relative; display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border: 1px solid var(--reader-line); border-radius: 7px; color: var(--reader-text); background: var(--reader-raised); }
+  .reader-publication-picker:focus-within { outline: 3px solid rgb(236 128 109 / 55%); outline-offset: 2px; }
+  .reader-publication-picker select { position: absolute; inset: 0; width: 100%; min-height: 0; height: 100%; padding: 0; opacity: 0; cursor: pointer; }
+  .reader-publication-icon, .reader-mode-icon, .reader-direction-icon { display: block; }
+  .reader-mode-label, .reader-direction-label { display: none; }
   .reader-volume-nav > span:not(:first-child):not(:last-child) { display: none; }
-  .reader-toolbar { gap: .4rem; padding-inline: max(.5rem, env(safe-area-inset-left)); }
-  .reader-modes { width: 100%; }
-  .reader-modes button { flex: 1; min-width: 0; padding-inline: .35rem; }
+  .reader-volume-nav { flex: 0 0 auto; gap: .1rem; }
+  .reader-volume-nav > a, .reader-volume-nav > span:first-child, .reader-volume-nav > span:last-child { min-width: 32px; min-height: 32px; border-radius: 7px; }
+  .reader-modes { flex: 0 0 auto; gap: .1rem; padding: .1rem; border-radius: 8px; }
+  .reader-modes button { flex: 0 0 28px; width: 28px; min-width: 28px; min-height: 28px; padding: 0; border-radius: 6px; }
+  .reader-direction-icon { font-size: 1.1rem; line-height: 1; }
   .reader-stage { padding-inline: 2.75rem; }
   .reader-page-nav { width: 40px; height: 64px; border-radius: 9px; }
   .reader-page-nav.previous { left: .2rem; }

@@ -7,8 +7,20 @@ import pytest
 from fakes import page, publication
 
 from nineveh.database import SQLiteRepository
-from nineveh.domain import ReadingProgress, ReadScope, ScannedPublication
-from nineveh.reader import ReaderService, publication_order_key, reading_direction
+from nineveh.domain import (
+    ReadingProgress,
+    ReadScope,
+    ScannedPublication,
+    SpreadAnalysis,
+    SpreadGuess,
+)
+from nineveh.reader import (
+    ReaderService,
+    SpreadDetectionService,
+    clamp_anchor,
+    publication_order_key,
+    reading_direction,
+)
 
 
 class ReaderRepositoryStub:
@@ -112,6 +124,144 @@ def test_manga_pairs_read_right_to_left_while_comics_read_left_to_right():
     assert reading_direction("comics") == "ltr"
 
 
+@pytest.mark.parametrize(
+    ("anchor", "page_count", "expected"),
+    [
+        (4, 20, 4),
+        (None, 20, None),
+        (1, 20, 2),  # The cover stands alone, so pairing cannot start before 2.
+        (0, 20, 2),
+        (99, 20, 20),  # A re-scanned volume may be shorter than its stored anchor.
+        (4, 1, None),  # Nothing to pair in a single-page publication.
+    ],
+)
+def test_an_anchor_is_kept_inside_the_volume_it_belongs_to(
+    anchor, page_count, expected
+):
+    assert clamp_anchor(anchor, page_count) == expected
+
+
+class SpreadRepositoryStub:
+    def __init__(self, item, pages):
+        self.item = item
+        self.enabled = True
+        self.override = None
+        self.analysis = None
+        self.items = pages
+
+    def publications_in_series(self, _series_id):
+        return [self.item]
+
+    def publication_spread_analysis(self, _publication_id, revision):
+        current = self.analysis
+        return current if current and current.revision == revision else None
+
+    def pages(self, _publication_id, _start, _end):
+        return self.items
+
+    def update_page_dimensions(self, _publication_id, dimensions):
+        measured = {number: (width, height) for number, width, height in dimensions}
+        self.items = [
+            replace(
+                value,
+                width=measured[value.number][0],
+                height=measured[value.number][1],
+            )
+            if value.number in measured
+            else value
+            for value in self.items
+        ]
+
+    def save_publication_spread_analysis(
+        self, publication_id, revision, anchor, source=None
+    ):
+        self.analysis = SpreadAnalysis(
+            publication_id,
+            revision,
+            "detected" if anchor else "none",
+            anchor,
+            datetime.now(UTC),
+            source,
+        )
+        return self.analysis
+
+    def series_spread_detection(self, _series_id):
+        return self.enabled
+
+    def publication_spread_override(self, _publication_id):
+        return self.override
+
+
+class CountingDetector:
+    def __init__(self, anchor, source="gutter"):
+        self.guess = SpreadGuess(anchor, source if anchor else None)
+        self.calls = 0
+
+    def detect(self, _publication, _pages, direction):
+        self.calls += 1
+        assert direction in {"ltr", "rtl"}
+        return self.guess
+
+
+class MeasuringArchives:
+    def __init__(self):
+        self.calls = 0
+
+    def page_dimensions_many(self, _publication, pages):
+        self.calls += 1
+        return {value.number: (120, 180) for value in pages}
+
+
+def _spread_service(anchor=3, pages=4):
+    item = replace(publication("spread", pages=pages), series_id="series-1")
+    repository = SpreadRepositoryStub(
+        item, [page(number) for number in range(1, pages + 1)]
+    )
+    detector = CountingDetector(anchor)
+    archives = MeasuringArchives()
+    service = SpreadDetectionService(repository, archives, detector)
+    return service, repository, detector, archives, item
+
+
+def test_a_volume_is_measured_and_detected_once_per_revision():
+    service, repository, detector, archives, item = _spread_service()
+
+    service.analyze_series("series-1")
+    assert service.anchor_for(item) == 3
+    assert (detector.calls, archives.calls) == (1, 1)
+    assert repository.items[0].width == 120  # Dimensions persisted for the reader.
+
+    service.analyze_series("series-1")
+    assert (detector.calls, archives.calls) == (1, 1)
+    service.analyze_series("series-1", force=True)
+    assert detector.calls == 2
+
+
+def test_a_disabled_series_reports_no_anchor_at_all():
+    service, repository, detector, _archives, item = _spread_service()
+    repository.enabled = False
+    assert service.anchor_for(item) is None
+    assert detector.calls == 0
+
+
+def test_a_hand_set_start_page_wins_over_detection_without_re_reading_the_archive():
+    service, repository, detector, _archives, item = _spread_service()
+    repository.override = 2
+    assert service.anchor_for(item) == 2
+    assert detector.calls == 0, "an override should not trigger image decoding"
+
+
+def test_a_stale_hand_set_start_page_is_clamped_into_the_volume():
+    service, repository, _detector, _archives, item = _spread_service(pages=4)
+    repository.override = 99
+    assert service.anchor_for(item) == 4
+
+
+def test_detection_that_abstains_leaves_pairing_where_it_was():
+    service, _repository, _detector, _archives, item = _spread_service(anchor=None)
+    assert service.anchor_for(item) is None
+
+
 def test_reader_uses_the_latest_mode_as_the_cross_publication_preference():
     item = _publication("one", "1", "Volume 1")
     repository = ReaderRepositoryStub([item])
@@ -202,3 +352,91 @@ def test_sqlite_progress_is_private_to_each_user(tmp_path):
     assert repository.reading_progress(second_user.id, item.id) is None
     repository.delete_reading_progress(first_user.id, item.id)
     assert repository.reading_progress(first_user.id, item.id) is None
+
+
+def test_sqlite_stores_series_setting_and_revision_bound_spread_result(tmp_path):
+    repository = SQLiteRepository(tmp_path / "nineveh.sqlite3")
+    repository.initialize()
+    item = publication("spread", pages=3)
+    repository.upsert_publication(
+        ScannedPublication(
+            item,
+            (
+                replace(page(1), width=120, height=180),
+                replace(page(2), width=260, height=180),
+                replace(page(3), width=120, height=180),
+            ),
+        )
+    )
+    stored = repository.publication_by_id(item.id)
+    assert stored is not None and stored.series_id
+
+    assert repository.set_series_spread_detection("missing", True) is False
+    assert repository.set_series_spread_detection(stored.series_id, True) is True
+    assert repository.series_spread_detection(stored.series_id) is True
+    assert repository.spread_detection_series_ids() == [stored.series_id]
+
+    analysis = repository.save_publication_spread_analysis(item.id, item.revision, 2)
+    assert (analysis.status, analysis.anchor_page) == ("detected", 2)
+    assert repository.publication_spread_analysis(item.id, "other-revision") is None
+    assert repository.set_series_spread_detection(stored.series_id, False) is True
+    assert repository.series_spread_detection(stored.series_id) is False
+
+
+def test_upgrading_discards_anchors_from_the_old_detector_but_keeps_overrides(
+    tmp_path,
+):
+    """The previous release stored the first wide page as the anchor, which is
+    not where pairing starts. Those rows must be recomputed, not trusted."""
+    from nineveh.database import SEAM_DETECTION_VERSION
+
+    path = tmp_path / "nineveh.sqlite3"
+    repository = SQLiteRepository(path)
+    repository.initialize()
+    item = publication("spread", pages=9)
+    repository.upsert_publication(
+        ScannedPublication(item, tuple(page(number) for number in (1, 2, 3)))
+    )
+    repository.save_publication_spread_analysis(item.id, item.revision, 3)
+    repository.set_publication_spread_override(item.id, 4)
+
+    with repository._connect() as connection:
+        connection.execute(f"PRAGMA user_version = {SEAM_DETECTION_VERSION - 1}")
+    SQLiteRepository(path).initialize()
+
+    assert repository.publication_spread_analysis(item.id, item.revision) is None
+    assert repository.publication_spread_override(item.id) == 4
+
+
+def test_the_detector_that_answered_is_recorded_with_the_anchor():
+    """The panel names the evidence, so the service has to carry it through."""
+    service, repository, _detector, _archives, _item = _spread_service()
+    service.analyze_series("series-1")
+    assert repository.analysis.source == "gutter"
+    assert repository.analysis.anchor_page == 3
+
+
+def test_an_abstention_records_no_evidence():
+    service, repository, _detector, _archives, _item = _spread_service(anchor=None)
+    service.analyze_series("series-1")
+    assert (repository.analysis.status, repository.analysis.source) == ("none", None)
+
+
+def test_sqlite_keeps_the_detection_source_alongside_the_anchor(tmp_path):
+    repository = SQLiteRepository(tmp_path / "nineveh.sqlite3")
+    repository.initialize()
+    item = publication("spread", pages=9)
+    repository.upsert_publication(
+        ScannedPublication(item, tuple(page(number) for number in (1, 2, 3)))
+    )
+
+    saved = repository.save_publication_spread_analysis(
+        item.id, item.revision, 4, "wide page"
+    )
+    assert saved.source == "wide page"
+    reloaded = repository.publication_spread_analysis(item.id, item.revision)
+    assert (reloaded.anchor_page, reloaded.source) == (4, "wide page")
+
+    # An anchor stored by an older release has no evidence recorded.
+    plain = repository.save_publication_spread_analysis(item.id, item.revision, 4)
+    assert plain.source is None

@@ -115,6 +115,50 @@ class SeriesMetadataState:
     edited: bool = False
     failed: bool = False
     fetched_at: datetime | None = None
+    searched_at: datetime | None = None
+    candidate_count: int = 0
+    lookup_error: str | None = None
+    auto_match_status: str | None = None
+    auto_match_detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataAutoMatchJob:
+    id: str
+    library_id: str
+    status: str
+    total: int
+    completed: int
+    linked: int
+    review: int
+    failed: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SpreadAnalysis:
+    publication_id: str
+    revision: str
+    status: str
+    anchor_page: int | None
+    updated_at: datetime
+    # Which detector answered, so an administrator comparing a suspicious
+    # anchor against the volume knows what evidence produced it. `None` on
+    # rows written before detection started recording it.
+    source: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SpreadGuess:
+    """One detector's answer, and what it looked at to get there."""
+
+    anchor: int | None
+    source: str | None = None
+
+    @classmethod
+    def none(cls) -> SpreadGuess:
+        return cls(None, None)
 
 
 @dataclass(frozen=True, slots=True)

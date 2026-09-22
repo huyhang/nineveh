@@ -355,6 +355,69 @@ class ThumbnailService:
         return destination
 
 
+class PageRenditionService:
+    """Screen-sized WebP copies of individual pages, for continuous scroll.
+
+    Scrolling keeps several pages alive at once, and a high-resolution scan
+    costs far more as a decoded bitmap than it does on the wire. Serving a copy
+    no wider than the reader's viewport bounds both. A zero budget switches
+    renditions off, and callers fall back to the original bytes.
+    """
+
+    ALLOWED_WIDTHS: ClassVar[frozenset[int]] = frozenset({640, 960, 1280})
+
+    def __init__(
+        self,
+        settings: Settings,
+        archives: ArchiveService,
+        renderer: ThumbnailRenderer,
+    ) -> None:
+        self._settings = settings
+        self._archives = archives
+        self._renderer = renderer
+        self._slots = threading.BoundedSemaphore(settings.extract_workers)
+        # Striped rather than one global lock: a scroll window asks for several
+        # neighbouring pages at once, and they have no reason to queue.
+        self._locks = tuple(threading.Lock() for _ in range(16))
+        self._budget = DiskCacheBudget(
+            settings.rendition_dir,
+            "*.webp",
+            settings.rendition_cache_mb * 1024 * 1024,
+        )
+
+    def rendition(
+        self, publication: Publication, page: Page, width: int
+    ) -> Path | None:
+        """A page no wider than `width`, or None to serve the original."""
+        if width not in self.ALLOWED_WIDTHS:
+            raise ValueError("rendition width must be 640, 960, or 1280")
+        if self._settings.rendition_cache_mb == 0:
+            return None
+        # Re-encoding a page that is already small buys nothing and can cost
+        # bytes, so the original stays the better answer.
+        if page.width is not None and page.width <= width:
+            return None
+        destination = (
+            self._settings.rendition_dir
+            / publication.id
+            / f"{publication.revision}-{page.number}-{page.crc:08x}-{width}.webp"
+        )
+        if destination.is_file():
+            os.utime(destination, None)  # keep hot pages away from the budget
+            return destination
+        lock = self._locks[hash((publication.id, page.number)) % len(self._locks)]
+        with self._slots, lock:
+            if destination.is_file():
+                return destination
+            try:
+                with self._archives.open_page_file(publication, page) as source:
+                    self._renderer.render(source, destination, width)
+            except (OSError, Image.DecompressionBombError) as error:
+                raise ArchiveUnavailable("page could not be resized") from error
+            self._budget.added(destination, destination.stat().st_size)
+        return destination
+
+
 class PageCacheService:
     """Materializes original pages into a bounded on-disk cache without buffering in RAM."""
 

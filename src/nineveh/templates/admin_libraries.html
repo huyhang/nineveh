@@ -28,6 +28,7 @@
                 {% endfor %}
               {% else %}<p class="muted">No indexed publications yet.</p>{% endif %}
               <div class="card-actions">
+                {% if usage.categories|selectattr('name', 'equalto', 'manga')|list %}<form method="post" action="/admin/libraries/{{ usage.library.id }}/metadata/auto-match" data-confirm="Auto-match every unmatched manga series in {{ usage.library.name }}? Existing links and local edits will be preserved."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit">Auto-match MangaBaka</button></form>{% endif %}
                 <form method="post" action="/admin/libraries/{{ usage.library.id }}/scan"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit" data-scan-lock data-scan-label="Scan library" data-scan-busy-label="Scanning…" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan library" }}</button></form>
                 <form method="post" action="/admin/libraries/{{ usage.library.id }}/remove" data-confirm="Remove {{ usage.library.name }} from Nineveh? Media files will not be deleted."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Remove</button></form>
               </div>

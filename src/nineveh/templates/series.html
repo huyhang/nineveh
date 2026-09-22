@@ -35,6 +35,70 @@
       {% endif %}
     </div>
   </section>
+  {% if spread %}
+    <details class="spread-panel" data-spread-status {% if spread.expanded %}open{% endif %}>
+      <summary>
+        <div class="spread-title">
+          <p class="eyebrow">Admin · Double-page pairing</p>
+          <h2>Spread start</h2>
+          <p class="spread-summary">{{ spread.summary }}</p>
+        </div>
+      </summary>
+      <div class="spread-body">
+        <p class="muted spread-intro">One stray page in the front matter pairs every later spread with the wrong half. Nineveh finds where the real spreads begin — from the printed gutter, or from the first spread the scan left stitched into one wide image — and shifts pairing to match. Archives are never modified.</p>
+        <div class="spread-actions">
+          <form method="post" action="/series/{{ series.id }}/spread-detection">
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+            <input type="hidden" name="enabled" value="{{ 'false' if spread.enabled else 'true' }}">
+            <button class="{{ 'secondary' if spread.enabled else '' }}" type="submit">{% if spread.enabled %}Turn off{% else %}Turn on{% endif %}</button>
+          </form>
+          {% if spread.enabled %}
+            <form method="post" action="/series/{{ series.id }}/spread-detection">
+              <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+              <input type="hidden" name="enabled" value="true">
+              <button class="secondary" type="submit" {% if spread.running %}disabled data-spread-progress{% endif %}>{{ 'Analyzing…' if spread.running else 'Detect again' }}</button>
+            </form>
+          {% endif %}
+        </div>
+        {% if spread.enabled %}
+          <ul class="spread-volumes">
+            {% for volume in spread.volumes %}
+              <li>
+                <span class="spread-volume-name" title="{{ volume.publication.title }}">{{ volume.publication.title }}</span>
+                {% if volume.override %}
+                  <span class="badge accent-badge">Page {{ volume.override }} · by hand</span>
+                {% elif spread.running %}
+                  <span class="badge muted-badge">Analyzing…</span>
+                {% elif volume.shifted %}
+                  <span class="badge muted-badge" title="{% if volume.source == 'gutter' %}Found by matching the printed image across the seam between two pages.{% elif volume.source == 'wide page' %}Anchored on the first spread the scan left stitched into one wide image.{% else %}Detected automatically.{% endif %}">Page {{ volume.detected }} · {{ volume.source or 'detected' }}</span>
+                {% elif volume.analyzed %}
+                  <span class="badge muted-badge">From the cover</span>
+                {% else %}
+                  <span class="badge muted-badge">Not analyzed</span>
+                {% endif %}
+                <form class="spread-override" method="post" action="/publications/{{ volume.publication.id }}/spread-start">
+                  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+                  <label class="sr-only" for="spread-{{ volume.publication.id }}">Start pairing {{ volume.publication.title }} at page</label>
+                  <input id="spread-{{ volume.publication.id }}" name="anchor_page" type="number" min="2" max="{{ volume.publication.page_count }}" value="{{ volume.override or '' }}" placeholder="{{ volume.detected or 'auto' }}" inputmode="numeric">
+                  <button class="secondary" type="submit">Set</button>
+                </form>
+                {% if volume.override %}
+                  <form method="post" action="/publications/{{ volume.publication.id }}/spread-start">
+                    <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+                    <input type="hidden" name="anchor_page" value="">
+                    <button class="link-button spread-reset" type="submit">Reset</button>
+                  </form>
+                {% else %}
+                  <span class="spread-reset" aria-hidden="true"></span>
+                {% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+          <p class="muted spread-note">Leave a volume on <em>auto</em> unless you can see two halves meeting wrongly in double-page mode — then type the first page of the first real spread.</p>
+        {% endif %}
+      </div>
+    </details>
+  {% endif %}
   <section class="volume-section">
     <div class="section-heading"><div><p class="eyebrow">On this server</p><h2>Volumes and issues</h2></div></div>
     <div class="card-grid publication-grid">
@@ -127,3 +191,4 @@
     </div>
   </section>
 {% endblock %}
+{% block scripts %}{% if session.user.is_admin %}<script src="{{ url_for('static', path='admin.js') }}" defer></script>{% endif %}{% endblock %}

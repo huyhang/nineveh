@@ -214,6 +214,38 @@
         "title": "SettingsUpdate",
         "type": "object"
       },
+      "SpreadDetectionInput": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "SpreadDetectionInput",
+        "type": "object"
+      },
+      "SpreadStartInput": {
+        "description": "`null` restores automatic detection for the volume.",
+        "properties": {
+          "page": {
+            "anyOf": [
+              {
+                "minimum": 2.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page"
+          }
+        },
+        "title": "SpreadStartInput",
+        "type": "object"
+      },
       "UserCreate": {
         "properties": {
           "is_admin": {
@@ -537,6 +569,118 @@
         ]
       }
     },
+    "/api/v1/admin/libraries/{library_id}/metadata/auto-match": {
+      "get": {
+        "operationId": "admin_library_metadata_auto_match_status_api_v1_admin_libraries__library_id__metadata_auto_match_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "library_id",
+            "required": true,
+            "schema": {
+              "title": "Library Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admin Library Metadata Auto Match Status Api V1 Admin Libraries  Library Id  Metadata Auto Match Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Admin Library Metadata Auto Match Status",
+        "tags": [
+          "administration"
+        ]
+      },
+      "post": {
+        "operationId": "admin_library_metadata_auto_match_api_v1_admin_libraries__library_id__metadata_auto_match_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "library_id",
+            "required": true,
+            "schema": {
+              "title": "Library Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admin Library Metadata Auto Match Api V1 Admin Libraries  Library Id  Metadata Auto Match Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Admin Library Metadata Auto Match",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
     "/api/v1/admin/libraries/{library_id}/scan": {
       "post": {
         "operationId": "scan_library_api_v1_admin_libraries__library_id__scan_post",
@@ -691,6 +835,82 @@
           }
         ],
         "summary": "Admin Metadata Batch Lookup",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/publications/{publication_id}/spread-start": {
+      "put": {
+        "description": "Pin one volume's pairing start, or send null to restore detection.",
+        "operationId": "admin_publication_spread_start_api_v1_admin_publications__publication_id__spread_start_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpreadStartInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admin Publication Spread Start Api V1 Admin Publications  Publication Id  Spread Start Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Admin Publication Spread Start",
         "tags": [
           "administration"
         ]
@@ -1158,6 +1378,81 @@
           }
         ],
         "summary": "Admin Series Metadata Refresh",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/series/{series_id}/spread-detection": {
+      "post": {
+        "operationId": "admin_series_spread_detection_api_v1_admin_series__series_id__spread_detection_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "series_id",
+            "required": true,
+            "schema": {
+              "title": "Series Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpreadDetectionInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Admin Series Spread Detection Api V1 Admin Series  Series Id  Spread Detection Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Admin Series Spread Detection",
         "tags": [
           "administration"
         ]
@@ -2014,6 +2309,24 @@
               ],
               "title": "Revision"
             }
+          },
+          {
+            "description": "Serve a copy no wider than this instead of the original.",
+            "in": "query",
+            "name": "width",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a copy no wider than this instead of the original.",
+              "title": "Width"
+            }
           }
         ],
         "responses": {
@@ -2081,6 +2394,24 @@
                 }
               ],
               "title": "Revision"
+            }
+          },
+          {
+            "description": "Serve a copy no wider than this instead of the original.",
+            "in": "query",
+            "name": "width",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Serve a copy no wider than this instead of the original.",
+              "title": "Width"
             }
           }
         ],

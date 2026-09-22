@@ -15,6 +15,7 @@ from . import __version__
 from .archives import (
     ArchiveService,
     PageCacheService,
+    PageRenditionService,
     PillowThumbnailRenderer,
     ThumbnailService,
 )
@@ -29,6 +30,7 @@ from .http_web import router as web_router
 from .metadata import (
     MangaBakaProvider,
     MetadataCoverStore,
+    MetadataError,
     MetadataService,
     PersistentRateLimiter,
     UrllibTransport,
@@ -39,11 +41,13 @@ from .ports import (
     CatalogScan,
     CoverSource,
     PageStore,
+    RenditionSource,
     Repository,
     RestartController,
 )
-from .reader import ReaderService
+from .reader import ReaderService, SpreadDetectionService
 from .restart import DisabledRestartController, ProcessRestartController
+from .spreads import LayeredSpreadDetector, SeamSpreadDetector, WidePageDetector
 
 LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +63,7 @@ class Container:
     scanner: CatalogScan
     archives: ArchiveSource
     thumbnails: CoverSource
+    renditions: RenditionSource
     page_cache: PageStore
     opds: OpdsBuilder
     access: AccessService
@@ -67,6 +72,7 @@ class Container:
     restarter: RestartController
     reader: ReaderService
     metadata: MetadataService | None = None
+    spreads: SpreadDetectionService | None = None
 
 
 def build_container(settings: Settings) -> Container:
@@ -79,6 +85,14 @@ def build_container(settings: Settings) -> Container:
     effective = configuration.activate()
     archives = ArchiveService(effective)
     limiter = PersistentRateLimiter(repository, configuration.mangabaka_request_limit)
+    spreads = SpreadDetectionService(
+        repository,
+        archives,
+        LayeredSpreadDetector(
+            SeamSpreadDetector(archives, effective.max_image_pixels),
+            WidePageDetector(),
+        ),
+    )
     return Container(
         settings=effective,
         repository=repository,
@@ -89,6 +103,11 @@ def build_container(settings: Settings) -> Container:
         ),
         archives=archives,
         thumbnails=ThumbnailService(
+            effective,
+            archives,
+            PillowThumbnailRenderer(effective.max_image_pixels),
+        ),
+        renditions=PageRenditionService(
             effective,
             archives,
             PillowThumbnailRenderer(effective.max_image_pixels),
@@ -109,6 +128,7 @@ def build_container(settings: Settings) -> Container:
                 effective.metadata_cover_dir, effective.max_image_pixels
             ),
         ),
+        spreads=spreads,
     )
 
 
@@ -126,6 +146,7 @@ def create_app(
             configured.state_dir,
             configured.thumbnail_dir,
             configured.page_cache_dir,
+            configured.rendition_dir,
             configured.range_dir,
             configured.metadata_cover_dir,
         ):
@@ -147,6 +168,11 @@ def create_app(
                 configured.bootstrap_admin_username,
                 configured.admin_password(),
             )
+        active_job = await asyncio.to_thread(
+            container.repository.active_metadata_auto_match_job
+        )
+        if active_job:
+            application.state.start_metadata_auto_match(active_job.id)
         application.state.start_scan()
         scheduler = asyncio.create_task(_scan_scheduler(application, configured))
         try:
@@ -157,6 +183,7 @@ def create_app(
                 await scheduler
             await _drain_scan(application.state.scan_task)
             await _drain_scan(application.state.metadata_task)
+            await _drain_scan(application.state.spread_task)
             container.archives.close()
 
     application = FastAPI(
@@ -168,6 +195,10 @@ def create_app(
     application.state.container = container
     application.state.scan_task = None
     application.state.metadata_task = None
+    application.state.pending_metadata_job = None
+    application.state.spread_task = None
+    application.state.spread_pending = {}
+    application.state.spread_active = None
     application.state.metadata_status = {
         "running": False,
         "completed": 0,
@@ -183,7 +214,7 @@ def create_app(
         if current is not None and not current.done():
             return False
         application.state.scan_task = asyncio.create_task(
-            _run_scan(container.scanner, library_id)
+            _run_scan(application, library_id)
         )
         return True
 
@@ -205,6 +236,52 @@ def create_app(
         return True
 
     application.state.start_metadata_lookup = start_metadata_lookup
+
+    def start_metadata_auto_match(job_id: str) -> bool:
+        current = application.state.metadata_task
+        if container.metadata is None:
+            return False
+        if current is not None and not current.done():
+            if application.state.pending_metadata_job is not None:
+                return False
+            application.state.pending_metadata_job = job_id
+            return True
+        application.state.metadata_task = asyncio.create_task(
+            _run_metadata_auto_match(application, job_id)
+        )
+        return True
+
+    application.state.start_metadata_auto_match = start_metadata_auto_match
+
+    def start_spread_detection(series_ids: list[str], *, force: bool = False) -> bool:
+        if container.spreads is None:
+            return False
+        for series_id in dict.fromkeys(series_ids):
+            application.state.spread_pending[series_id] = (
+                force or application.state.spread_pending.get(series_id, False)
+            )
+        current = application.state.spread_task
+        if current is not None and not current.done():
+            return True
+        application.state.spread_task = asyncio.create_task(
+            _run_spread_detection(application)
+        )
+        return True
+
+    application.state.start_spread_detection = start_spread_detection
+
+    def spread_detection_running(series_id: str) -> bool:
+        """Whether this one series is queued or being analyzed right now.
+
+        Asking about the shared task instead would make every series page in
+        the library claim to be analyzing whenever any of them was.
+        """
+        return (
+            series_id in application.state.spread_pending
+            or application.state.spread_active == series_id
+        )
+
+    application.state.spread_detection_running = spread_detection_running
 
     @application.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -307,9 +384,10 @@ async def _drain_scan(scan_task: asyncio.Task | None) -> None:
         LOGGER.exception("Catalog scan failed during shutdown")
 
 
-async def _run_scan(scanner: CatalogScan, library_id: str | None = None) -> None:
+async def _run_scan(application: FastAPI, library_id: str | None = None) -> None:
+    container = application.state.container
     try:
-        report = await asyncio.to_thread(scanner.scan, library_id)
+        report = await asyncio.to_thread(container.scanner.scan, library_id)
         LOGGER.info(
             "Catalog scan completed: discovered=%d indexed=%d unchanged=%d removed=%d failed=%d",
             report.discovered,
@@ -318,6 +396,11 @@ async def _run_scan(scanner: CatalogScan, library_id: str | None = None) -> None
             report.removed,
             report.failed,
         )
+        series_ids = await asyncio.to_thread(
+            container.repository.spread_detection_series_ids
+        )
+        if series_ids:
+            application.state.start_spread_detection(series_ids)
     except Exception:
         LOGGER.exception("Background catalog scan failed")
 
@@ -341,6 +424,88 @@ async def _run_metadata_lookup(application: FastAPI, series_ids: list[str]) -> N
             application.state.metadata_status["completed"] += 1
     finally:
         application.state.metadata_status["running"] = False
+        pending_job = application.state.pending_metadata_job
+        application.state.pending_metadata_job = None
+        if pending_job:
+            await _run_metadata_auto_match(application, pending_job)
+
+
+async def _run_metadata_auto_match(application: FastAPI, job_id: str) -> None:
+    container = application.state.container
+    completed_normally = False
+    try:
+        series_ids = await asyncio.to_thread(
+            container.repository.pending_metadata_auto_match_series, job_id
+        )
+        for series_id in series_ids:
+            series = await asyncio.to_thread(
+                container.repository.catalog_series_by_id, series_id
+            )
+            if not series or series.category.casefold() != "manga":
+                await asyncio.to_thread(
+                    container.repository.finish_metadata_auto_match_item,
+                    job_id,
+                    series_id,
+                    "failed",
+                    "Manga series no longer exists",
+                )
+                continue
+            try:
+                result = await asyncio.to_thread(container.metadata.auto_match, series)
+            except Exception as error:
+                LOGGER.exception("Metadata auto-match failed for series %s", series_id)
+                detail = (
+                    str(error)
+                    if isinstance(error, MetadataError)
+                    else "Unexpected metadata error"
+                )
+                lookup = await asyncio.to_thread(
+                    container.repository.metadata_lookup, series_id
+                )
+                if lookup.error != detail:
+                    await asyncio.to_thread(
+                        container.repository.replace_metadata_lookup,
+                        series_id,
+                        list(lookup.candidates),
+                        detail,
+                    )
+                await asyncio.to_thread(
+                    container.repository.finish_metadata_auto_match_item,
+                    job_id,
+                    series_id,
+                    "failed",
+                    detail,
+                )
+                continue
+            await asyncio.to_thread(
+                container.repository.finish_metadata_auto_match_item,
+                job_id,
+                series_id,
+                result.status,
+                result.detail,
+            )
+        completed_normally = True
+    finally:
+        if completed_normally:
+            await asyncio.to_thread(
+                container.repository.complete_metadata_auto_match_job, job_id
+            )
+
+
+async def _run_spread_detection(application: FastAPI) -> None:
+    service = application.state.container.spreads
+    if service is None:
+        return
+    while application.state.spread_pending:
+        series_id = next(iter(application.state.spread_pending))
+        force = application.state.spread_pending.pop(series_id)
+        application.state.spread_active = series_id
+        try:
+            await asyncio.to_thread(service.analyze_series, series_id, force=force)
+        except Exception:
+            LOGGER.exception("Spread detection failed for series %s", series_id)
+        finally:
+            application.state.spread_active = None
 
 
 async def _scan_scheduler(application: FastAPI, settings: Settings) -> None:

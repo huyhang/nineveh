@@ -54,6 +54,21 @@ class FakeCovers:
         return self._path
 
 
+class FakeRenditions:
+    """A `RenditionSource` that always defers to the original page."""
+
+    def __init__(self) -> None:
+        self.requested: list[tuple[int, int]] = []
+
+    def rendition(
+        self, publication: Publication, page: Page, width: int
+    ) -> Path | None:
+        if width not in {640, 960, 1280}:
+            raise ValueError("rendition width must be 640, 960, or 1280")
+        self.requested.append((page.number, width))
+        return None
+
+
 class FakePageStore:
     """A `PageStore` that never caches, so responses take the streaming path."""
 

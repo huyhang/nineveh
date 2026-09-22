@@ -1,5 +1,6 @@
 import {
   READING_MODES,
+  activeImageNumbers,
   adjacentPage,
   clampPage,
   groupForPage,
@@ -13,6 +14,12 @@ import {
 // explicit override, remembered per browser.
 const DIRECTION_CYCLE = ["auto", "ltr", "rtl"];
 const DIRECTION_LABELS = { auto: "Auto", ltr: "LTR", rtl: "RTL" };
+const DIRECTION_ICONS = { auto: "↔", ltr: "→", rtl: "←" };
+// Screen-sized page copies the server can produce, smallest first.
+const RENDITION_WIDTHS = [640, 960, 1280];
+// How long the reader has to stay on one page before it is upgraded from
+// its screen-sized copy to the original.
+const SETTLE_UPGRADE_MS = 500;
 
 class ReaderController {
   constructor(root, dependencies = {}) {
@@ -25,6 +32,8 @@ class ReaderController {
     this.observer = null;
     this.endObserver = null;
     this.saveTimer = null;
+    this.settleTimer = null;
+    this.renditionTarget = null;
     this.retryTimer = null;
     this.chromeTimer = null;
     this.renderVersion = 0;
@@ -33,6 +42,7 @@ class ReaderController {
     this.forcePair = false;
     this.finished = false;
     this.visiblePageNumbers = [];
+    this.pairingAnchor = null;
     this.elements = this.findElements();
     this.portraitPhone = window.matchMedia(
       "(max-width: 640px) and (orientation: portrait)",
@@ -62,6 +72,8 @@ class ReaderController {
       savedMessage: find("[data-saved-message]"),
       picker: find("[data-publication-picker]"),
       direction: find("[data-direction-toggle]"),
+      directionIcon: find("[data-direction-icon]"),
+      directionLabel: find("[data-direction-label]"),
       fullscreen: find("[data-fullscreen]"),
       stage: find("[data-reader-stage]"),
       modes: [...this.root.querySelectorAll("[data-mode]")],
@@ -154,7 +166,8 @@ class ReaderController {
     this.root.classList.toggle("direction-rtl", effective === "rtl");
     this.root.classList.toggle("direction-ltr", effective !== "rtl");
     this.elements.slider.dir = effective;
-    this.elements.direction.textContent = DIRECTION_LABELS[this.direction];
+    this.elements.directionLabel.textContent = DIRECTION_LABELS[this.direction];
+    this.elements.directionIcon.textContent = DIRECTION_ICONS[this.direction];
     this.elements.direction.dataset.explicit = String(explicit);
     const label = explicit
       ? `Reading ${spelled}. Change reading direction.`
@@ -249,6 +262,7 @@ class ReaderController {
       this.forcePair = false;
       if (this.state.mode === "double") this.perform(() => this.render());
     });
+    window.addEventListener("resize", () => this.refitContinuousWindow());
     window.addEventListener("online", () => this.saveRemote());
     window.addEventListener("pagehide", () => this.saveRemote(true));
     document.addEventListener("visibilitychange", () => {
@@ -286,6 +300,9 @@ class ReaderController {
       throw new Error(message);
     }
     const manifest = await response.json();
+    if (Object.hasOwn(manifest, "pairingAnchor")) {
+      this.pairingAnchor = Number(manifest.pairingAnchor);
+    }
     for (const page of manifest.pages) this.pages.set(page.number, page);
     return manifest;
   }
@@ -361,6 +378,7 @@ class ReaderController {
       pages,
       this.state.page,
       this.isAdaptiveSingle(),
+      this.pairingAnchor,
     );
     if (this.state.mode === "double" && !this.isAdaptiveSingle() && visible.length) {
       this.state.page = visible[0].number;
@@ -377,7 +395,10 @@ class ReaderController {
     this.elements.pages.replaceChildren(spread);
     this.elements.pages.hidden = this.finished;
     this.elements.endCard.hidden = !this.finished;
-    const group = groupForPage(pageGroups(pages), this.state.page);
+    const group = groupForPage(
+      pageGroups(pages, this.pairingAnchor),
+      this.state.page,
+    );
     const adaptedPair = this.isAdaptiveSingle() && group && group.length === 2;
     const stitchedOnPortrait = this.portraitPhone.matches
       && visible.length === 1
@@ -399,7 +420,13 @@ class ReaderController {
       spread.className = "reader-spread";
       spread.classList.toggle("is-stitched", isStitched(page));
       spread.dataset.page = String(page.number);
-      spread.append(this.pageFigure(page, page.number !== this.state.page));
+      spread.append(
+        this.pageFigure(
+          page,
+          page.number !== this.state.page,
+          page.number === this.state.page,
+        ),
+      );
       fragment.append(spread);
     }
     this.elements.pages.replaceChildren(fragment);
@@ -407,6 +434,9 @@ class ReaderController {
     this.elements.endCard.hidden = false;
     this.elements.adaptiveNote.hidden = true;
     this.visiblePageNumbers = [this.state.page];
+    this.renditionTarget = this.renditionWidth();
+    this.updateContinuousWindow(this.state.page);
+    this.scheduleFullResolution(this.state.page);
     this.observeContinuousPages();
     requestAnimationFrame(() => {
       this.elements.pages
@@ -415,12 +445,13 @@ class ReaderController {
     });
   }
 
-  pageFigure(page, lazy) {
+  pageFigure(page, lazy, load = true) {
     const figure = document.createElement("figure");
     figure.className = "reader-page";
     figure.dataset.pageNumber = String(page.number);
     const image = document.createElement("img");
-    image.src = page.href;
+    image.dataset.href = page.href;
+    if (load) this.attachImage(image, page);
     image.alt = `Page ${page.number} of ${this.totalPages}`;
     // Without this the browser starts its own image drag, which fires
     // `pointercancel` and swallows the swipe before it can turn the page.
@@ -433,12 +464,36 @@ class ReaderController {
       // An explicit ratio is what lets a width limit shrink the height, and a
       // height limit shrink the width, instead of one of them letterboxing.
       image.style.aspectRatio = `${page.width} / ${page.height}`;
+      // The figure reserves the same box whether or not the image is loaded,
+      // so releasing a distant page never collapses the document around it.
+      figure.style.setProperty("--page-ratio", `${page.width} / ${page.height}`);
     }
-    image.addEventListener("error", () =>
-      this.showError(new Error(`Page ${page.number} could not be loaded.`)),
-    );
+    image.classList.toggle("is-deferred", !load);
+    image.addEventListener("load", () => image.classList.remove("is-deferred"));
+    image.addEventListener("error", () => {
+      if (image.hasAttribute("src")) {
+        this.showError(new Error(`Page ${page.number} could not be loaded.`));
+      }
+    });
     figure.append(image);
     return figure;
+  }
+
+  // Continuous scroll asks for a copy no wider than the viewport can show.
+  // Capping the device ratio at two keeps a phone from demanding the largest
+  // rendition for a screen that cannot resolve it.
+  renditionWidth() {
+    const available = this.elements.pages.clientWidth || 0;
+    if (!available) return null;
+    const wanted = available * Math.min(window.devicePixelRatio || 1, 2);
+    return RENDITION_WIDTHS.find((width) => width >= wanted) ?? null;
+  }
+
+  attachImage(image, page) {
+    const width = this.state.mode === "scroll" ? this.renditionWidth() : null;
+    const source = width ? `${page.href}&width=${width}` : page.href;
+    image.dataset.rendition = width ? String(width) : "";
+    if (image.getAttribute("src") !== source) image.src = source;
   }
 
   observeContinuousPages() {
@@ -447,6 +502,8 @@ class ReaderController {
         const visible = entries.find((entry) => entry.isIntersecting);
         if (!visible) return;
         const page = Number(visible.target.dataset.page);
+        this.updateContinuousWindow(page);
+        this.scheduleFullResolution(page);
         if (page !== this.state.page) this.recordPage(page);
       },
       { rootMargin: "-46% 0px -46% 0px", threshold: 0 },
@@ -463,7 +520,68 @@ class ReaderController {
     this.endObserver.observe(this.elements.endCard);
   }
 
+  updateContinuousWindow(pageNumber) {
+    const active = activeImageNumbers(pageNumber, this.totalPages);
+    const width = this.renditionWidth();
+    for (const image of this.elements.pages.querySelectorAll("img[data-href]")) {
+      const number = Number(image.closest("[data-page]")?.dataset.page);
+      if (!active.has(number)) {
+        // Dropping the source releases the decoded bitmap. The figure keeps
+        // its reserved box, so nothing above or below the reader moves.
+        if (image.hasAttribute("src")) {
+          image.removeAttribute("src");
+          image.dataset.rendition = "";
+          image.classList.add("is-deferred");
+        }
+        continue;
+      }
+      // A page already shown at full detail is left alone: re-requesting a
+      // smaller copy of what the reader is looking at would be a downgrade.
+      const current = image.dataset.rendition;
+      if (image.hasAttribute("src") && (current === "" || current === String(width))) {
+        continue;
+      }
+      const page = this.pages.get(number);
+      if (page) this.attachImage(image, page);
+      image.classList.remove("is-deferred");
+    }
+  }
+
+  // Growing the window leaves the live pages at a copy too small for it. The
+  // boxes are sized by CSS either way, so this only affects sharpness.
+  refitContinuousWindow() {
+    if (this.state.mode !== "scroll") return;
+    const width = this.renditionWidth();
+    if (width === this.renditionTarget) return;
+    this.renditionTarget = width;
+    this.updateContinuousWindow(this.state.page);
+  }
+
+  // Once the reader settles, quietly replace the settled page's screen-sized
+  // copy with the original. Preloading off-screen means a failure leaves the
+  // readable copy in place instead of raising the reader-wide error card.
+  scheduleFullResolution(pageNumber) {
+    window.clearTimeout(this.settleTimer);
+    this.settleTimer = window.setTimeout(() => {
+      const image = this.elements.pages.querySelector(
+        `[data-page="${pageNumber}"] img[data-href]`,
+      );
+      if (!image || this.state.mode !== "scroll") return;
+      if (this.state.page !== pageNumber || !image.dataset.rendition) return;
+      const full = new Image();
+      full.addEventListener("load", () => {
+        if (image.isConnected && image.dataset.rendition) {
+          image.src = image.dataset.href;
+          image.dataset.rendition = "";
+        }
+      });
+      full.src = image.dataset.href;
+    }, SETTLE_UPGRADE_MS);
+  }
+
   disconnectObservers() {
+    window.clearTimeout(this.settleTimer);
+    this.settleTimer = null;
     this.observer?.disconnect();
     this.endObserver?.disconnect();
     this.observer = null;
@@ -486,6 +604,7 @@ class ReaderController {
       direction,
       this.isAdaptiveSingle(),
       this.totalPages,
+      this.pairingAnchor,
     );
     if (target === null) {
       if (direction > 0) this.showEndCard();
@@ -510,6 +629,7 @@ class ReaderController {
       const target = this.elements.pages.querySelector(
         `[data-page="${this.state.page}"]`,
       );
+      this.updateContinuousWindow(this.state.page);
       target?.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "start" });
       this.recordPage(this.state.page);
       return;

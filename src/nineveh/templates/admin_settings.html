@@ -15,6 +15,7 @@
         <label>Open archive cache <input name="archive_cache_size" type="number" min="0" max="128" value="{{ settings.archive_cache_size }}" required></label>
         <label>Thumbnail cache <span class="input-unit"><input name="thumbnail_cache_mb" type="number" min="1" value="{{ settings.thumbnail_cache_mb }}" required><span>MiB</span></span></label>
         <label>Page cache <span class="input-unit"><input name="page_cache_mb" type="number" min="0" value="{{ settings.page_cache_mb }}" required><span>MiB</span></span></label>
+        <label>Scroll rendition cache <span class="input-unit"><input name="rendition_cache_mb" type="number" min="0" value="{{ settings.rendition_cache_mb }}" required><span>MiB</span></span></label>
       </div>
       <div class="settings-group metadata-settings"><h3>MangaBaka</h3>
         <label>Requests per minute <input name="mangabaka_requests_per_minute" type="number" min="1" max="30" value="{{ settings.mangabaka_requests_per_minute }}" required></label>

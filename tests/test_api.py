@@ -398,3 +398,35 @@ def test_responses_carry_the_hardening_headers(client: TestClient):
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+
+
+def test_a_page_is_served_at_a_screen_size_until_it_is_known_to_be_small(
+    client: TestClient, publication_id: str
+):
+    """Continuous scroll asks for a bounded width. Before the reader has
+    measured a volume the server resizes on request; once dimensions are
+    stored it can tell that resizing a small page would only cost bytes."""
+    base = f"/api/v1/publications/{publication_id}/pages"
+
+    plain = client.get(f"{base}/2", headers=authorization())
+    sized = client.get(f"{base}/2?width=640", headers=authorization())
+    assert sized.status_code == 200
+    assert sized.headers["content-type"] == "image/webp"
+    # Two views of the same page must not share an ETag, or a browser holding
+    # the small copy would never fetch the full one.
+    assert sized.headers["etag"] != plain.headers["etag"]
+
+    # The manifest measures every page and stores the result.
+    client.get(base, headers=authorization())
+    settled = client.get(f"{base}/2?width=640", headers=authorization())
+    assert settled.content == plain.content
+
+
+def test_an_unsupported_page_width_is_refused(client: TestClient, publication_id: str):
+    assert (
+        client.get(
+            f"/api/v1/publications/{publication_id}/pages/1?width=999",
+            headers=authorization(),
+        ).status_code
+        == 422
+    )

@@ -34,6 +34,7 @@ class Settings:
         "archive_cache_size": (0, 128),
         "thumbnail_cache_mb": (1, 1024 * 1024),
         "page_cache_mb": (0, 1024 * 1024),
+        "rendition_cache_mb": (0, 1024 * 1024),
         "hash_workers": (1, 32),
         "extract_workers": (1, 32),
         "max_image_pixels": (1, 1_000_000_000),
@@ -64,6 +65,9 @@ class Settings:
     max_image_pixels: int = 200_000_000
     thumbnail_cache_mb: int = 512
     page_cache_mb: int = 1024
+    # Screen-sized copies of pages for continuous scroll. Zero turns them
+    # off and the reader falls back to the original images.
+    rendition_cache_mb: int = 512
     # Concurrency ceilings for the two CPU/memory-heavy code paths. Each password
     # hash holds ~19 MiB for the duration of the Argon2id verification, and each
     # extraction slot streams one page into the cache.
@@ -108,6 +112,7 @@ class Settings:
             max_image_pixels=_int_env("NINEVEH_MAX_IMAGE_PIXELS", 200_000_000, 1),
             thumbnail_cache_mb=_int_env("NINEVEH_THUMBNAIL_CACHE_MB", 512, 1),
             page_cache_mb=_int_env("NINEVEH_PAGE_CACHE_MB", 1024, 0),
+            rendition_cache_mb=_int_env("NINEVEH_RENDITION_CACHE_MB", 512, 0),
             hash_workers=_int_env("NINEVEH_HASH_WORKERS", 2, 1),
             extract_workers=_int_env("NINEVEH_EXTRACT_WORKERS", 2, 1),
             bootstrap_admin_username=os.getenv("NINEVEH_ADMIN_USERNAME", "admin"),
@@ -165,6 +170,10 @@ class Settings:
         return self.state_dir / "page-cache"
 
     @property
+    def rendition_dir(self) -> Path:
+        return self.state_dir / "renditions"
+
+    @property
     def range_dir(self) -> Path:
         """Scratch space for generated page-range archives.
 
@@ -199,7 +208,7 @@ class SettingsService:
     Only a value that actually differs from the deployment default is persisted.
     That keeps `docker/.env` authoritative for everything an administrator has
     not deliberately pinned in the UI — saving one field must not silently
-    freeze the other eleven at whatever they happened to be that day.
+    freeze the other twelve at whatever they happened to be that day.
     """
 
     def __init__(self, defaults: Settings, store: SettingsStore) -> None:

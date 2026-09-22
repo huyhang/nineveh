@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from conftest import ADMIN_PASSWORD, READER_PASSWORD, authorization
 from fakes import publication
 from fastapi.testclient import TestClient
@@ -118,6 +119,147 @@ def test_a_publication_opens_in_the_browser_reader(
         if link.startswith("/series/")
     )
     assert f"/read/{publication_id}" in client.get(series_url).text
+
+
+def _await_spread_analysis(client: TestClient) -> None:
+    task = client.app.state.spread_task
+    for _ in range(300):
+        if task is None or task.done():
+            return
+        time.sleep(0.01)
+    raise AssertionError("spread analysis never finished")
+
+
+def _manifest_anchor(client: TestClient, publication_id: str):
+    manifest = client.get(
+        f"/api/v1/publications/{publication_id}/pages", headers=authorization()
+    ).json()
+    return manifest.get("pairingAnchor")
+
+
+def test_admin_turns_on_spread_alignment_and_sees_a_row_for_every_volume(
+    client: TestClient, publication_id: str
+):
+    container = client.app.state.container
+    item = container.repository.publication_by_id(publication_id)
+    assert item is not None and item.series_id
+
+    enabled = client.post(
+        f"/api/v1/admin/series/{item.series_id}/spread-detection",
+        headers=authorization(),
+        json={"enabled": True},
+    )
+    assert enabled.status_code == 200
+    assert enabled.json() == {"enabled": True, "analysisStarted": True}
+    _await_spread_analysis(client)
+
+    # Nothing in this archive is misaligned, so detection must leave it alone.
+    assert _manifest_anchor(client, publication_id) is None
+
+    _login(client)
+    page = client.get(f"/series/{item.series_id}").text
+    assert "Spread start" in page
+    assert "data-spread-status" in page
+    assert "/static/admin.js" in page
+    assert f"/publications/{publication_id}/spread-start" in page
+    assert "From the cover" in page
+
+    csrf = _csrf(client, f"/series/{item.series_id}")
+    disabled = client.post(
+        f"/series/{item.series_id}/spread-detection",
+        data={"csrf_token": csrf, "enabled": "false"},
+        follow_redirects=True,
+    )
+    assert "Automatic spread alignment disabled" in disabled.text
+
+
+def test_admin_pins_one_volume_start_page_and_then_hands_it_back(
+    client: TestClient, publication_id: str
+):
+    container = client.app.state.container
+    item = container.repository.publication_by_id(publication_id)
+    client.post(
+        f"/api/v1/admin/series/{item.series_id}/spread-detection",
+        headers=authorization(),
+        json={"enabled": True},
+    )
+    _await_spread_analysis(client)
+    _login(client)
+    series_url = f"/series/{item.series_id}"
+
+    csrf = _csrf(client, series_url)
+    pinned = client.post(
+        f"/publications/{publication_id}/spread-start",
+        data={"csrf_token": csrf, "anchor_page": "2"},
+        follow_redirects=True,
+    )
+    assert "pairs from page 2" in pinned.text
+    assert "by hand" in pinned.text
+    assert _manifest_anchor(client, publication_id) == 2
+
+    cleared = client.post(
+        f"/publications/{publication_id}/spread-start",
+        data={"csrf_token": _csrf(client, series_url), "anchor_page": ""},
+        follow_redirects=True,
+    )
+    assert "back to automatic detection" in cleared.text
+    assert _manifest_anchor(client, publication_id) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("1", "must be between 2"),
+        ("0", "must be between 2"),
+        ("4000", "must be between 2"),
+        ("two", "whole number"),
+    ],
+)
+def test_an_impossible_start_page_is_refused_with_a_reason(
+    client: TestClient, publication_id: str, value: str, message: str
+):
+    _login(client)
+    container = client.app.state.container
+    item = container.repository.publication_by_id(publication_id)
+    response = client.post(
+        f"/publications/{publication_id}/spread-start",
+        data={
+            "csrf_token": _csrf(client, f"/series/{item.series_id}"),
+            "anchor_page": value,
+        },
+        follow_redirects=True,
+    )
+    assert message in response.text
+    assert _manifest_anchor(client, publication_id) is None
+
+
+def test_the_spread_panel_is_hidden_from_readers(client: TestClient, reader: dict):
+    container = client.app.state.container
+    _login(client)
+    series_id = container.repository.catalog_series()[0].id
+    assert "Spread start" in client.get(f"/series/{series_id}").text
+    client.post("/logout", data={"csrf_token": _csrf(client, "/")})
+    _login(client, "reader", READER_PASSWORD)
+    assert "Spread start" not in client.get(f"/series/{series_id}").text
+
+
+def test_pinning_a_start_page_needs_an_administrator_and_a_token(
+    client: TestClient, publication_id: str, reader: dict
+):
+    _login(client, "reader", READER_PASSWORD)
+    forbidden = client.post(
+        f"/publications/{publication_id}/spread-start",
+        data={"csrf_token": _csrf(client, "/"), "anchor_page": "2"},
+    )
+    assert forbidden.status_code == 403
+    client.post("/logout", data={"csrf_token": _csrf(client, "/")})
+    _login(client)
+    forged = client.post(
+        f"/publications/{publication_id}/spread-start",
+        data={"csrf_token": "forged", "anchor_page": "2"},
+    )
+    assert forged.status_code == 403
+    assert _manifest_anchor(client, publication_id) is None
 
 
 def test_reader_progress_is_csrf_protected_and_restored(
@@ -305,6 +447,74 @@ def test_reader_styles_honour_the_reading_direction(client: TestClient):
         ".reader-shell.direction-rtl .reader-page-nav.next",
     ):
         assert rule in stylesheet, rule
+
+
+def _rule(stylesheet: str, selector: str) -> str:
+    """The declarations of one rule, whitespace-collapsed.
+
+    Asserting on a parsed rule rather than a literal line keeps these checks
+    from failing the next time the stylesheet is reformatted.
+    """
+    body = stylesheet.split(selector + " {", 1)
+    assert len(body) == 2, f"no rule for {selector}"
+    return re.sub(r"\s+", " ", body[1].split("}", 1)[0]).strip()
+
+
+def test_continuous_mode_reserves_every_page_box_from_its_known_ratio(
+    client: TestClient,
+):
+    """A released page has no intrinsic size, so the box has to be reserved by
+    the figure. Sizing off the image collapsed distant pages to a quarter of
+    their height and moved the document under the reader."""
+    stylesheet = client.get("/static/reader.css").text
+    figure = _rule(stylesheet, ".reader-shell.mode-scroll .reader-page")
+    assert "aspect-ratio: var(--page-ratio)" in figure
+    assert "--page-ratio:" in figure, "needs a fallback before the manifest lands"
+    assert "width: min(100%" in figure
+
+    spread = _rule(stylesheet, ".reader-shell.mode-scroll .reader-spread")
+    # An auto-sized grid column makes the figure's own `100%` cyclic, and the
+    # browser silently falls back to shrink-to-fit -- which is the collapse.
+    assert "grid-template-columns: minmax(0, 1fr)" in spread
+
+    image = _rule(stylesheet, ".reader-shell.mode-scroll .reader-page img")
+    assert "width: 100%" in image and "height: 100%" in image
+    assert "object-fit: contain" in image
+
+    script = client.get("/static/reader.js").text
+    assert "--page-ratio" in script, "the ratio has to come from the manifest"
+    assert 'image.removeAttribute("src")' in script, "distant pages must be released"
+
+
+def test_the_reader_asks_for_screen_sized_pages_and_upgrades_the_settled_one(
+    client: TestClient,
+):
+    script = client.get("/static/reader.js").text
+    assert "RENDITION_WIDTHS" in script
+    assert "&width=" in script
+    assert "devicePixelRatio" in script
+    assert "scheduleFullResolution" in script
+
+
+def test_the_phone_toolbar_is_one_row_that_neither_wraps_nor_hides_controls(
+    client: TestClient,
+):
+    stylesheet = client.get("/static/reader.css").text
+    narrow = stylesheet.split("@media (max-width: 640px)", 1)[1]
+    toolbar = _rule(narrow, ".reader-toolbar")
+    assert "flex-wrap: nowrap" in toolbar
+    assert "overflow-x: auto" not in toolbar, (
+        "controls must fit, not hide behind a swipe"
+    )
+    assert "--reader-toolbar-height: 48px" in narrow
+    assert ".reader-mode-label, .reader-direction-label { display: none; }" in narrow
+
+
+def test_the_series_page_polls_only_while_an_analysis_is_running(client: TestClient):
+    admin_script = client.get("/static/admin.js").text
+    assert "pollSpreadStatus" in admin_script
+    assert "current.replaceWith(fresh)" in admin_script
+    assert "data-spread-progress" in admin_script
 
 
 def test_the_overview_reports_what_the_last_scan_found(client: TestClient):
@@ -899,3 +1109,116 @@ def test_the_last_scan_time_reads_as_a_phrase_not_an_iso_string(client: TestClie
     assert f'datetime="{completed}"' in page
     assert re.search(r">(just now|\d+ seconds? ago)</time>", page)
     assert re.search(r'title="\d{2} \w{3} \d{4}, \d{2}:\d{2} UTC"', page)
+
+
+def test_a_detected_shift_and_a_plain_volume_read_differently(
+    client: TestClient, publication_id: str
+):
+    """Pairing from page two is the default, so reporting it as a detection
+    would tell an administrator nothing."""
+    container = client.app.state.container
+    item = container.repository.publication_by_id(publication_id)
+    container.repository.set_series_spread_detection(item.series_id, True)
+    _login(client)
+
+    container.repository.save_publication_spread_analysis(
+        publication_id, item.revision, 2
+    )
+    assert "From the cover" in client.get(f"/series/{item.series_id}").text
+
+    container.repository.save_publication_spread_analysis(
+        publication_id, item.revision, 3
+    )
+    assert "Page 3" in client.get(f"/series/{item.series_id}").text
+
+
+def test_a_long_series_keeps_the_spread_panel_folded_away(
+    client: TestClient, publication_id: str
+):
+    """The panel sits above the volume grid, so a long series has to start it
+    closed rather than push the volumes the page is about off the screen."""
+    from nineveh.http_web import SPREAD_PANEL_OPEN_LIMIT, _spread_panel
+
+    container = client.app.state.container
+    item = container.repository.publication_by_id(publication_id)
+    container.repository.set_series_spread_detection(item.series_id, True)
+    _login(client)
+
+    short = client.get(f"/series/{item.series_id}").text
+    assert "<details" in short and "open>" in short
+
+    many = [item] * (SPREAD_PANEL_OPEN_LIMIT + 1)
+    panel = _spread_panel(container, item.series_id, many)
+    assert panel["expanded"] is False
+    assert panel["summary"].startswith(f"{len(many)} volumes")
+
+    few = [item] * SPREAD_PANEL_OPEN_LIMIT
+    assert _spread_panel(container, item.series_id, few)["expanded"] is True
+
+
+@pytest.mark.parametrize(
+    ("enabled", "anchors", "expected"),
+    [
+        (False, [], "Off · every volume pairs from the cover"),
+        (True, [(None, None, True)], "1 volume · nothing misaligned"),
+        (True, [(33, None, True), (None, None, True)], "2 volumes · 1 shifted"),
+        (True, [(None, 9, True)], "1 volume · 1 set by hand"),
+        (True, [(None, None, False)], "1 volume · 1 not analyzed"),
+    ],
+)
+def test_the_collapsed_panel_says_what_is_inside_it(enabled, anchors, expected):
+    from nineveh.http_web import _spread_summary
+
+    volumes = [
+        {
+            "detected": detected,
+            "override": override,
+            "analyzed": analyzed,
+            "shifted": bool(detected and detected > 2),
+        }
+        for detected, override, analyzed in anchors
+    ]
+    assert _spread_summary(enabled, volumes) == expected
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("gutter", "Page 3 · gutter"),
+        ("wide page", "Page 3 · wide page"),
+        (None, "Page 3 · detected"),
+    ],
+)
+def test_the_panel_names_whatever_evidence_produced_an_anchor(
+    client: TestClient, publication_id: str, source, expected
+):
+    container = client.app.state.container
+    item = container.repository.publication_by_id(publication_id)
+    container.repository.set_series_spread_detection(item.series_id, True)
+    container.repository.save_publication_spread_analysis(
+        publication_id, item.revision, 3, source
+    )
+    _login(client)
+
+    assert expected in client.get(f"/series/{item.series_id}").text
+
+
+def test_a_hand_set_page_says_so_instead_of_naming_a_detector(
+    client: TestClient, publication_id: str
+):
+    container = client.app.state.container
+    item = container.repository.publication_by_id(publication_id)
+    container.repository.set_series_spread_detection(item.series_id, True)
+    container.repository.save_publication_spread_analysis(
+        publication_id, item.revision, 3, "gutter"
+    )
+    container.repository.set_publication_spread_override(publication_id, 2)
+    _login(client)
+
+    page = client.get(f"/series/{item.series_id}").text
+    assert "Page 2 · by hand" in page
+    # The explanatory copy mentions the gutter; the row itself must not claim
+    # a detector produced a number an administrator typed.
+    row = page.split('class="spread-volumes"', 1)[1].split("</ul>", 1)[0]
+    assert "gutter" not in row
+    assert "Page 3" not in row
