@@ -22,8 +22,9 @@ from fastapi.templating import Jinja2Templates
 from .auth import AuthenticationError, InvalidUserInput, LastAdministratorError
 from .catalog import InvalidLibrary
 from .deployment import memory_limit_text
-from .domain import AccessGrant, Publication, Session
+from .domain import SEVERITY_ORDER, AccessGrant, Publication, Session
 from .http_api import SESSION_COOKIE, scan_active
+from .librarian import PURGE_OPTIONS, SCOPE_OPTIONS, LibrarianError
 from .metadata import (
     EDITABLE_FIELDS,
     MAX_COVER_BYTES,
@@ -1372,3 +1373,157 @@ def _series_cards(series_items, metadata_by_series) -> list[dict[str, object]]:
 
 def _search_url(query: str, page: int) -> str:
     return f"/?{urlencode({'q': query, 'page': page})}"
+
+
+@router.get("/admin/librarian", response_class=HTMLResponse)
+async def admin_librarian_page(request: Request):
+    return templates.TemplateResponse(
+        request, "admin_librarian.html", await _librarian_context(request)
+    )
+
+
+@router.post("/admin/librarian/tokens", response_class=HTMLResponse)
+async def admin_issue_librarian_token(
+    request: Request,
+    name: str = Form(..., max_length=64),
+    csrf_token: str = Form(...),
+    scopes: list[str] = Form(default=[]),
+    library_ids: list[str] = Form(default=[]),
+):
+    """Issue a token and render the secret on this response.
+
+    Deliberately not a redirect. The flash mechanism is session-backed, which
+    is right for notices, but routing a secret through it writes the plaintext
+    into the sessions table for the duration of the round trip. Rendering here
+    means the value exists in one response body and nowhere else.
+    """
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    container = _container(request)
+    try:
+        token, secret = await run_in_threadpool(
+            container.librarian_auth.issue,
+            name,
+            tuple(scopes),
+            tuple(library_ids),
+            actor=session.user.username,
+        )
+    except LibrarianError as error:
+        return await _admin_redirect(request, "librarian", error=str(error))
+    context = await _librarian_context(request)
+    context["created_token"] = token
+    context["created_secret"] = secret
+    context["message"] = f"Issued token {token.name}."
+    return templates.TemplateResponse(request, "admin_librarian.html", context)
+
+
+@router.post("/admin/librarian/tokens/{token_id}")
+async def admin_update_librarian_token(
+    request: Request,
+    token_id: str,
+    csrf_token: str = Form(...),
+    name: str = Form(..., max_length=64),
+    scopes: list[str] = Form(default=[]),
+    library_ids: list[str] = Form(default=[]),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    try:
+        updated = await run_in_threadpool(
+            lambda: _container(request).librarian_auth.update(
+                token_id,
+                name=name,
+                scopes=tuple(scopes),
+                library_ids=tuple(library_ids),
+                actor=session.user.username,
+            )
+        )
+    except LibrarianError as error:
+        return await _admin_redirect(request, "librarian", error=str(error))
+    if updated is None:
+        return await _admin_redirect(
+            request, "librarian", error="Librarian token not found."
+        )
+    return await _admin_redirect(
+        request, "librarian", message=f"Updated {updated.name}."
+    )
+
+
+@router.post("/admin/librarian/tokens/{token_id}/revoke")
+async def admin_revoke_librarian_token(
+    request: Request, token_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    revoked = await run_in_threadpool(
+        _container(request).librarian_auth.revoke,
+        token_id,
+        actor=session.user.username,
+    )
+    if revoked is None:
+        return await _admin_redirect(
+            request, "librarian", error="Librarian token not found."
+        )
+    # The row leaves this list; the history stays in the activity feed below.
+    return await _admin_redirect(
+        request, "librarian", message=f"Revoked {revoked.name}."
+    )
+
+
+async def _librarian_context(request: Request) -> dict[str, object]:
+    context = await _admin_context(request, "librarian")
+    container = _container(request)
+    tokens = await run_in_threadpool(container.librarian_auth.tokens)
+    context["tokens"] = tokens
+    context["scope_options"] = SCOPE_OPTIONS
+    context["purge_options"] = PURGE_OPTIONS
+    libraries = await run_in_threadpool(container.repository.managed_libraries)
+    # Both pickers render from the same (value, label, detail) shape, so the
+    # template needs one macro rather than two near-copies.
+    context["library_options"] = [
+        (library.id, library.name, None) for library in libraries
+    ]
+    # Default to notice-and-louder: an agent issues far more reads than writes,
+    # and a feed that is mostly `resolve` rows is a feed nobody opens.
+    severity = request.query_params.get("severity") or "notice"
+    if severity not in SEVERITY_ORDER:
+        severity = "notice"
+    context["severity"] = severity
+    events = await run_in_threadpool(
+        lambda: container.audit.events(severity=severity, limit=60)
+    )
+    context["events"] = events
+    # Computed here rather than in the template: the only comparison worth
+    # surfacing is "this ran under permissions the token no longer has", and
+    # working that out in Jinja is unreadable.
+    current = {item.id: item.scopes for item in tokens}
+    context["stale_scopes"] = {
+        event.id
+        for event in events
+        if event.scopes_at_time
+        and event.token_id in current
+        and current[event.token_id] != event.scopes_at_time
+    }
+    return context
+
+
+@router.post("/admin/librarian/activity/clear")
+async def admin_clear_librarian_activity(
+    request: Request, csrf_token: str = Form(...), window: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    try:
+        removed = await run_in_threadpool(
+            _container(request).audit.purge, window, actor=session.user.username
+        )
+    except LibrarianError as error:
+        return await _admin_redirect(request, "librarian", error=str(error))
+    return await _admin_redirect(
+        request,
+        "librarian",
+        message=(
+            f"Cleared {removed} activity entr{'y' if removed == 1 else 'ies'}. "
+            "Permission changes were kept."
+        ),
+    )

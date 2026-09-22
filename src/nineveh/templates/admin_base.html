@@ -11,6 +11,7 @@
     <a href="/admin" {% if admin_section == 'overview' %}aria-current="page"{% endif %}>Overview</a>
     <a href="/admin/users" {% if admin_section == 'users' %}aria-current="page"{% endif %}>Users</a>
     <a href="/admin/libraries" {% if admin_section == 'libraries' %}aria-current="page"{% endif %}>Libraries</a>
+    <a href="/admin/librarian" {% if admin_section == 'librarian' %}aria-current="page"{% endif %}>Librarian</a>
     <a href="/admin/settings" {% if admin_section == 'settings' %}aria-current="page"{% endif %}>Settings</a>
   </nav>
   {% block admin_content %}{% endblock %}

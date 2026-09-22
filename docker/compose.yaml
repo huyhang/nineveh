@@ -19,16 +19,25 @@ services:
     environment:
       NINEVEH_DATA_DIR: /data
       NINEVEH_STATE_DIR: /state
+      # Starlette spills a multipart body to disk once it outgrows memory, and
+      # the default target is /tmp -- which is a 128 MB RAM disk below. Without
+      # this, any upload larger than that fails with a generic parse error and
+      # nothing in the log to explain it. /state is the persistent volume.
+      TMPDIR: /state
       NINEVEH_PUBLIC_BASE_URL: "${NINEVEH_PUBLIC_BASE_URL:-}"
       NINEVEH_ADMIN_USERNAME: "${NINEVEH_ADMIN_USERNAME:-admin}"
       NINEVEH_ADMIN_PASSWORD: "${NINEVEH_ADMIN_PASSWORD:-}"
       NINEVEH_ADMIN_PASSWORD_FILE: "${NINEVEH_ADMIN_PASSWORD_FILE:-/run/secrets/admin_password.txt}"
       NINEVEH_SECURE_COOKIES: "${NINEVEH_SECURE_COOKIES:-true}"
       NINEVEH_MEMORY_LIMIT: "${NINEVEH_MEMORY_LIMIT:-1g}"
+      NINEVEH_MAX_UPLOAD_BYTES: "${NINEVEH_MAX_UPLOAD_BYTES:-4294967296}"
       NINEVEH_RESTART_ENABLED: "${NINEVEH_RESTART_ENABLED:-true}"
       NINEVEH_FORWARDED_ALLOW_IPS: "${NINEVEH_FORWARDED_ALLOW_IPS:-127.0.0.1}"
     volumes:
-      - "${NINEVEH_DATA_PATH:?Set NINEVEH_DATA_PATH in .env}:/data:ro"
+      # Writable so the librarian can place a validated volume. Placement is
+      # the only write the agent can cause, and it never replaces a file: the
+      # final step is a hard link, which fails outright if the name is taken.
+      - "${NINEVEH_DATA_PATH:?Set NINEVEH_DATA_PATH in .env}:/data"
       - "${NINEVEH_STATE_PATH:?Set NINEVEH_STATE_PATH in .env}:/state"
       - "${NINEVEH_SECRETS_PATH:-./secrets}:/run/secrets:ro"
     # A ceiling, not a target: Nineveh idles around 80-120 MB. The limit exists so

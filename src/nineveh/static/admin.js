@@ -213,3 +213,78 @@ async function pollSpreadStatus(failures = 0) {
 if (document.querySelector("[data-spread-progress]")) {
   window.setTimeout(() => pollSpreadStatus(), SPREAD_POLL_MS);
 }
+
+// Copying the one-time librarian secret.
+//
+// `navigator.clipboard` exists only in a secure context: HTTPS, or localhost.
+// A NAS reached at http://192.168.x.x has neither, and the obvious
+// `if (!navigator.clipboard) return;` turns the button into a dead control
+// with no explanation. Fall back to selecting the text and say so.
+for (const button of document.querySelectorAll("[data-copy-secret]")) {
+  const panel = button.closest(".agent-secret");
+  const value = panel?.querySelector("[data-librarian-secret]");
+  const fallback = panel?.querySelector("[data-copy-fallback]");
+  if (!value) continue;
+
+  const selectSecret = () => {
+    const range = document.createRange();
+    range.selectNodeContents(value);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  };
+
+  button.addEventListener("click", async () => {
+    const secret = value.textContent.trim();
+    if (!navigator.clipboard?.writeText) {
+      selectSecret();
+      if (fallback) fallback.hidden = false;
+      button.textContent = "Press ⌘C";
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(secret);
+      button.textContent = "Copied";
+    } catch {
+      selectSecret();
+      if (fallback) fallback.hidden = false;
+      button.textContent = "Press ⌘C";
+      return;
+    }
+    // Restore the label so a second copy does not look like a no-op.
+    window.setTimeout(() => {
+      button.textContent = "Copy token";
+    }, 2000);
+  });
+}
+
+// Keep each picker's summary reporting its own selection, the way a native
+// select reports its value. Without this the closed control would still read
+// "None selected" while boxes are ticked behind it.
+for (const picker of document.querySelectorAll(".picker")) {
+  const value = picker.querySelector("[data-picker-value]");
+  const boxes = picker.querySelectorAll('input[type="checkbox"]');
+  if (!value || !boxes.length) continue;
+  const refresh = () => {
+    const chosen = [...boxes].filter((box) => box.checked).length;
+    value.textContent = chosen ? `${chosen} selected` : value.dataset.empty;
+    value.classList.toggle("is-set", chosen > 0);
+  };
+  for (const box of boxes) box.addEventListener("change", refresh);
+  refresh();
+}
+
+// A disclosure stays open until it is told otherwise, which is not how a
+// dropdown is expected to behave once you click past it.
+document.addEventListener("click", (event) => {
+  for (const picker of document.querySelectorAll(".picker[open]")) {
+    if (!picker.contains(event.target)) picker.open = false;
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  for (const picker of document.querySelectorAll(".picker[open]")) {
+    picker.open = false;
+    picker.querySelector("summary")?.focus();
+  }
+});

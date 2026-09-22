@@ -8,6 +8,8 @@ from typing import Any, BinaryIO, Protocol
 from .domain import (
     AccessGrant,
     CatalogSeries,
+    LibrarianEvent,
+    LibrarianToken,
     LibraryUsage,
     ManagedLibrary,
     MetadataAutoMatchJob,
@@ -265,6 +267,56 @@ class UserRepository(Protocol):
     def take_session_flash(self, token_hash: str) -> tuple[str | None, str | None]: ...
 
 
+class LibrarianRepository(Protocol):
+    def create_librarian_token(
+        self,
+        name: str,
+        token_hash: str,
+        scopes: tuple[str, ...],
+        library_ids: tuple[str, ...],
+    ) -> LibrarianToken: ...
+
+    def librarian_token_by_hash(self, token_hash: str) -> LibrarianToken | None: ...
+
+    def librarian_token(self, token_id: str) -> LibrarianToken | None: ...
+
+    def librarian_tokens(
+        self, *, include_revoked: bool = False
+    ) -> list[LibrarianToken]: ...
+
+    def update_librarian_token(
+        self,
+        token_id: str,
+        *,
+        name: str | None = None,
+        scopes: tuple[str, ...] | None = None,
+        library_ids: tuple[str, ...] | None = None,
+    ) -> LibrarianToken | None: ...
+
+    def revoke_librarian_token(self, token_id: str) -> LibrarianToken | None: ...
+
+    def touch_librarian_token(self, token_id: str) -> None: ...
+
+    def record_librarian_event(self, event: LibrarianEvent) -> LibrarianEvent: ...
+
+    def purge_librarian_events(
+        self, before: str, *, keep_severities: tuple[str, ...] = ()
+    ) -> int: ...
+
+    def librarian_events(
+        self,
+        *,
+        token_id: str | None = None,
+        severity: str | None = None,
+        action: str | None = None,
+        outcome: str | None = None,
+        correlation_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+    ) -> list[LibrarianEvent]: ...
+
+
 class Repository(
     CatalogRepository,
     UserRepository,
@@ -273,6 +325,7 @@ class Repository(
     MetadataRepository,
     ReadingRepository,
     SpreadRepository,
+    LibrarianRepository,
     Protocol,
 ):
     """The single persistence seam the application composes against."""

@@ -302,3 +302,78 @@ class ScanStatus:
     report: ScanReport | None = None
     error: str | None = None
     library_id: str | None = None
+
+
+# Ranked, not just enumerated: the activity feed filters on a floor ("notice
+# and louder") so reads can be hidden without hiding writes. An agent issues
+# far more reads than placements, and a feed that is mostly `resolve` rows is a
+# feed nobody opens.
+SEVERITY_ORDER: dict[str, int] = {
+    "info": 0,
+    "notice": 1,
+    "important": 2,
+    "security": 3,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LibrarianToken:
+    """A credential for the off-device librarian agent.
+
+    Revocation is a soft delete. The row survives so activity rows keep a
+    resolvable owner, and `token_hash` is cleared so a revoked secret cannot
+    authenticate even if a caller forgets to filter on `revoked_at`.
+    """
+
+    id: str
+    name: str
+    scopes: tuple[str, ...]
+    library_ids: tuple[str, ...]
+    created_at: datetime
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.revoked_at is None
+
+    def permits(self, scope: str) -> bool:
+        return scope in self.scopes
+
+    def reaches(self, library_id: str | None) -> bool:
+        """An empty grant list means every library, matching the admin UI."""
+        if not self.library_ids:
+            return True
+        return library_id in self.library_ids
+
+
+@dataclass(frozen=True, slots=True)
+class LibrarianEvent:
+    """One line of the librarian activity feed.
+
+    Holds both lifecycle events (a token was issued, re-scoped, revoked) and
+    usage events (a series was resolved, a volume placed), because the person
+    reading the feed does not care which table a row came from -- seeing a
+    permission grant next to the first write it enabled is the point.
+
+    `summary` is rendered once, at write time, and stored. Rendering from a
+    template at read time would let a later template change silently rewrite
+    history; an audit trail should say what was reported then.
+    """
+
+    id: str
+    kind: str
+    action: str
+    severity: str
+    outcome: str
+    summary: str
+    created_at: datetime
+    token_id: str | None = None
+    token_name: str = ""
+    actor: str | None = None
+    correlation_id: str | None = None
+    scopes_at_time: tuple[str, ...] = ()
+    subject_type: str | None = None
+    subject_id: str | None = None
+    subject_label: str | None = None
+    detail: dict[str, Any] | None = None

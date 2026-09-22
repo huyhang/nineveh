@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Regenerate the committed API contract.
+"""Regenerate the committed API contracts.
 
     python scripts/export-openapi.py
 
-`tests/test_contract.py` fails if the committed file and the live route table
+Writes two files. `docs/openapi.json` is the whole published surface.
+`docs/librarian-openapi.json` is the slice a librarian agent consumes, so a
+client in another repository can vendor a contract that moves only when its
+own endpoints move -- not every time an unrelated one does.
+
+`tests/test_contract.py` fails if either file and the live route table
 disagree, so run this after adding, removing, or re-shaping an endpoint.
 """
 
@@ -15,16 +20,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from nineveh.app import openapi_document
+from nineveh.app import openapi_document, tagged_contract
 
-DESTINATION = Path(__file__).resolve().parent.parent / "docs" / "openapi.json"
+DOCS = Path(__file__).resolve().parent.parent / "docs"
+AGENT_TAG = "librarian"
+
+
+def write(destination: Path, document: dict) -> None:
+    rendered = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    destination.write_text(rendered, encoding="utf-8")
+    print(f"{destination} ({len(rendered.splitlines())} lines)")
 
 
 def main() -> None:
-    DESTINATION.parent.mkdir(parents=True, exist_ok=True)
-    document = json.dumps(openapi_document(), indent=2, sort_keys=True) + "\n"
-    DESTINATION.write_text(document, encoding="utf-8")
-    print(f"{DESTINATION} ({len(document.splitlines())} lines)")
+    DOCS.mkdir(parents=True, exist_ok=True)
+    document = openapi_document()
+    write(DOCS / "openapi.json", document)
+    write(DOCS / f"{AGENT_TAG}-openapi.json", tagged_contract(AGENT_TAG, document))
 
 
 if __name__ == "__main__":

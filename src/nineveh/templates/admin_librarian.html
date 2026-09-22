@@ -1,0 +1,141 @@
+{% extends "admin_base.html" %}
+
+{#
+  Both multi-selects collapse into a disclosure so the issue form stays a
+  single row of equal-height controls. The summary reports the selection the
+  way a native select reports its value; the field label sits above it, like
+  every other control on the page.
+#}
+{% macro picker(title, name, options, selected, empty_label, note=None) %}
+  <div class="field">
+    <span>{{ title }}</span>
+    <details class="picker">
+      <summary>
+        <span class="picker-value{% if selected %} is-set{% endif %}" data-picker-value data-empty="{{ empty_label }}">
+          {% if selected %}{{ selected|length }} selected{% else %}{{ empty_label }}{% endif %}
+        </span>
+      </summary>
+      <div class="picker-menu">
+        {% if note %}<p class="picker-note">{{ note }}</p>{% endif %}
+        {% for value, label, detail in options %}
+          <label class="picker-option">
+            <input type="checkbox" name="{{ name }}" value="{{ value }}" {% if value in selected %}checked{% endif %}>
+            <span>{{ label }}{% if detail %}<small>{{ detail }}</small>{% endif %}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </details>
+  </div>
+{% endmacro %}
+
+{% macro capability_picker(scope_options, selected) %}
+  {{ picker("Capabilities", "scopes", scope_options, selected, "None selected") }}
+{% endmacro %}
+
+{% macro library_picker(library_options, selected) %}
+  {{ picker(
+      "Libraries",
+      "library_ids",
+      library_options,
+      selected,
+      "All libraries",
+      "Leave every box clear to allow all libraries.",
+  ) }}
+{% endmacro %}
+
+{% block admin_content %}
+  <section class="admin-section">
+    <div class="section-heading"><div><p class="eyebrow">Agent access</p><h2>Librarian</h2></div></div>
+    <p class="access-note">Credentials for the off-device librarian agent. Each token is limited to the capabilities you tick and the libraries you select. Proposing an upload and placing one are separate capabilities, so a token can be allowed to suggest a volume without being allowed to write it.</p>
+
+    {% if created_secret %}
+      <div class="agent-secret" role="status">
+        <strong>Copy the token for {{ created_token.name }} now.</strong>
+        <p>It is stored as a hash and will not be shown again.</p>
+        <div class="agent-secret-value">
+          <code data-librarian-secret>{{ created_secret }}</code>
+          <button type="button" class="secondary" data-copy-secret>Copy token</button>
+        </div>
+        <p class="copy-fallback" data-copy-fallback hidden>Select the token above and copy it with your keyboard.</p>
+      </div>
+    {% endif %}
+
+    <form method="post" action="/admin/librarian/tokens" class="create-user-form librarian-token-form">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <label>Token name <input name="name" autocomplete="off" required maxlength="64" placeholder="Cleo"></label>
+      {{ capability_picker(scope_options, []) }}
+      {{ library_picker(library_options, []) }}
+      <button type="submit">Issue token</button>
+    </form>
+
+    <div class="user-list">
+      {% for token in tokens %}
+        <article class="user-card">
+          <div class="user-summary">
+            <div class="avatar" aria-hidden="true">{{ token.name[:1]|upper }}</div>
+            <div>
+              <h3>{{ token.name }}</h3>
+              <p>{{ token.scopes|length }} capabilit{{ 'y' if token.scopes|length == 1 else 'ies' }} ·
+                 {% if token.library_ids %}{{ token.library_ids|length }} librar{{ 'y' if token.library_ids|length == 1 else 'ies' }}{% else %}all libraries{% endif %} ·
+                 {% if token.last_used_at %}last used {{ token.last_used_at|since }}{% else %}never used{% endif %}</p>
+            </div>
+            <form class="user-actions" method="post" action="/admin/librarian/tokens/{{ token.id }}/revoke" onsubmit="return confirm('Revoke {{ token.name }}? The agent stops working immediately.')">
+              <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+              <button class="secondary danger" type="submit">Revoke</button>
+            </form>
+          </div>
+          <details>
+            <summary>Edit capabilities</summary>
+            <form method="post" action="/admin/librarian/tokens/{{ token.id }}" class="create-user-form librarian-token-form">
+              <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+              <label>Name <input name="name" value="{{ token.name }}" required maxlength="64"></label>
+              {{ capability_picker(scope_options, token.scopes) }}
+              {{ library_picker(library_options, token.library_ids) }}
+              <button class="secondary" type="submit">Save changes</button>
+            </form>
+            <p class="access-note">The secret is not rotated, so the agent keeps working across a change.</p>
+          </details>
+        </article>
+      {% else %}
+        <p class="access-note">No librarian tokens yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="admin-section">
+    <div class="section-heading">
+      <div><p class="eyebrow">What the agent did</p><h2>Activity</h2></div>
+      <nav class="activity-filter" aria-label="Severity">
+        {% for level, label in (('notice', 'Actions'), ('security', 'Permissions'), ('info', 'Everything')) %}
+          <a href="/admin/librarian?severity={{ level }}" {% if severity == level %}aria-current="page"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </nav>
+    </div>
+    <p class="access-note">Issued and revoked credentials appear here alongside what the agent read and wrote, so a permission change sits next to the first action it allowed. Revoked tokens leave the list above but keep their history here.</p>
+    <form method="post" action="/admin/librarian/activity/clear" class="activity-clear"
+          onsubmit="return confirm('Clear activity older than the selected age? Permission changes are kept.')">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <label class="visually-hidden" for="clear-window">Clear activity older than</label>
+      <select id="clear-window" name="window">
+        {% for value, label in purge_options %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+      </select>
+      <button class="secondary" type="submit">Clear activities</button>
+      <span class="picker-note">Permission changes are always kept.</span>
+    </form>
+    <ol class="activity-feed">
+      {% for event in events %}
+        <li class="activity-row severity-{{ event.severity }} outcome-{{ event.outcome }}">
+          <time datetime="{{ event.created_at.isoformat() }}" title="{{ event.created_at|timestamp }}">{{ event.created_at|since }}</time>
+          <p class="activity-summary">{{ event.summary }}</p>
+          {% if event.outcome != 'ok' %}<span class="activity-outcome">{{ event.outcome }}</span>{% endif %}
+          {% if event.id in stale_scopes %}
+            <p class="activity-warning">⚠ Ran under different permissions than this token has now — {{ event.scopes_at_time|join(', ') }}</p>
+          {% endif %}
+          {% if event.subject_label %}<p class="activity-subject">{{ event.subject_type }}: {{ event.subject_label }}</p>{% endif %}
+        </li>
+      {% else %}
+        <li class="activity-row"><p class="activity-summary">Nothing recorded yet.</p></li>
+      {% endfor %}
+    </ol>
+  </section>
+{% endblock %}

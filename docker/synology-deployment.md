@@ -23,13 +23,16 @@ Create separate directories for the source, persistent state, initial password, 
             └── Volume 01.cbz
 ```
 
-Keep the state directory outside the media tree so the library can be mounted read-only.
+Keep the state directory outside the media tree. The media mount is writable so the
+librarian agent can place validated volumes; scans never modify it, and placement
+never replaces an existing file.
 
 ## 2. Determine the service account IDs
 
 Through SSH, run `id USERNAME` for the DSM account that should run Nineveh. Record its numeric UID and GID. That account needs:
 
-- Read and directory-traversal permission for the media tree
+- Read, write and directory-traversal permission for the media tree (the librarian
+  places new volumes there; nothing else writes to it)
 - Read/write permission for `/volume1/docker/nineveh/state`
 - Read permission for the initial password file
 

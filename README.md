@@ -2,7 +2,7 @@
 
 Nineveh is a self-hosted, API-first OPDS 2.0 service for CBZ comic and manga libraries. It provides authenticated OPDS feeds, full-archive downloads, individual page access, a responsive browser catalog, and local user administration.
 
-The service is designed for a small Docker host such as a Synology NAS. Media remains read-only while users, the catalog index, and generated thumbnails live in a separate state volume.
+The service is designed for a small Docker host such as a Synology NAS. Media is written only by the librarian agent's guarded ingest path, which never replaces an existing file; users, the catalog index, agent activity, and generated thumbnails live in a separate state volume.
 
 ## Features
 
@@ -15,6 +15,8 @@ The service is designed for a small Docker host such as a Synology NAS. Media re
 - Responsive browser reader with single-page, double-page, and continuous modes
 - Automatic per-user reading progress and reading-mode synchronization
 - Administrator-reviewed MangaBaka metadata with durable local edits and covers
+- Scoped librarian-agent API with fuzzy series resolution and a two-step guarded ingest
+- Auditable agent activity, with permission changes and writes in one feed
 - Persisted application settings with a Docker-supervised restart action
 - System, light, paper, and dark display themes with a persistent header toggle
 - Original CBZ downloads with byte-range and cache support
@@ -89,6 +91,12 @@ All catalog and content endpoints require authentication.
 | `/api/v1/admin/libraries` | Managed libraries, indexed capacity, and available `/data` directories |
 | `/api/v1/admin/users/{id}/access` | Library, content-type, and series read grants |
 | `/api/v1/admin/settings`, `/api/v1/admin/restart` | Persisted application settings and restart control |
+| `/api/v1/admin/librarian-tokens` | Issue, re-scope, list, and revoke librarian credentials |
+| `/api/v1/admin/librarian/activity` | Merged lifecycle and usage feed for the agent |
+| `/api/v1/librarian/libraries` | Libraries the calling token may reach |
+| `/api/v1/librarian/series` | Resolve a title, or filter series by stored metadata |
+| `/api/v1/librarian/series/{id}` | Volumes on disk, latest volume, and provider totals |
+| `/api/v1/librarian/ingest` | Stage, inspect, commit, or discard a proposed volume |
 | `/api/v1/admin/metadata` | Manga metadata status and manually initiated matching operations |
 | `/api/v1/admin/libraries/{id}/metadata/auto-match` | Start or inspect a resumable, confidence-gated library auto-match job |
 | `/api/v1/admin/series/{id}/spread-detection` | Enable or disable automatic spread-start detection for a series |
@@ -109,7 +117,7 @@ Reading position is API state rather than a private detail of the browser reader
 
 | Variable | Default | Description |
 |---|---:|---|
-| `NINEVEH_DATA_DIR` | `/data` | Read-only library root inside the container |
+| `NINEVEH_DATA_DIR` | `/data` | Library root; the librarian's ingest path needs create access |
 | `NINEVEH_STATE_DIR` | `/state` | Writable database and cache directory |
 | `NINEVEH_ADMIN_USERNAME` | `admin` | First administrator username |
 | `NINEVEH_ADMIN_PASSWORD_FILE` | — | File containing the first administrator password |
@@ -122,6 +130,7 @@ Reading position is API state rather than a private detail of the browser reader
 | `NINEVEH_PORT` | `8080` | Listen port |
 | `NINEVEH_LOG_LEVEL` | `INFO` | Level for the JSON stdout log |
 | `NINEVEH_FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxies whose `X-Forwarded-*` headers are trusted |
+| `NINEVEH_MAX_UPLOAD_BYTES` | `4294967296` | Largest body accepted for one agent upload |
 
 Getting that last one wrong used to fail silently. Nineveh now warns at startup when its own container gateway is not in the trusted list, and raises a banner on **Admin → Overview** — naming the peer address and the exact variable to set — the first time it discards a real proxy's `X-Forwarded-Proto`. It reports; it never widens the trust list itself, because finding the address in front of the container does not establish that it is your proxy.
 
@@ -147,7 +156,7 @@ Nineveh's resident set is roughly 80–120 MB and does not grow with library siz
 
 The bootstrap password is used only when `/state` contains no users. Afterwards, users, access grants, libraries, scans, and application settings are managed at `/admin`. New readers have no catalog access until an administrator grants it. Existing readers are granted access to their currently indexed libraries when upgrading from the original schema.
 
-On first startup, Nineveh registers each top-level directory under `/data`. Later directories must be added explicitly from the admin UI. Removing a library clears its index and grants but never changes the read-only media directory. Reported capacity is the sum of indexed CBZ file sizes.
+On first startup, Nineveh registers each top-level directory under `/data`. Later directories must be added explicitly from the admin UI. Removing a library clears its index and grants but never deletes anything from the media directory. Reported capacity is the sum of indexed CBZ file sizes.
 
 Docker-level options such as `NINEVEH_MEMORY_LIMIT` remain deployment-managed. Compose enables the UI restart action; it gracefully exits the application and the `unless-stopped` policy restarts the same container with saved application settings. A Docker restart does not apply edits to Compose-level resource limits; recreate the service after changing those values. The settings page reports the ceiling it reads from the container's own cgroup, so it shows what is actually enforced rather than what was declared.
 
@@ -180,6 +189,35 @@ Manga metadata in Nineveh is provided by [MangaBaka](https://mangabaka.org/) thr
 
 Nineveh is not affiliated with or endorsed by MangaBaka. Cover images referenced by the metadata may remain subject to the rights of their respective owners.
 
+## Librarian agent
+
+Nineveh exposes a small API for an LLM-based librarian running on another device. Tokens are created under **Admin → Librarian**, limited to an explicit set of capabilities and to selected libraries. The secret is displayed once, at creation, and stored only as a hash.
+
+Capabilities are deliberately finer than read and write:
+
+| Capability | What it allows |
+|---|---|
+| `catalog:read` | Find series by title and list the volumes on disk |
+| `metadata:read` | Answer author, status, and publication questions from stored details |
+| `ingest:stage` | Validate and stage a new volume; writes nothing into the library |
+| `ingest:commit` | Place a staged volume on disk |
+
+Staging and placing are separate on purpose. A token held by a phone or a remote helper can be granted `ingest:stage` alone: it may propose a volume and see exactly where it would land, while only a token you keep locally can complete the write. `GET /api/v1/librarian/ingest` lists what is waiting.
+
+Uploads are validated with the same archive rules the scanner uses, checked against the series for identical content, and offered a filename consistent with the volumes already there. Placement refuses a name that exists, and the file only appears once it is completely written.
+
+Every read, proposal, placement, refusal, and permission change is recorded with the capabilities that were in force at the time, and shown together under **Admin → Librarian**. Revoking a token removes it from the list while leaving its history intact.
+
+### Building a client
+
+`docs/librarian-openapi.json` is the agent-facing slice of the contract: the eight librarian operations and the schemas they reference, and nothing else. A client in another repository should vendor that file rather than `docs/openapi.json`, so its copy moves only when the endpoints it calls move — not every time an unrelated part of Nineveh changes.
+
+Regenerate both with `python scripts/export-openapi.py`. `tests/test_contract.py` fails if either drifts from the live route table, and additionally checks that every `$ref` in the slice resolves inside it, so the file is safe to feed straight to a code generator.
+
+Pin the slice by content hash rather than by `info.version`: the version tracks the package and bumps on releases that leave the agent surface untouched.
+
+[`docs/contract-vendoring.md`](docs/contract-vendoring.md) walks through setting this up in a client repository, and lists what a client has to get right — capabilities, the staging/committing split, correlation headers, and the status codes worth handling.
+
 ## Security notes
 
-Use HTTPS for any non-local deployment. The Docker Compose configuration mounts `/data` read-only, drops Linux capabilities, uses a read-only container filesystem, and persists only `/state`. Back up `/state/nineveh.sqlite3` to preserve accounts and stable publication identifiers.
+Use HTTPS for any non-local deployment. The Docker Compose configuration mounts `/data` writable so the librarian can place volumes, drops Linux capabilities, uses a read-only container filesystem, and persists only `/state`. Nothing in the agent surface can overwrite, move, rename, or delete an existing file. Back up the media tree and `/state/nineveh.sqlite3`; filesystem access is broader than the agent API's authorization, so NAS snapshots remain worthwhile.

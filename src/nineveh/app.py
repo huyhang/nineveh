@@ -27,6 +27,7 @@ from .database import SQLiteRepository
 from .deployment import discarded_forwarded_proto, proxy_trust_advice
 from .http_api import router as api_router
 from .http_web import router as web_router
+from .librarian import AuditTrail, IngestService, LibrarianAuth, LibrarianService
 from .metadata import (
     MangaBakaProvider,
     MetadataCoverStore,
@@ -71,6 +72,10 @@ class Container:
     configuration: SettingsService
     restarter: RestartController
     reader: ReaderService
+    audit: AuditTrail
+    librarian_auth: LibrarianAuth
+    librarian: LibrarianService
+    ingest: IngestService
     metadata: MetadataService | None = None
     spreads: SpreadDetectionService | None = None
 
@@ -84,6 +89,7 @@ def build_container(settings: Settings) -> Container:
     configuration = SettingsService(settings, repository)
     effective = configuration.activate()
     archives = ArchiveService(effective)
+    audit = AuditTrail(repository)
     limiter = PersistentRateLimiter(repository, configuration.mangabaka_request_limit)
     spreads = SpreadDetectionService(
         repository,
@@ -121,6 +127,16 @@ def build_container(settings: Settings) -> Container:
         if effective.restart_enabled
         else DisabledRestartController(),
         reader=ReaderService(repository, repository),
+        audit=audit,
+        librarian_auth=LibrarianAuth(repository, audit),
+        librarian=LibrarianService(repository),
+        ingest=IngestService(
+            effective.data_dir,
+            effective.ingest_staging_dir,
+            repository,
+            ArchiveInspector(effective),
+            effective.max_upload_bytes,
+        ),
         metadata=MetadataService(
             repository,
             MangaBakaProvider(UrllibTransport(), limiter),
@@ -149,6 +165,7 @@ def create_app(
             configured.rendition_dir,
             configured.range_dir,
             configured.metadata_cover_dir,
+            configured.ingest_staging_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         _discard_stale_ranges(configured.range_dir)
@@ -352,6 +369,79 @@ def openapi_document() -> dict[str, object]:
         root = Path(scratch)
         settings = Settings(data_dir=root, state_dir=root / "state")
         return create_app(settings).openapi()
+
+
+def tagged_contract(tag: str, document: dict[str, object] | None = None) -> dict:
+    """The slice of the contract one tag's consumers actually need.
+
+    The librarian agent calls eight of fifty-six operations. Handing it the
+    whole document means every unrelated endpoint churns its vendored copy and
+    raises a false "the contract moved" alarm, so the useful signal -- did *my*
+    surface change? -- gets lost in noise.
+
+    Schemas are pulled in by following `$ref` to a fixed point rather than by
+    copying `components` wholesale: a subset that references a schema it does
+    not carry is worse than no subset, because it fails at generation time
+    instead of review time.
+    """
+    source = document or openapi_document()
+    paths: dict[str, dict] = {}
+    for path, item in source.get("paths", {}).items():
+        operations = {
+            method: operation
+            for method, operation in item.items()
+            if isinstance(operation, dict) and tag in (operation.get("tags") or [])
+        }
+        if not operations:
+            continue
+        # Path-level keys (shared `parameters`, `summary`) belong to every
+        # operation under them, so they travel with any that survive.
+        shared = {
+            key: value
+            for key, value in item.items()
+            if not isinstance(value, dict) or "responses" not in value
+        }
+        paths[path] = {**shared, **operations}
+
+    schemas = source.get("components", {}).get("schemas", {})
+    wanted: set[str] = set()
+    _collect_refs(paths, wanted)
+    pending = set(wanted)
+    while pending:
+        nested: set[str] = set()
+        _collect_refs(schemas.get(pending.pop(), {}), nested)
+        discovered = nested - wanted
+        wanted |= discovered
+        pending |= discovered
+
+    contract: dict[str, object] = {
+        "openapi": source["openapi"],
+        "info": {
+            **source["info"],
+            "title": f"{source['info']['title']} ({tag})",
+        },
+        "paths": paths,
+    }
+    if wanted:
+        contract["components"] = {
+            "schemas": {name: schemas[name] for name in sorted(wanted) if name in schemas}
+        }
+    return contract
+
+
+def _collect_refs(node: object, found: set[str]) -> None:
+    if isinstance(node, dict):
+        reference = node.get("$ref")
+        if isinstance(reference, str) and reference.startswith(_SCHEMA_PREFIX):
+            found.add(reference[len(_SCHEMA_PREFIX) :])
+        for value in node.values():
+            _collect_refs(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_refs(item, found)
+
+
+_SCHEMA_PREFIX = "#/components/schemas/"
 
 
 def _discard_stale_ranges(directory: Path) -> None:

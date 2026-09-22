@@ -61,6 +61,12 @@ class Settings:
     max_archive_entries: int = 10_000
     max_archive_uncompressed_bytes: int = 8 * 1024 * 1024 * 1024
     max_page_uncompressed_bytes: int = 256 * 1024 * 1024
+    # Deliberately its own ceiling rather than a reuse of
+    # `max_archive_uncompressed_bytes`: that one guards decompression against
+    # zip bombs, this one bounds how many bytes an agent may push over HTTP.
+    # Conflating them advertises an 8 GiB limit on a transfer path that cannot
+    # honour it.
+    max_upload_bytes: int = 4 * 1024 * 1024 * 1024
     max_compression_ratio: int = 200
     max_image_pixels: int = 200_000_000
     thumbnail_cache_mb: int = 512
@@ -107,6 +113,9 @@ class Settings:
             ),
             max_page_uncompressed_bytes=_int_env(
                 "NINEVEH_MAX_PAGE_UNCOMPRESSED_BYTES", 256 * 1024 * 1024, 1
+            ),
+            max_upload_bytes=_int_env(
+                "NINEVEH_MAX_UPLOAD_BYTES", 4 * 1024 * 1024 * 1024, 1
             ),
             max_compression_ratio=_int_env("NINEVEH_MAX_COMPRESSION_RATIO", 200, 1),
             max_image_pixels=_int_env("NINEVEH_MAX_IMAGE_PIXELS", 200_000_000, 1),
@@ -185,6 +194,16 @@ class Settings:
     @property
     def metadata_cover_dir(self) -> Path:
         return self.state_dir / "series-covers"
+
+    @property
+    def ingest_staging_dir(self) -> Path:
+        """Where staged agent uploads wait for a commit.
+
+        On the writable state volume, never under `/data`: a staged archive is
+        invisible to the catalog until it is committed, and a scan must not be
+        able to index something nobody has approved.
+        """
+        return self.state_dir / "ingest"
 
     def admin_password(self) -> str | None:
         if self.bootstrap_admin_password:

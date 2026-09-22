@@ -9,9 +9,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .domain import (
+    SEVERITY_ORDER,
     AccessGrant,
     CatalogSeries,
     CategoryUsage,
+    LibrarianEvent,
+    LibrarianToken,
     LibraryUsage,
     ManagedLibrary,
     MetadataAutoMatchJob,
@@ -31,7 +34,7 @@ from .domain import (
     User,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # The release that began recording `ComicInfo.xml` spread markers. Databases
 # older than this need one reinspection pass to pick them up.
 SPREAD_MARKER_VERSION = 4
@@ -222,6 +225,50 @@ CREATE TABLE IF NOT EXISTS application_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- `token_hash` is nullable so revocation can clear it: the row must survive to
+-- keep activity rows attributable, but the secret must stop authenticating even
+-- if some future caller forgets to filter on `revoked_at`. SQLite permits many
+-- NULLs under a UNIQUE constraint, so cleared hashes do not collide.
+CREATE TABLE IF NOT EXISTS librarian_tokens (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash TEXT UNIQUE,
+    scopes TEXT NOT NULL,
+    library_ids TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT
+);
+
+-- Lifecycle and usage share one table. A reader wants a permission grant and
+-- the first write it enabled on adjacent lines, which a single indexed scan
+-- gives for free; retention is driven by `severity`, not by which table a row
+-- landed in. `token_name` is denormalised so a row stays readable even if its
+-- token is ever hard-deleted -- an orphaned id records an action by an agent
+-- nobody can identify.
+CREATE TABLE IF NOT EXISTS librarian_events (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    token_id TEXT REFERENCES librarian_tokens(id) ON DELETE SET NULL,
+    token_name TEXT NOT NULL DEFAULT '',
+    actor TEXT,
+    correlation_id TEXT,
+    scopes_at_time TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    subject_type TEXT,
+    subject_id TEXT,
+    subject_label TEXT,
+    summary TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS librarian_events_recent
+    ON librarian_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS librarian_events_token
+    ON librarian_events(token_id, created_at DESC);
 """
 
 # Applied after `SCHEMA`, because a v1 database only grows the columns it indexes
@@ -1766,6 +1813,256 @@ class SQLiteRepository:
             ).fetchall()
         return [self._publication(row) for row in rows]
 
+    def create_librarian_token(
+        self,
+        name: str,
+        token_hash: str,
+        scopes: tuple[str, ...],
+        library_ids: tuple[str, ...],
+    ) -> LibrarianToken:
+        token = LibrarianToken(
+            id=str(uuid.uuid4()),
+            name=name,
+            scopes=scopes,
+            library_ids=library_ids,
+            created_at=datetime.now(UTC),
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO librarian_tokens(
+                    id, name, token_hash, scopes, library_ids, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token.id,
+                    token.name,
+                    token_hash,
+                    _join(scopes),
+                    _join(library_ids),
+                    token.created_at.isoformat(),
+                ),
+            )
+        return token
+
+    def librarian_token_by_hash(self, token_hash: str) -> LibrarianToken | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM librarian_tokens
+                WHERE token_hash = ? AND revoked_at IS NULL
+                """,
+                (token_hash,),
+            ).fetchone()
+        return self._librarian_token(row) if row else None
+
+    def librarian_token(self, token_id: str) -> LibrarianToken | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM librarian_tokens WHERE id = ?", (token_id,)
+            ).fetchone()
+        return self._librarian_token(row) if row else None
+
+    def librarian_tokens(
+        self, *, include_revoked: bool = False
+    ) -> list[LibrarianToken]:
+        where = "" if include_revoked else " WHERE revoked_at IS NULL"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM librarian_tokens{where}"
+                " ORDER BY created_at DESC"
+            ).fetchall()
+        return [self._librarian_token(row) for row in rows]
+
+    def update_librarian_token(
+        self,
+        token_id: str,
+        *,
+        name: str | None = None,
+        scopes: tuple[str, ...] | None = None,
+        library_ids: tuple[str, ...] | None = None,
+    ) -> LibrarianToken | None:
+        assignments: list[str] = []
+        values: list[object] = []
+        if name is not None:
+            assignments.append("name = ?")
+            values.append(name)
+        if scopes is not None:
+            assignments.append("scopes = ?")
+            values.append(_join(scopes))
+        if library_ids is not None:
+            assignments.append("library_ids = ?")
+            values.append(_join(library_ids))
+        if not assignments:
+            return self.librarian_token(token_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE librarian_tokens SET {', '.join(assignments)}"
+                " WHERE id = ? AND revoked_at IS NULL",
+                (*values, token_id),
+            )
+            if not cursor.rowcount:
+                return None
+        return self.librarian_token(token_id)
+
+    def revoke_librarian_token(self, token_id: str) -> LibrarianToken | None:
+        # Clearing `token_hash` is the part that matters: the row stays so the
+        # activity feed keeps a resolvable owner, but the secret can never
+        # authenticate again even if a lookup forgets the `revoked_at` filter.
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE librarian_tokens
+                SET revoked_at = ?, token_hash = NULL
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (_now_iso(), token_id),
+            )
+            if not cursor.rowcount:
+                return None
+        return self.librarian_token(token_id)
+
+    def touch_librarian_token(self, token_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE librarian_tokens SET last_used_at = ? WHERE id = ?",
+                (_now_iso(), token_id),
+            )
+
+    def record_librarian_event(self, event: LibrarianEvent) -> LibrarianEvent:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO librarian_events(
+                    id, kind, token_id, token_name, actor, correlation_id,
+                    scopes_at_time, action, severity, outcome, subject_type,
+                    subject_id, subject_label, summary, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.kind,
+                    event.token_id,
+                    event.token_name,
+                    event.actor,
+                    event.correlation_id,
+                    _join(event.scopes_at_time),
+                    event.action,
+                    event.severity,
+                    event.outcome,
+                    event.subject_type,
+                    event.subject_id,
+                    event.subject_label,
+                    event.summary,
+                    json.dumps(event.detail) if event.detail is not None else None,
+                    event.created_at.isoformat(),
+                ),
+            )
+        return event
+
+    def purge_librarian_events(
+        self, before: str, *, keep_severities: tuple[str, ...] = ()
+    ) -> int:
+        """Drop activity older than `before`, except the severities named.
+
+        The exemption is the point: an audit trail that a single button can
+        erase is not one. Callers keep `security` so who-was-granted-what
+        survives however aggressively the read noise is trimmed.
+        """
+        clauses = ["created_at < ?"]
+        values: list[object] = [before]
+        if keep_severities:
+            placeholders = ",".join("?" * len(keep_severities))
+            clauses.append(f"severity NOT IN ({placeholders})")
+            values.extend(keep_severities)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM librarian_events WHERE {' AND '.join(clauses)}",
+                values,
+            )
+            return cursor.rowcount
+
+    def librarian_events(
+        self,
+        *,
+        token_id: str | None = None,
+        severity: str | None = None,
+        action: str | None = None,
+        outcome: str | None = None,
+        correlation_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+    ) -> list[LibrarianEvent]:
+        clauses: list[str] = []
+        values: list[object] = []
+        for column, value in (
+            ("token_id", token_id),
+            ("action", action),
+            ("outcome", outcome),
+            ("correlation_id", correlation_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                values.append(value)
+        if severity is not None:
+            # Severity is a floor, not an equality match: asking for `notice`
+            # means "notice and anything louder", which is how the admin view
+            # hides read noise without hiding writes.
+            ranked = SEVERITY_ORDER.get(severity)
+            if ranked is None:
+                raise ValueError(f"Unknown severity: {severity}")
+            allowed = [name for name, rank in SEVERITY_ORDER.items() if rank >= ranked]
+            clauses.append(f"severity IN ({','.join('?' * len(allowed))})")
+            values.extend(allowed)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            values.append(since)
+        if until is not None:
+            clauses.append("created_at <= ?")
+            values.append(until)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM librarian_events{where}"
+                " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (*values, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [self._librarian_event(row) for row in rows]
+
+    @staticmethod
+    def _librarian_token(row: sqlite3.Row) -> LibrarianToken:
+        return LibrarianToken(
+            id=row["id"],
+            name=row["name"],
+            scopes=_split(row["scopes"]),
+            library_ids=_split(row["library_ids"]),
+            created_at=_parse_time(row["created_at"]),
+            last_used_at=_parse_optional_time(row["last_used_at"]),
+            revoked_at=_parse_optional_time(row["revoked_at"]),
+        )
+
+    @staticmethod
+    def _librarian_event(row: sqlite3.Row) -> LibrarianEvent:
+        return LibrarianEvent(
+            id=row["id"],
+            kind=row["kind"],
+            action=row["action"],
+            severity=row["severity"],
+            outcome=row["outcome"],
+            summary=row["summary"],
+            created_at=_parse_time(row["created_at"]),
+            token_id=row["token_id"],
+            token_name=row["token_name"],
+            actor=row["actor"],
+            correlation_id=row["correlation_id"],
+            scopes_at_time=_split(row["scopes_at_time"]),
+            subject_type=row["subject_type"],
+            subject_id=row["subject_id"],
+            subject_label=row["subject_label"],
+            detail=json.loads(row["detail"]) if row["detail"] else None,
+        )
+
     @staticmethod
     def _catalog_series(row: sqlite3.Row) -> CatalogSeries:
         return CatalogSeries(
@@ -1937,3 +2234,19 @@ def _scope_predicate(scope: ReadScope | None) -> tuple[str, list[object]]:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _join(values: tuple[str, ...]) -> str:
+    return "\x1f".join(values)
+
+
+def _split(value: str) -> tuple[str, ...]:
+    return tuple(part for part in value.split("\x1f") if part)
+
+
+def _parse_time(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _parse_optional_time(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None

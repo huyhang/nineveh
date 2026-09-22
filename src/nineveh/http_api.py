@@ -3,12 +3,24 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -27,6 +39,8 @@ from .deployment import memory_limit_text
 from .domain import (
     AccessGrant,
     CatalogSeries,
+    LibrarianEvent,
+    LibrarianToken,
     LibraryUsage,
     ManagedLibrary,
     Page,
@@ -34,6 +48,12 @@ from .domain import (
     ReadingProgress,
     Session,
     User,
+)
+from .librarian import (
+    LibrarianConflict,
+    LibrarianError,
+    LibrarianNotFound,
+    LibrarianTooLarge,
 )
 from .metadata import MetadataError
 from .opds import CBZ_MEDIA_TYPE, NAVIGATION_PATH, PUBLICATIONS_PATH
@@ -1567,3 +1587,664 @@ def _catalog_modified(container: Container) -> str:
         container.scanner.status.catalog_modified_at
         or datetime.fromtimestamp(0, UTC).isoformat()
     )
+
+
+# --------------------------------------------------------------------------
+# Librarian agent
+#
+# Two rules shape this surface. Every route is named for one operation, so a
+# small model picks between four distinct verbs rather than a family of
+# lookalikes; and staging is a different scope from committing, so a token can
+# be allowed to propose an upload without being allowed to perform one.
+# --------------------------------------------------------------------------
+
+
+class LibrarianTokenCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(min_length=1)
+    library_ids: list[str] = Field(default_factory=list)
+
+
+class LibrarianTokenUpdate(BaseModel):
+    """Every field optional: a PATCH may change one facet and leave the rest."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    scopes: list[str] | None = Field(default=None, min_length=1)
+    library_ids: list[str] | None = None
+
+
+class LibrarianCommitInput(BaseModel):
+    filename: str | None = Field(default=None, max_length=255)
+
+
+async def librarian_identity(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> LibrarianToken:
+    secret = None
+    if authorization and authorization.lower().startswith("bearer "):
+        secret = authorization[len("bearer ") :].strip()
+    token = await run_in_threadpool(_container(request).librarian_auth.verify, secret)
+    if token is None:
+        raise HTTPException(
+            status_code=401, detail="Librarian authentication required"
+        )
+    return token
+
+
+def _correlation(request: Request) -> str:
+    """Group a resolve/stage/commit chain so the feed reads as one action."""
+    return request.headers.get("x-correlation-id") or str(uuid.uuid4())
+
+
+async def _require_librarian_scope(
+    request: Request, token: LibrarianToken, scope: str
+) -> None:
+    if token.permits(scope):
+        return
+    await run_in_threadpool(
+        _container(request).audit.record,
+        kind="usage",
+        action="scope.denied",
+        severity="security",
+        outcome="denied",
+        summary=f"“{token.name}” was refused {scope}",
+        token=token,
+        correlation_id=_correlation(request),
+        detail={"scope": scope},
+    )
+    raise HTTPException(status_code=403, detail=f"Librarian token lacks {scope}")
+
+
+def _librarian_error(error: LibrarianError) -> HTTPException:
+    if isinstance(error, LibrarianNotFound):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, LibrarianConflict):
+        return HTTPException(status_code=409, detail=str(error))
+    if isinstance(error, LibrarianTooLarge):
+        return HTTPException(status_code=413, detail=str(error))
+    return HTTPException(status_code=422, detail=str(error))
+
+
+@router.get("/api/v1/librarian/libraries", tags=["librarian"])
+async def librarian_libraries(
+    request: Request,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+) -> dict[str, object]:
+    await _require_librarian_scope(request, token, "catalog:read")
+    container = _container(request)
+    libraries = await run_in_threadpool(container.librarian.libraries, token)
+    await run_in_threadpool(
+        container.audit.record,
+        kind="usage",
+        action="libraries.list",
+        severity="info",
+        outcome="ok",
+        summary=f"“{token.name}” listed {len(libraries)} libraries",
+        token=token,
+        correlation_id=_correlation(request),
+    )
+    return {
+        "libraries": [
+            {"id": item.id, "name": item.name, "relativePath": item.relative_path}
+            for item in libraries
+        ]
+    }
+
+
+@router.get("/api/v1/librarian/series", tags=["librarian"])
+async def librarian_series(
+    request: Request,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+    query: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    library: Annotated[str | None, Query(max_length=200)] = None,
+    author: Annotated[str | None, Query(max_length=200)] = None,
+    artist: Annotated[str | None, Query(max_length=200)] = None,
+    publisher: Annotated[str | None, Query(max_length=200)] = None,
+    status_filter: Annotated[str | None, Query(alias="status", max_length=64)] = None,
+    tag: Annotated[str | None, Query(max_length=64)] = None,
+    title: Annotated[str | None, Query(max_length=200)] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> dict[str, object]:
+    """One collection, two questions.
+
+    Title resolution and metadata filtering are the same lookup with different
+    predicates, so they share a route; the harness exposes them as two
+    distinctly named tools. Keeping them as sibling endpoints is what makes a
+    small model pick the wrong one.
+    """
+    container = _container(request)
+    correlation = _correlation(request)
+    filters = (author, artist, publisher, status_filter, tag, title)
+    if query is None and not any(filters):
+        raise HTTPException(
+            status_code=422, detail="Provide query, or at least one metadata filter"
+        )
+    if query is not None:
+        await _require_librarian_scope(request, token, "catalog:read")
+        try:
+            resolution = await run_in_threadpool(
+                container.librarian.resolve, token, query, library=library, limit=limit
+            )
+        except LibrarianError as error:
+            raise _librarian_error(error) from error
+        await run_in_threadpool(
+            container.audit.record,
+            kind="usage",
+            action="series.resolve",
+            severity="info",
+            outcome="ok",
+            summary=(
+                f"“{token.name}” resolved “{query}” → "
+                + (
+                    f"{resolution.candidates[0].series.name} "
+                    f"({resolution.candidates[0].score:.2f})"
+                    if resolution.candidates
+                    else "no match"
+                )
+            ),
+            token=token,
+            correlation_id=correlation,
+            detail={"query": query, "matches": len(resolution.candidates)},
+        )
+        return {
+            "candidates": [_match_payload(item) for item in resolution.candidates],
+            "confidentMatch": resolution.confident_match,
+            "ambiguous": resolution.ambiguous,
+        }
+    await _require_librarian_scope(request, token, "metadata:read")
+    try:
+        found = await run_in_threadpool(
+            lambda: container.librarian.search_metadata(
+                token,
+                author=author,
+                artist=artist,
+                publisher=publisher,
+                status=status_filter,
+                tag=tag,
+                title=title,
+                limit=limit,
+            )
+        )
+    except LibrarianError as error:
+        raise _librarian_error(error) from error
+    await run_in_threadpool(
+        container.audit.record,
+        kind="usage",
+        action="metadata.search",
+        severity="info",
+        outcome="ok",
+        summary=f"“{token.name}” searched metadata → {len(found)} series",
+        token=token,
+        correlation_id=correlation,
+        detail={
+            name: value
+            for name, value in (
+                ("author", author),
+                ("artist", artist),
+                ("publisher", publisher),
+                ("status", status_filter),
+                ("tag", tag),
+                ("title", title),
+            )
+            if value
+        },
+    )
+    return {
+        "candidates": [
+            _series_summary(series, metadata) for series, metadata in found
+        ],
+        "confidentMatch": None,
+        "ambiguous": len(found) != 1,
+    }
+
+
+@router.get("/api/v1/librarian/series/{series_id}", tags=["librarian"])
+async def librarian_series_detail(
+    request: Request,
+    series_id: str,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+) -> dict[str, object]:
+    await _require_librarian_scope(request, token, "catalog:read")
+    container = _container(request)
+    try:
+        inventory = await run_in_threadpool(
+            container.librarian.inventory, token, series_id
+        )
+    except LibrarianError as error:
+        raise _librarian_error(error) from error
+    latest = inventory.latest
+    await run_in_threadpool(
+        container.audit.record,
+        kind="usage",
+        action="series.inventory",
+        severity="info",
+        outcome="ok",
+        summary=(
+            f"“{token.name}” read {inventory.series.name} — "
+            f"{len(inventory.publications)} volumes"
+        ),
+        token=token,
+        correlation_id=_correlation(request),
+        subject=("series", inventory.series.id, inventory.series.name),
+    )
+    return {
+        "series": _series_summary(inventory.series, inventory.metadata),
+        "inventory": {
+            "publicationCount": len(inventory.publications),
+            "totalSize": inventory.total_size,
+            "latest": _publication_payload(latest) if latest else None,
+            "filenames": [item.filename for item in inventory.publications],
+            "publications": [
+                _publication_payload(item) for item in inventory.publications
+            ],
+        },
+        "providerTotals": inventory.provider_totals,
+    }
+
+
+@router.post("/api/v1/librarian/ingest", status_code=201, tags=["librarian"])
+async def librarian_ingest_stage(
+    request: Request,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+    series_id: Annotated[str, Form(max_length=64)],
+    filename: Annotated[str, Form(max_length=255)],
+    file: Annotated[UploadFile, File()],
+) -> dict[str, object]:
+    await _require_librarian_scope(request, token, "ingest:stage")
+    container = _container(request)
+    correlation = _correlation(request)
+    try:
+        staged = await run_in_threadpool(
+            container.ingest.stage, token, series_id, filename, file.file
+        )
+    except LibrarianError as error:
+        await run_in_threadpool(
+            container.audit.record,
+            kind="usage",
+            action="ingest.stage",
+            severity="notice",
+            outcome="rejected",
+            summary=f"“{token.name}” upload rejected — {error}",
+            token=token,
+            correlation_id=correlation,
+            detail={"filename": filename, "seriesId": series_id},
+        )
+        raise _librarian_error(error) from error
+    finally:
+        await file.close()
+    await run_in_threadpool(
+        container.audit.record,
+        kind="usage",
+        action="ingest.stage",
+        severity="notice",
+        outcome="ok",
+        summary=(
+            f"“{token.name}” staged {staged.suggested_filename} "
+            f"({_readable(staged.size)}, {staged.page_count} pages)"
+        ),
+        token=token,
+        correlation_id=correlation,
+        subject=("ingest", staged.id, staged.suggested_filename),
+        detail={"targetPath": staged.target_path, "sha256": staged.sha256},
+    )
+    return _staged_payload(staged)
+
+
+@router.get("/api/v1/librarian/ingest", tags=["librarian"])
+async def librarian_ingest_pending(
+    request: Request,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+) -> dict[str, object]:
+    """What is waiting for a commit — the approve-at-the-desk queue."""
+    await _require_librarian_scope(request, token, "ingest:stage")
+    pending = await run_in_threadpool(_container(request).ingest.pending, token)
+    return {"pending": [_staged_payload(item) for item in pending]}
+
+
+@router.get("/api/v1/librarian/ingest/{ingest_id}", tags=["librarian"])
+async def librarian_ingest_detail(
+    request: Request,
+    ingest_id: str,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+) -> dict[str, object]:
+    await _require_librarian_scope(request, token, "ingest:stage")
+    container = _container(request)
+    staged = await run_in_threadpool(container.ingest.staged, token, ingest_id)
+    if staged is not None:
+        return _staged_payload(staged)
+    # The staged record is gone, but the activity feed remembers what happened
+    # to it. An agent that lost its connection can still learn the outcome.
+    events = await run_in_threadpool(
+        container.audit.events, correlation_id=None, action="ingest.commit", limit=200
+    )
+    for event in events:
+        if event.subject_id == ingest_id:
+            return {
+                "ingestId": ingest_id,
+                "state": "placed" if event.outcome == "ok" else event.outcome,
+                "relativePath": (event.detail or {}).get("relativePath"),
+                "committedAt": event.created_at.isoformat(),
+                "summary": event.summary,
+            }
+    raise HTTPException(status_code=404, detail="Staged upload not found or expired")
+
+
+@router.post(
+    "/api/v1/librarian/ingest/{ingest_id}/commit", tags=["librarian"]
+)
+async def librarian_ingest_commit(
+    request: Request,
+    ingest_id: str,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+    body: LibrarianCommitInput | None = None,
+) -> dict[str, object]:
+    await _require_librarian_scope(request, token, "ingest:commit")
+    container = _container(request)
+    correlation = _correlation(request)
+    try:
+        placed = await run_in_threadpool(
+            container.ingest.commit,
+            token,
+            ingest_id,
+            body.filename if body else None,
+        )
+    except LibrarianError as error:
+        await run_in_threadpool(
+            container.audit.record,
+            kind="usage",
+            action="ingest.commit",
+            severity="important",
+            outcome="conflict" if isinstance(error, LibrarianConflict) else "rejected",
+            summary=f"“{token.name}” commit refused — {error}",
+            token=token,
+            correlation_id=correlation,
+            subject=("ingest", ingest_id, ingest_id),
+        )
+        raise _librarian_error(error) from error
+    await run_in_threadpool(
+        container.audit.record,
+        kind="usage",
+        action="ingest.commit",
+        severity="important",
+        outcome="ok",
+        summary=f"“{token.name}” placed {placed.relative_path}",
+        token=token,
+        correlation_id=correlation,
+        subject=("ingest", ingest_id, placed.filename),
+        detail={"relativePath": placed.relative_path, "size": placed.size},
+    )
+    request.app.state.start_scan(placed.library_id)
+    return {
+        "ingestId": ingest_id,
+        "state": "placed",
+        "seriesId": placed.series_id,
+        "filename": placed.filename,
+        "relativePath": placed.relative_path,
+        "size": placed.size,
+        "pageCount": placed.page_count,
+        "scanStarted": True,
+    }
+
+
+@router.delete(
+    "/api/v1/librarian/ingest/{ingest_id}", status_code=204, tags=["librarian"]
+)
+async def librarian_ingest_discard(
+    request: Request,
+    ingest_id: str,
+    token: Annotated[LibrarianToken, Depends(librarian_identity)],
+) -> Response:
+    await _require_librarian_scope(request, token, "ingest:stage")
+    container = _container(request)
+    if not await run_in_threadpool(container.ingest.discard, token, ingest_id):
+        raise HTTPException(status_code=404, detail="Staged upload not found")
+    await run_in_threadpool(
+        container.audit.record,
+        kind="usage",
+        action="ingest.discard",
+        severity="notice",
+        outcome="ok",
+        summary=f"“{token.name}” discarded a staged upload",
+        token=token,
+        correlation_id=_correlation(request),
+        subject=("ingest", ingest_id, ingest_id),
+    )
+    return Response(status_code=204)
+
+
+@router.get("/api/v1/admin/librarian-tokens", tags=["admin"])
+async def list_librarian_tokens(
+    request: Request,
+    identity: Annotated[Identity, Depends(administrator)],
+    include_revoked: Annotated[bool, Query()] = False,
+) -> dict[str, object]:
+    tokens = await run_in_threadpool(
+        _container(request).librarian_auth.tokens, include_revoked=include_revoked
+    )
+    return {"tokens": [_token_payload(item) for item in tokens]}
+
+
+@router.post("/api/v1/admin/librarian-tokens", status_code=201, tags=["admin"])
+async def create_librarian_token(
+    request: Request,
+    body: LibrarianTokenCreate,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf)
+    try:
+        token, secret = await run_in_threadpool(
+            _container(request).librarian_auth.issue,
+            body.name,
+            tuple(body.scopes),
+            tuple(body.library_ids),
+            actor=identity.user.username,
+        )
+    except LibrarianError as error:
+        raise _librarian_error(error) from error
+    # The only time the secret exists in a response. It is stored as a hash.
+    return {**_token_payload(token), "secret": secret}
+
+
+@router.patch("/api/v1/admin/librarian-tokens/{token_id}", tags=["admin"])
+async def update_librarian_token(
+    request: Request,
+    token_id: str,
+    body: LibrarianTokenUpdate,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    """Re-scope a live token. The secret is never rotated by this call."""
+    require_api_csrf(request, identity, csrf)
+    try:
+        updated = await run_in_threadpool(
+            lambda: _container(request).librarian_auth.update(
+                token_id,
+                name=body.name,
+                scopes=tuple(body.scopes) if body.scopes is not None else None,
+                library_ids=(
+                    tuple(body.library_ids) if body.library_ids is not None else None
+                ),
+                actor=identity.user.username,
+            )
+        )
+    except LibrarianError as error:
+        raise _librarian_error(error) from error
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Librarian token not found")
+    return _token_payload(updated)
+
+
+@router.delete("/api/v1/admin/librarian-tokens/{token_id}", tags=["admin"])
+async def revoke_librarian_token(
+    request: Request,
+    token_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf)
+    revoked = await run_in_threadpool(
+        _container(request).librarian_auth.revoke,
+        token_id,
+        actor=identity.user.username,
+    )
+    if revoked is None:
+        raise HTTPException(status_code=404, detail="Librarian token not found")
+    return _token_payload(revoked)
+
+
+@router.get("/api/v1/admin/librarian/activity", tags=["admin"])
+async def librarian_activity(
+    request: Request,
+    identity: Annotated[Identity, Depends(administrator)],
+    token_id: Annotated[str | None, Query()] = None,
+    severity: Annotated[
+        Literal["info", "notice", "important", "security"] | None, Query()
+    ] = None,
+    action: Annotated[str | None, Query(max_length=64)] = None,
+    outcome: Annotated[str | None, Query(max_length=32)] = None,
+    correlation_id: Annotated[str | None, Query()] = None,
+    since: Annotated[str | None, Query(max_length=40)] = None,
+    until: Annotated[str | None, Query(max_length=40)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict[str, object]:
+    """Lifecycle and usage in one chronological feed.
+
+    Severity is a floor, so the default view can hide read noise without
+    hiding writes; `info` opts back into the resolves.
+    """
+    container = _container(request)
+    current = {
+        item.id: item.scopes
+        for item in await run_in_threadpool(
+            container.librarian_auth.tokens, include_revoked=True
+        )
+    }
+    events = await run_in_threadpool(
+        lambda: container.audit.events(
+            token_id=token_id,
+            severity=severity,
+            action=action,
+            outcome=outcome,
+            correlation_id=correlation_id,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return {"events": [_event_payload(item, current) for item in events]}
+
+
+def _match_payload(match) -> dict[str, object]:
+    series = match.series
+    return {
+        "seriesId": series.id,
+        "libraryId": series.library_id,
+        "library": series.library,
+        "category": series.category,
+        "localName": series.name,
+        "publicationCount": series.publication_count,
+        "score": round(match.score, 4),
+        "matchedOn": match.matched_on,
+        "matchedValue": match.matched_value,
+    }
+
+
+def _series_summary(series: CatalogSeries, metadata) -> dict[str, object]:
+    return {
+        "seriesId": series.id,
+        "libraryId": series.library_id,
+        "library": series.library,
+        "category": series.category,
+        "localName": series.name,
+        "title": (metadata.title if metadata else None) or series.name,
+        "publicationCount": series.publication_count,
+    }
+
+
+def _publication_payload(item: Publication) -> dict[str, object]:
+    return {
+        "id": item.id,
+        "filename": item.filename,
+        "title": item.title,
+        "number": item.number,
+        "size": item.size,
+        "pageCount": item.page_count,
+    }
+
+
+def _staged_payload(staged) -> dict[str, object]:
+    duplicate = staged.duplicate_of
+    return {
+        "ingestId": staged.id,
+        "state": staged.state,
+        "seriesId": staged.series_id,
+        "filename": staged.filename,
+        "suggestedFilename": staged.suggested_filename,
+        "siblingPattern": staged.sibling_pattern,
+        "targetPath": staged.target_path,
+        "size": staged.size,
+        "pageCount": staged.page_count,
+        "sha256": staged.sha256,
+        "duplicateOf": (
+            {"publicationId": duplicate[0], "filename": duplicate[1]}
+            if duplicate
+            else None
+        ),
+        "createdAt": staged.created_at.isoformat(),
+    }
+
+
+def _token_payload(token: LibrarianToken) -> dict[str, object]:
+    return {
+        "id": token.id,
+        "name": token.name,
+        "scopes": list(token.scopes),
+        "libraryIds": list(token.library_ids),
+        "createdAt": token.created_at.isoformat(),
+        "lastUsedAt": token.last_used_at.isoformat() if token.last_used_at else None,
+        "revokedAt": token.revoked_at.isoformat() if token.revoked_at else None,
+    }
+
+
+def _event_payload(
+    event: LibrarianEvent, current_scopes: dict[str, tuple[str, ...]]
+) -> dict[str, object]:
+    effective = list(event.scopes_at_time)
+    now = current_scopes.get(event.token_id or "")
+    return {
+        "id": event.id,
+        "kind": event.kind,
+        "action": event.action,
+        "severity": event.severity,
+        "outcome": event.outcome,
+        "summary": event.summary,
+        "createdAt": event.created_at.isoformat(),
+        "tokenId": event.token_id,
+        "tokenName": event.token_name,
+        "actor": event.actor,
+        "correlationId": event.correlation_id,
+        "scopesAtTime": effective,
+        # The one comparison worth surfacing: this action ran under different
+        # permissions than the token carries now.
+        "scopesDiffer": now is not None and list(now) != effective and bool(effective),
+        "subject": (
+            {
+                "type": event.subject_type,
+                "id": event.subject_id,
+                "label": event.subject_label,
+            }
+            if event.subject_type
+            else None
+        ),
+        "detail": event.detail,
+    }
+
+
+def _readable(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size} B"

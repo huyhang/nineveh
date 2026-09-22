@@ -8,13 +8,14 @@ that somebody remembered to regenerate it.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
 import pytest
 
 from nineveh import __version__
-from nineveh.app import openapi_document
+from nineveh.app import openapi_document, tagged_contract
 from nineveh.http_api import router as api_router
 from nineveh.http_web import router as web_router
 
@@ -85,3 +86,74 @@ def test_every_operation_is_tagged_for_navigation(document: dict):
         if not document["paths"][path][method].get("tags")
     ]
     assert untagged == []
+
+
+# --------------------------------------------------------------------------
+# The per-tag slice a client in another repository vendors
+# --------------------------------------------------------------------------
+
+AGENT_CONTRACT = CONTRACT.parent / "librarian-openapi.json"
+SCHEMA_REF = re.compile(r'"\$ref":\s*"#/components/schemas/([^"]+)"')
+
+
+@pytest.fixture(scope="module")
+def agent_document() -> dict:
+    return json.loads(AGENT_CONTRACT.read_text(encoding="utf-8"))
+
+
+def test_the_committed_agent_contract_matches_the_running_application():
+    expected = (
+        json.dumps(tagged_contract("librarian"), indent=2, sort_keys=True) + "\n"
+    )
+    assert AGENT_CONTRACT.read_text(encoding="utf-8") == expected, (
+        "docs/librarian-openapi.json is stale — run `python scripts/export-openapi.py`"
+    )
+
+
+def test_the_agent_contract_carries_every_librarian_operation(
+    document: dict, agent_document: dict
+):
+    tagged = {
+        (path, method)
+        for path, method in _operations(document)
+        if "librarian" in (document["paths"][path][method].get("tags") or [])
+    }
+    assert set(_operations(agent_document)) == tagged
+    assert tagged, "the tag filter matched nothing, so the subset proves nothing"
+
+
+def test_the_agent_contract_leaves_out_administration(agent_document: dict):
+    """A token-management endpoint is the operator's, not the agent's."""
+    assert not [path for path, _ in _operations(agent_document) if "/admin/" in path]
+
+
+def test_every_reference_in_the_agent_contract_resolves_inside_it(
+    agent_document: dict,
+):
+    """A subset that references a schema it does not carry fails at code
+    generation, which is far later and more confusing than failing here."""
+    carried = set(agent_document.get("components", {}).get("schemas", {}))
+    referenced = set(SCHEMA_REF.findall(json.dumps(agent_document)))
+    assert referenced - carried == set()
+
+
+def test_the_agent_contract_carries_nothing_it_does_not_reference(
+    agent_document: dict,
+):
+    """Unused schemas would reintroduce the churn the subset exists to avoid."""
+    carried = set(agent_document.get("components", {}).get("schemas", {}))
+    referenced = set(SCHEMA_REF.findall(json.dumps(agent_document)))
+    assert carried - referenced == set()
+
+
+def test_the_agent_contract_is_versioned_with_the_package(agent_document: dict):
+    assert agent_document["info"]["version"] == __version__
+    assert agent_document["openapi"].startswith("3.1")
+    assert agent_document["info"]["title"].endswith("(librarian)")
+
+
+def test_an_unknown_tag_yields_an_empty_contract():
+    """So a typo in the export script fails loudly rather than shipping a stub."""
+    empty = tagged_contract("no-such-tag")
+    assert empty["paths"] == {}
+    assert "components" not in empty

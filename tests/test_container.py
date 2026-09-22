@@ -25,9 +25,15 @@ from fastapi.testclient import TestClient
 from nineveh.app import Container, create_app
 from nineveh.auth import AuthService
 from nineveh.authorization import AccessService, ReadAllPolicy
-from nineveh.catalog import LibraryService
+from nineveh.catalog import ArchiveInspector, LibraryService
 from nineveh.config import Settings, SettingsService
 from nineveh.database import SQLiteRepository
+from nineveh.librarian import (
+    AuditTrail,
+    IngestService,
+    LibrarianAuth,
+    LibrarianService,
+)
 from nineveh.domain import ScannedPublication
 from nineveh.opds import OpdsBuilder
 from nineveh.reader import ReaderService
@@ -45,6 +51,7 @@ def fake_container(tmp_path: Path) -> Container:
     repository = SQLiteRepository(settings.database_path)
     cover = tmp_path / "cover.webp"
     cover.write_bytes(b"fake-cover")
+    audit = AuditTrail(repository)
     return Container(
         settings=settings,
         repository=repository,
@@ -61,6 +68,16 @@ def fake_container(tmp_path: Path) -> Container:
         configuration=SettingsService(settings, repository),
         restarter=FakeRestartController(enabled=False),
         reader=ReaderService(repository, repository),
+        audit=audit,
+        librarian_auth=LibrarianAuth(repository, audit),
+        librarian=LibrarianService(repository),
+        ingest=IngestService(
+            settings.data_dir,
+            settings.ingest_staging_dir,
+            repository,
+            ArchiveInspector(settings),
+            settings.max_upload_bytes,
+        ),
     )
 
 
