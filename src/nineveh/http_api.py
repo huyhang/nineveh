@@ -1626,9 +1626,7 @@ async def librarian_identity(
         secret = authorization[len("bearer ") :].strip()
     token = await run_in_threadpool(_container(request).librarian_auth.verify, secret)
     if token is None:
-        raise HTTPException(
-            status_code=401, detail="Librarian authentication required"
-        )
+        raise HTTPException(status_code=401, detail="Librarian authentication required")
     return token
 
 
@@ -1791,9 +1789,7 @@ async def librarian_series(
         },
     )
     return {
-        "candidates": [
-            _series_summary(series, metadata) for series, metadata in found
-        ],
+        "candidates": [_series_summary(series, metadata) for series, metadata in found],
         "confidentMatch": None,
         "ambiguous": len(found) != 1,
     }
@@ -1930,9 +1926,7 @@ async def librarian_ingest_detail(
     raise HTTPException(status_code=404, detail="Staged upload not found or expired")
 
 
-@router.post(
-    "/api/v1/librarian/ingest/{ingest_id}/commit", tags=["librarian"]
-)
+@router.post("/api/v1/librarian/ingest/{ingest_id}/commit", tags=["librarian"])
 async def librarian_ingest_commit(
     request: Request,
     ingest_id: str,

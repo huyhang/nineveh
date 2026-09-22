@@ -28,13 +28,13 @@ from nineveh.authorization import AccessService, ReadAllPolicy
 from nineveh.catalog import ArchiveInspector, LibraryService
 from nineveh.config import Settings, SettingsService
 from nineveh.database import SQLiteRepository
+from nineveh.domain import ScannedPublication
 from nineveh.librarian import (
     AuditTrail,
     IngestService,
     LibrarianAuth,
     LibrarianService,
 )
-from nineveh.domain import ScannedPublication
 from nineveh.opds import OpdsBuilder
 from nineveh.reader import ReaderService
 

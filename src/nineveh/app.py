@@ -424,7 +424,9 @@ def tagged_contract(tag: str, document: dict[str, object] | None = None) -> dict
     }
     if wanted:
         contract["components"] = {
-            "schemas": {name: schemas[name] for name in sorted(wanted) if name in schemas}
+            "schemas": {
+                name: schemas[name] for name in sorted(wanted) if name in schemas
+            }
         }
     return contract
 

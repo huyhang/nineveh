@@ -1869,8 +1869,7 @@ class SQLiteRepository:
         where = "" if include_revoked else " WHERE revoked_at IS NULL"
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM librarian_tokens{where}"
-                " ORDER BY created_at DESC"
+                f"SELECT * FROM librarian_tokens{where} ORDER BY created_at DESC"
             ).fetchall()
         return [self._librarian_token(row) for row in rows]
 

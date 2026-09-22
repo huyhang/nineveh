@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import io
 import zipfile
-from pathlib import Path
 
 import pytest
 from conftest import authorization, image_bytes
@@ -130,13 +129,19 @@ def test_revoking_clears_the_hash_so_the_secret_cannot_authenticate(
     client: TestClient,
 ):
     token = issue(client)
-    assert client.get("/api/v1/librarian/libraries", headers=bearer(token)).status_code == 200
+    assert (
+        client.get("/api/v1/librarian/libraries", headers=bearer(token)).status_code
+        == 200
+    )
     revoked = client.delete(
         f"/api/v1/admin/librarian-tokens/{token['id']}", headers=authorization()
     )
     assert revoked.status_code == 200
     assert revoked.json()["revokedAt"]
-    assert client.get("/api/v1/librarian/libraries", headers=bearer(token)).status_code == 401
+    assert (
+        client.get("/api/v1/librarian/libraries", headers=bearer(token)).status_code
+        == 401
+    )
 
 
 def test_a_revoked_token_leaves_the_list_but_stays_auditable(client: TestClient):
@@ -302,13 +307,11 @@ def test_a_query_or_a_filter_is_required(client: TestClient):
 def test_a_disabled_library_is_invisible_by_id_and_by_name(client: TestClient):
     """Both lookup paths, because they are guarded in different places."""
     token = issue(client, ("catalog:read",))
-    listed = client.get(
-        "/api/v1/admin/libraries", headers=authorization()
-    ).json()["libraries"]
+    listed = client.get("/api/v1/admin/libraries", headers=authorization()).json()[
+        "libraries"
+    ]
     library = listed[0]
-    client.delete(
-        f"/api/v1/admin/libraries/{library['id']}", headers=authorization()
-    )
+    client.delete(f"/api/v1/admin/libraries/{library['id']}", headers=authorization())
     for reference in (library["id"], library["name"], library["name"].lower()):
         response = client.get(
             "/api/v1/librarian/series",
@@ -322,9 +325,12 @@ def test_a_token_cannot_reach_a_library_outside_its_grant(
     client: TestClient, series_id: str
 ):
     token = issue(client, ("catalog:read",), library_ids=("some-other-library",))
-    assert client.get("/api/v1/librarian/libraries", headers=bearer(token)).json()[
-        "libraries"
-    ] == []
+    assert (
+        client.get("/api/v1/librarian/libraries", headers=bearer(token)).json()[
+            "libraries"
+        ]
+        == []
+    )
     assert (
         client.get(
             f"/api/v1/librarian/series/{series_id}", headers=bearer(token)
@@ -344,9 +350,7 @@ def test_a_token_cannot_reach_a_library_outside_its_grant(
 # --------------------------------------------------------------------------
 
 
-def test_inventory_reports_volumes_and_filenames(
-    client: TestClient, series_id: str
-):
+def test_inventory_reports_volumes_and_filenames(client: TestClient, series_id: str):
     token = issue(client, ("catalog:read",))
     body = client.get(
         f"/api/v1/librarian/series/{series_id}", headers=bearer(token)
@@ -431,7 +435,7 @@ def test_committing_twice_is_not_possible(client: TestClient, series_id: str):
 def test_an_existing_file_is_never_overwritten(
     client: TestClient, series_id: str, library
 ):
-    settings, archive = library
+    _settings, archive = library
     token = issue(client, ("catalog:read", "ingest:stage", "ingest:commit"))
     original = archive.read_bytes()
     staged = stage(client, token, series_id, "Issue 1.cbz", cbz_bytes(pages=5)).json()
@@ -497,9 +501,7 @@ def test_an_oversized_upload_is_refused(
     client: TestClient, series_id: str, library, monkeypatch
 ):
     token = issue(client, ("catalog:read", "ingest:stage"))
-    monkeypatch.setattr(
-        client.app.state.container.ingest, "_max_upload_bytes", 64
-    )
+    monkeypatch.setattr(client.app.state.container.ingest, "_max_upload_bytes", 64)
     response = stage(client, token, series_id, "big.cbz", cbz_bytes(pages=6))
     assert response.status_code == 413
 
@@ -508,11 +510,9 @@ def test_identical_content_is_flagged_before_the_commit(
     client: TestClient, series_id: str, library
 ):
     """The duplicate shows up in the proposal, not as a late rejection."""
-    settings, archive = library
+    _settings, archive = library
     token = issue(client, ("catalog:read", "ingest:stage"))
-    staged = stage(
-        client, token, series_id, "Issue 2.cbz", archive.read_bytes()
-    ).json()
+    staged = stage(client, token, series_id, "Issue 2.cbz", archive.read_bytes()).json()
     assert staged["duplicateOf"]["filename"] == "Issue 1.cbz"
 
 
@@ -524,9 +524,7 @@ def test_a_different_archive_is_not_flagged_as_duplicate(
     assert staged["duplicateOf"] is None
 
 
-def test_a_staged_upload_can_be_discarded(
-    client: TestClient, series_id: str, library
-):
+def test_a_staged_upload_can_be_discarded(client: TestClient, series_id: str, library):
     settings, _ = library
     token = issue(client, ("catalog:read", "ingest:stage"))
     staged = stage(client, token, series_id, "Issue 2.cbz").json()
@@ -545,9 +543,7 @@ def test_a_staged_upload_can_be_discarded(
     )
 
 
-def test_pending_lists_what_is_waiting_for_approval(
-    client: TestClient, series_id: str
-):
+def test_pending_lists_what_is_waiting_for_approval(client: TestClient, series_id: str):
     token = issue(client, ("catalog:read", "ingest:stage"))
     stage(client, token, series_id, "Issue 2.cbz")
     stage(client, token, series_id, "Issue 3.cbz", cbz_bytes(pages=4))
@@ -568,9 +564,7 @@ def test_a_malformed_ingest_id_cannot_reach_the_filesystem(
         )
 
 
-def test_the_outcome_survives_the_staged_record(
-    client: TestClient, series_id: str
-):
+def test_the_outcome_survives_the_staged_record(client: TestClient, series_id: str):
     """A dropped connection must not cost the agent the answer."""
     token = issue(client, ("catalog:read", "ingest:stage", "ingest:commit"))
     staged = stage(client, token, series_id, "Issue 2.cbz").json()
@@ -637,7 +631,7 @@ def test_the_feed_reads_as_sentences_and_records_the_scopes_in_force(
         headers=authorization(),
         params={"severity": "notice"},
     ).json()["events"]
-    placed = [item for item in feed if item["action"] == "ingest.commit"][0]
+    placed = next(item for item in feed if item["action"] == "ingest.commit")
     assert placed["summary"].startswith("“Cleo” placed ")
     assert placed["severity"] == "important"
     assert placed["outcome"] == "ok"
@@ -669,9 +663,7 @@ def test_the_feed_hides_reads_until_asked(client: TestClient, series_id: str):
 def test_a_chain_shares_one_correlation_id(client: TestClient, series_id: str):
     token = issue(client, ALL_SCOPES)
     headers = {**bearer(token), "X-Correlation-Id": "chain-1"}
-    client.get(
-        "/api/v1/librarian/series", headers=headers, params={"query": "Example"}
-    )
+    client.get("/api/v1/librarian/series", headers=headers, params={"query": "Example"})
     staged = client.post(
         "/api/v1/librarian/ingest",
         headers=headers,
@@ -757,7 +749,7 @@ def test_suggest_filename_follows_the_series_pattern():
 
 
 def test_suggest_filename_sanitizes_hostile_characters():
-    assert suggest_filename('ev<il>:x.cbz', [])[0] == "ev_il__x.cbz"
+    assert suggest_filename("ev<il>:x.cbz", [])[0] == "ev_il__x.cbz"
     assert suggest_filename("  sp  aced  .cbz", [])[0] == "sp aced.cbz"
 
 
@@ -768,7 +760,7 @@ def test_a_lone_sibling_is_not_a_pattern():
 
 def test_exact_titles_outrank_substrings():
     titles = [("localName", "Saga"), ("title", "Saga of the Long Winter")]
-    score, source, value = best_match("Saga", titles)
+    score, _source, value = best_match("Saga", titles)
     assert score == 1.0
     assert value == "Saga"
 
@@ -899,7 +891,12 @@ def test_metadata_with_no_usable_fields_is_simply_unmatched(
     client: TestClient, series_id: str
 ):
     client.app.state.container.repository.save_series_metadata(
-        series_id, 1, "https://example.invalid/1", {"title": 12, "authors": "nope"}, {}, None
+        series_id,
+        1,
+        "https://example.invalid/1",
+        {"title": 12, "authors": "nope"},
+        {},
+        None,
     )
     token = issue(client, ("catalog:read", "metadata:read"))
     assert (
@@ -936,9 +933,9 @@ def test_a_token_name_must_be_reasonable(client: TestClient, name: str):
 
 def test_changing_the_reachable_libraries_is_recorded(client: TestClient):
     token = issue(client, ("catalog:read",))
-    listed = client.get(
-        "/api/v1/admin/libraries", headers=authorization()
-    ).json()["libraries"]
+    listed = client.get("/api/v1/admin/libraries", headers=authorization()).json()[
+        "libraries"
+    ]
     client.patch(
         f"/api/v1/admin/librarian-tokens/{token['id']}",
         headers=authorization(),
@@ -1016,9 +1013,10 @@ def test_a_corrupt_sidecar_is_ignored_rather_than_crashing(
         == 404
     )
     sidecar.write_text('{"id": "x"}', encoding="utf-8")
-    assert client.get("/api/v1/librarian/ingest", headers=bearer(token)).json()[
-        "pending"
-    ] == []
+    assert (
+        client.get("/api/v1/librarian/ingest", headers=bearer(token)).json()["pending"]
+        == []
+    )
 
 
 def test_expired_staging_is_swept_including_orphaned_archives(
@@ -1061,9 +1059,12 @@ def test_a_disabled_library_stays_hidden_even_with_its_catalog_intact(
             "UPDATE managed_libraries SET enabled = 0 WHERE id = ?", (library.id,)
         )
     token = issue(client, ("catalog:read",))
-    assert client.get("/api/v1/librarian/libraries", headers=bearer(token)).json()[
-        "libraries"
-    ] == []
+    assert (
+        client.get("/api/v1/librarian/libraries", headers=bearer(token)).json()[
+            "libraries"
+        ]
+        == []
+    )
     assert (
         client.get(
             f"/api/v1/librarian/series/{series_id}", headers=bearer(token)
@@ -1079,9 +1080,14 @@ def test_a_disabled_library_stays_hidden_even_with_its_catalog_intact(
             ).status_code
             == 404
         )
-    assert client.get(
-        "/api/v1/librarian/series", headers=bearer(token), params={"query": "Example"}
-    ).json()["candidates"] == []
+    assert (
+        client.get(
+            "/api/v1/librarian/series",
+            headers=bearer(token),
+            params={"query": "Example"},
+        ).json()["candidates"]
+        == []
+    )
 
 
 def test_a_disabled_library_refuses_new_uploads(client: TestClient, series_id: str):
@@ -1121,7 +1127,9 @@ def login(client: TestClient) -> str:
     from conftest import ADMIN_PASSWORD
 
     client.post(
-        "/login", data={"username": "admin", "password": ADMIN_PASSWORD}, follow_redirects=False
+        "/login",
+        data={"username": "admin", "password": ADMIN_PASSWORD},
+        follow_redirects=False,
     )
     page = client.get("/admin/librarian")
     marker = 'name="csrf_token" value="'
@@ -1190,9 +1198,7 @@ def test_revoking_clears_the_row_but_not_the_history(client: TestClient):
     token_id = client.get(
         "/api/v1/admin/librarian-tokens", headers=authorization()
     ).json()["tokens"][0]["id"]
-    client.post(
-        f"/admin/librarian/tokens/{token_id}/revoke", data={"csrf_token": csrf}
-    )
+    client.post(f"/admin/librarian/tokens/{token_id}/revoke", data={"csrf_token": csrf})
     page = client.get("/admin/librarian?severity=security")
     assert "No librarian tokens yet." in page.text
     assert "issued token “Cleo”" in page.text
@@ -1284,9 +1290,7 @@ def backdate(client: TestClient, days: int, *, action: str | None = None) -> Non
                 (when, action),
             )
         else:
-            connection.execute(
-                "UPDATE librarian_events SET created_at = ?", (when,)
-            )
+            connection.execute("UPDATE librarian_events SET created_at = ?", (when,))
 
 
 def feed(client: TestClient, severity: str = "info") -> list[dict]:
@@ -1375,7 +1379,11 @@ def test_the_clear_records_itself(client: TestClient, series_id: str):
     client.post(
         "/admin/librarian/activity/clear", data={"csrf_token": csrf, "window": "month"}
     )
-    cleared = [item for item in feed(client, "security") if item["action"] == "activity.cleared"]
+    cleared = [
+        item
+        for item in feed(client, "security")
+        if item["action"] == "activity.cleared"
+    ]
     assert cleared, [item["action"] for item in feed(client, "security")]
     assert cleared[0]["detail"]["removed"] == aged
     assert cleared[0]["detail"]["window"] == "month"

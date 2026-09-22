@@ -1387,8 +1387,8 @@ async def admin_issue_librarian_token(
     request: Request,
     name: str = Form(..., max_length=64),
     csrf_token: str = Form(...),
-    scopes: list[str] = Form(default=[]),
-    library_ids: list[str] = Form(default=[]),
+    scopes: Annotated[list[str] | None, Form()] = None,
+    library_ids: Annotated[list[str] | None, Form()] = None,
 ):
     """Issue a token and render the secret on this response.
 
@@ -1404,8 +1404,8 @@ async def admin_issue_librarian_token(
         token, secret = await run_in_threadpool(
             container.librarian_auth.issue,
             name,
-            tuple(scopes),
-            tuple(library_ids),
+            tuple(scopes or ()),
+            tuple(library_ids or ()),
             actor=session.user.username,
         )
     except LibrarianError as error:
@@ -1423,8 +1423,8 @@ async def admin_update_librarian_token(
     token_id: str,
     csrf_token: str = Form(...),
     name: str = Form(..., max_length=64),
-    scopes: list[str] = Form(default=[]),
-    library_ids: list[str] = Form(default=[]),
+    scopes: Annotated[list[str] | None, Form()] = None,
+    library_ids: Annotated[list[str] | None, Form()] = None,
 ):
     session = await _require_admin(request)
     _verify_csrf(request, session, csrf_token)
@@ -1433,8 +1433,8 @@ async def admin_update_librarian_token(
             lambda: _container(request).librarian_auth.update(
                 token_id,
                 name=name,
-                scopes=tuple(scopes),
-                library_ids=tuple(library_ids),
+                scopes=tuple(scopes or ()),
+                library_ids=tuple(library_ids or ()),
                 actor=session.user.username,
             )
         )

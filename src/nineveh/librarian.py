@@ -356,7 +356,9 @@ class LibrarianAuth:
             return None
         cleaned_name = _clean_name(name) if name is not None else None
         cleaned_scopes = _clean_scopes(scopes) if scopes is not None else None
-        libraries = tuple(dict.fromkeys(library_ids)) if library_ids is not None else None
+        libraries = (
+            tuple(dict.fromkeys(library_ids)) if library_ids is not None else None
+        )
         after = self._repository.update_librarian_token(
             token_id,
             name=cleaned_name,
@@ -518,7 +520,9 @@ class LibrarianService:
                 title=title,
             ):
                 found.append((series, metadata))
-        found.sort(key=lambda item: (item[0].library.casefold(), item[0].name.casefold()))
+        found.sort(
+            key=lambda item: (item[0].library.casefold(), item[0].name.casefold())
+        )
         return found[:limit]
 
 
@@ -684,9 +688,7 @@ class IngestService:
         return series, library
 
     @staticmethod
-    def _relative(
-        library: ManagedLibrary, series: CatalogSeries, filename: str
-    ) -> str:
+    def _relative(library: ManagedLibrary, series: CatalogSeries, filename: str) -> str:
         return f"{library.relative_path}/{series.category}/{series.name}/{filename}"
 
     def _store(self, source: BinaryIO, destination: Path) -> tuple[int, str]:
@@ -750,9 +752,7 @@ class IngestService:
             "duplicate_of": list(staged.duplicate_of) if staged.duplicate_of else None,
             "created_at": staged.created_at.isoformat(),
         }
-        self._sidecar_path(staged.id).write_text(
-            json.dumps(payload), encoding="utf-8"
-        )
+        self._sidecar_path(staged.id).write_text(json.dumps(payload), encoding="utf-8")
 
     def _load(self, ingest_id: str) -> StagedUpload | None:
         if not _valid_ingest_id(ingest_id):
@@ -815,7 +815,9 @@ def normalize_title(value: str) -> str:
     return " ".join(text.split())
 
 
-def best_match(query: str, titles: list[tuple[str, str]]) -> tuple[float, str | None, str | None]:
+def best_match(
+    query: str, titles: list[tuple[str, str]]
+) -> tuple[float, str | None, str | None]:
     """Score a query against every known title for one series.
 
     Exact matches win outright. Substrings score in a deliberately modest band
@@ -872,9 +874,7 @@ def metadata_matches(
         actual = values.get("status")
         if not isinstance(actual, str) or actual.casefold() != status.casefold():
             return False
-    if title and not _title_matches(values, title):
-        return False
-    return True
+    return not title or _title_matches(values, title)
 
 
 def validate_filename(filename: str) -> str:
@@ -895,14 +895,14 @@ def validate_filename(filename: str) -> str:
     return cleaned
 
 
-_SIBLING = re.compile(r"^(?P<prefix>.*?)(?P<number>\d+)(?P<suffix>[^\d]*)\.cbz$", re.I)
+_SIBLING = re.compile(
+    r"^(?P<prefix>.*?)(?P<number>\d+)(?P<suffix>[^\d]*)\.cbz$", re.IGNORECASE
+)
 _NUMBER = re.compile(r"(\d+(?:\.\d+)?)")
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def suggest_filename(
-    filename: str, siblings: list[str]
-) -> tuple[str, str | None]:
+def suggest_filename(filename: str, siblings: list[str]) -> tuple[str, str | None]:
     """Propose a name consistent with what the series already uses.
 
     Returned rather than applied. A silent rewrite hides the decision, and a
@@ -918,9 +918,7 @@ def suggest_filename(
     if number is None:
         return sanitized, f"{prefix}{'N' * width}{suffix}.cbz"
     value = number.group(1)
-    rendered = (
-        value.zfill(width) if "." not in value else value
-    )
+    rendered = value.zfill(width) if "." not in value else value
     return f"{prefix}{rendered}{suffix}.cbz", f"{prefix}{'N' * width}{suffix}.cbz"
 
 

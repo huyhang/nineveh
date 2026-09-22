@@ -102,9 +102,7 @@ def agent_document() -> dict:
 
 
 def test_the_committed_agent_contract_matches_the_running_application():
-    expected = (
-        json.dumps(tagged_contract("librarian"), indent=2, sort_keys=True) + "\n"
-    )
+    expected = json.dumps(tagged_contract("librarian"), indent=2, sort_keys=True) + "\n"
     assert AGENT_CONTRACT.read_text(encoding="utf-8") == expected, (
         "docs/librarian-openapi.json is stale — run `python scripts/export-openapi.py`"
     )
