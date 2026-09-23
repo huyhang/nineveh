@@ -179,11 +179,55 @@ export NINEVEH_SECURE_COOKIES=false
 nineveh
 ```
 
+To try a change against a running server, see [Testing without Docker](#testing-without-docker) below.
+
 Run `pytest` for the suite (it enforces 90% branch coverage), and `ruff check src tests && ruff format --check src tests` for style. [CI](.github/workflows/ci.yml) runs all three on Linux with Python 3.12 — the same platform the image ships — then builds the image and smoke-tests a live container.
 
 `create_app(settings, container)` takes every I/O seam as an argument, so tests can substitute any of them; see [`tests/fakes.py`](tests/fakes.py) and [`tests/test_container.py`](tests/test_container.py) for the whole HTTP surface driven without a single CBZ on disk.
 
 The application uses one process intentionally; blocking archive and password work runs through bounded framework worker threads while SQLite and in-process caches remain singular.
+
+### Testing without Docker
+
+`scripts/dev-server.sh` runs Nineveh straight from this checkout, so a change can be tried from a browser, the reading app or Cleo without rebuilding the image. It restarts on every edit under `src/`.
+
+```sh
+scripts/dev-server.sh            # serve on http://127.0.0.1:8081
+scripts/dev-server.sh token      # in a second terminal: a read-only librarian token
+scripts/dev-server.sh --reset    # throw everything away and start again
+```
+
+**What it creates.** Everything lives in `.dev/`, which is gitignored:
+
+| Path | Contents |
+|---|---|
+| `.dev/data/` | A two-issue sample library, from `docker/create-sample-library.py` |
+| `.dev/state/` | The database and caches |
+| `.dev/admin-password` | A generated password for the `admin` account |
+
+It never touches `example-data/`, `state/` or the Docker container, and it uses a different port, so the container can keep serving on 8080 at the same time.
+
+**Signing in.** The first start creates an `admin` account with the generated password, and the startup banner prints both. Nineveh creates this account only when no users exist. If you change the password in the admin UI, `.dev/admin-password` goes stale, and the banner and `token` stop working until you run `--reset`.
+
+**Pointing Cleo at it.** `token` issues a token with `catalog:read` and `metadata:read`, and prints it as two `export` lines. Environment variables take precedence over Cleo's `.env`, so this redirects Cleo in the current shell only:
+
+```sh
+eval "$(scripts/dev-server.sh token)"
+cleo
+```
+
+For a token with ingest scopes, issue one under **Admin → Librarian** instead.
+
+**Options.**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NINEVEH_DEV_PORT` | `8081` | Port to serve on |
+| `NINEVEH_DEV_DATA` | `.dev/data` | Library to serve, e.g. `"$PWD/example-data"`. State stays in `.dev/` |
+
+Any other [configuration](#configuration) variable you export, such as `NINEVEH_SCAN_INTERVAL_SECONDS`, is passed through to Nineveh.
+
+**How it differs from the container.** It listens on `127.0.0.1` only, so an iPad or phone can't reach it; test from a device against the container. Cookies aren't marked `Secure`, because it's served over plain HTTP. There is no memory limit and no read-only filesystem, and logs use uvicorn's plain-text format rather than JSON.
 
 ## MangaBaka attribution
 

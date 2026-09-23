@@ -24,3 +24,4 @@ example-data/
 .DS_Store
 .idea/
 .vscode/
+.dev/
