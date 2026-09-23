@@ -7,87 +7,12 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
-import pytest
-from conftest import ADMIN_PASSWORD, authorization
-from fakes import (
-    PAGE_BYTES,
-    FakeArchives,
-    FakeCovers,
-    FakePageStore,
-    FakeRenditions,
-    FakeRestartController,
-    FakeScanner,
-    page,
-    publication,
-)
+from conftest import authorization
+from fakes import PAGE_BYTES
 from fastapi.testclient import TestClient
 
 from nineveh.app import Container, create_app
-from nineveh.auth import AuthService
-from nineveh.authorization import AccessService, ReadAllPolicy
-from nineveh.catalog import ArchiveInspector, LibraryService
-from nineveh.config import Settings, SettingsService
-from nineveh.database import SQLiteRepository
-from nineveh.domain import ScannedPublication
-from nineveh.librarian import (
-    AuditTrail,
-    IngestService,
-    LibrarianAuth,
-    LibrarianService,
-)
-from nineveh.opds import OpdsBuilder
-from nineveh.reader import ReaderService
-
-
-@pytest.fixture
-def fake_container(tmp_path: Path) -> Container:
-    settings = Settings(
-        data_dir=tmp_path,
-        state_dir=tmp_path / "state",
-        secure_cookies=False,
-        scan_interval_seconds=0,
-        bootstrap_admin_password=ADMIN_PASSWORD,
-    )
-    repository = SQLiteRepository(settings.database_path)
-    cover = tmp_path / "cover.webp"
-    cover.write_bytes(b"fake-cover")
-    audit = AuditTrail(repository)
-    return Container(
-        settings=settings,
-        repository=repository,
-        auth=AuthService(repository),
-        authorization=ReadAllPolicy(),
-        scanner=FakeScanner(),
-        archives=FakeArchives(),
-        thumbnails=FakeCovers(cover),
-        renditions=FakeRenditions(),
-        page_cache=FakePageStore(),
-        opds=OpdsBuilder("Nineveh"),
-        access=AccessService(repository),
-        libraries=LibraryService(settings.data_dir, repository),
-        configuration=SettingsService(settings, repository),
-        restarter=FakeRestartController(enabled=False),
-        reader=ReaderService(repository, repository),
-        audit=audit,
-        librarian_auth=LibrarianAuth(repository, audit),
-        librarian=LibrarianService(repository),
-        ingest=IngestService(
-            settings.data_dir,
-            settings.ingest_staging_dir,
-            repository,
-            ArchiveInspector(settings),
-            settings.max_upload_bytes,
-        ),
-    )
-
-
-@pytest.fixture
-def fake_client(fake_container: Container) -> TestClient:
-    with TestClient(create_app(container=fake_container)) as client:
-        fake_container.repository.upsert_publication(
-            ScannedPublication(publication(), tuple(page(n) for n in (1, 2, 3)))
-        )
-        yield client
+from nineveh.config import Settings
 
 
 def test_the_container_propagates_the_worker_ceilings(tmp_path: Path):

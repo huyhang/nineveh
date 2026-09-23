@@ -3,12 +3,13 @@
 
     python scripts/export-openapi.py
 
-Writes two files. `docs/openapi.json` is the whole published surface.
-`docs/librarian-openapi.json` is the slice a librarian agent consumes, so a
-client in another repository can vendor a contract that moves only when its
-own endpoints move -- not every time an unrelated one does.
+`docs/openapi.json` is the whole published surface. Beside it, one
+`docs/<name>-openapi.json` per entry in `CONTRACT_SLICES`: the librarian
+agent's slice and the native reading app's. A client in another repository
+vendors its own slice, so its copy moves only when its own endpoints move --
+not every time an unrelated one does.
 
-`tests/test_contract.py` fails if either file and the live route table
+`tests/test_contract.py` fails if any file and the live route table
 disagree, so run this after adding, removing, or re-shaping an endpoint.
 """
 
@@ -20,10 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from nineveh.app import openapi_document, tagged_contract
+from nineveh.app import CONTRACT_SLICES, openapi_document, tagged_contract
 
 DOCS = Path(__file__).resolve().parent.parent / "docs"
-AGENT_TAG = "librarian"
 
 
 def write(destination: Path, document: dict) -> None:
@@ -36,7 +36,8 @@ def main() -> None:
     DOCS.mkdir(parents=True, exist_ok=True)
     document = openapi_document()
     write(DOCS / "openapi.json", document)
-    write(DOCS / f"{AGENT_TAG}-openapi.json", tagged_contract(AGENT_TAG, document))
+    for name, tags in CONTRACT_SLICES.items():
+        write(DOCS / f"{name}-openapi.json", tagged_contract(name, tags, document))
 
 
 if __name__ == "__main__":

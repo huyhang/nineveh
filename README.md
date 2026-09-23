@@ -113,6 +113,8 @@ The browser catalog also links every publication to an immersive reader. Its dou
 
 Reading position is API state rather than a private detail of the browser reader: `/api/v1/publications/{id}/progress` reads, writes, and clears it under the same authentication and read grants as the rest of the catalog, so a third-party client can resume where the browser left off. Only the final page may be marked completed, which keeps "finished" meaning the same thing whoever wrote it. The two buttons on a volume card stay ordinary form posts on the browser surface, so marking something read still works without JavaScript.
 
+`docs/app-openapi.json` is the slice of the contract for a native reading app: the OPDS feeds, series and publication detail, pages, downloads, reading progress, and `/api/v1/auth/me`, with the HTTP Basic scheme they require. An app in another repository vendors it the same way as the [librarian slice](#building-a-client); [`docs/contract-vendoring.md`](docs/contract-vendoring.md#vendoring-the-app-contract) covers the differences. Its JSON responses are described by schemas, so a renamed or removed response field changes the slice like any other contract change; only the OPDS feeds stay free-form, under their own media types. Covers, pages, and downloads declare the media types they are actually sent with, and a publication's volume number is the numeric `belongsTo.series[].position` that OPDS 2.0 specifies.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -210,9 +212,9 @@ Every read, proposal, placement, refusal, and permission change is recorded with
 
 ### Building a client
 
-`docs/librarian-openapi.json` is the agent-facing slice of the contract: the eight librarian operations and the schemas they reference, and nothing else. A client in another repository should vendor that file rather than `docs/openapi.json`, so its copy moves only when the endpoints it calls move — not every time an unrelated part of Nineveh changes.
+`docs/librarian-openapi.json` is the agent-facing slice of the contract: the eight librarian operations, the schemas they reference, and the bearer scheme they require, and nothing else. Every response is described by a schema, so a generated client gets typed objects and a renamed response field shows up as a contract change. A client in another repository should vendor that file rather than `docs/openapi.json`, so its copy moves only when the endpoints it calls move — not every time an unrelated part of Nineveh changes.
 
-Regenerate both with `python scripts/export-openapi.py`. `tests/test_contract.py` fails if either drifts from the live route table, and additionally checks that every `$ref` in the slice resolves inside it, so the file is safe to feed straight to a code generator.
+Regenerate every contract with `python scripts/export-openapi.py`. `tests/test_contract.py` fails if any of them drifts from the live route table, and additionally checks that every `$ref` and security scheme in a slice resolves inside it, so the file is safe to feed straight to a code generator.
 
 Pin the slice by content hash rather than by `info.version`: the version tracks the package and bumps on releases that leave the agent surface untouched.
 

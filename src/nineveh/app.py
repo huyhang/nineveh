@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+from collections.abc import Collection
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -371,10 +372,25 @@ def openapi_document() -> dict[str, object]:
         return create_app(settings).openapi()
 
 
-def tagged_contract(tag: str, document: dict[str, object] | None = None) -> dict:
-    """The slice of the contract one tag's consumers actually need.
+CONTRACT_SLICES: dict[str, frozenset[str]] = {
+    # An LLM agent on another device: resolve series, stage and place volumes.
+    "librarian": frozenset({"librarian"}),
+    # A native reading app: browse over OPDS, then fetch pages and files and
+    # sync progress through the extensions the feeds advertise. Health checks
+    # stay out; the OPDS authentication document and `/auth/me` already tell
+    # an app whether a server is Nineveh and whether its credentials work.
+    "app": frozenset(
+        {"authentication", "opds", "pages", "publications", "reader", "series"}
+    ),
+}
 
-    The librarian agent calls eight of fifty-six operations. Handing it the
+
+def tagged_contract(
+    name: str, tags: Collection[str], document: dict[str, object] | None = None
+) -> dict:
+    """The slice of the contract one kind of client actually needs.
+
+    The librarian agent calls eight of sixty operations. Handing it the
     whole document means every unrelated endpoint churns its vendored copy and
     raises a false "the contract moved" alarm, so the useful signal -- did *my*
     surface change? -- gets lost in noise.
@@ -382,15 +398,18 @@ def tagged_contract(tag: str, document: dict[str, object] | None = None) -> dict
     Schemas are pulled in by following `$ref` to a fixed point rather than by
     copying `components` wholesale: a subset that references a schema it does
     not carry is worse than no subset, because it fails at generation time
-    instead of review time.
+    instead of review time. Security schemes travel the same way, for the
+    same reason.
     """
     source = document or openapi_document()
+    selected = frozenset(tags)
     paths: dict[str, dict] = {}
     for path, item in source.get("paths", {}).items():
         operations = {
             method: operation
             for method, operation in item.items()
-            if isinstance(operation, dict) and tag in (operation.get("tags") or [])
+            if isinstance(operation, dict)
+            and not selected.isdisjoint(operation.get("tags") or [])
         }
         if not operations:
             continue
@@ -414,20 +433,36 @@ def tagged_contract(tag: str, document: dict[str, object] | None = None) -> dict
         wanted |= discovered
         pending |= discovered
 
+    required = {
+        scheme
+        for item in paths.values()
+        for operation in item.values()
+        if isinstance(operation, dict)
+        for requirement in operation.get("security") or []
+        for scheme in requirement
+    }
+    defined = source.get("components", {}).get("securitySchemes", {})
+
+    components: dict[str, dict] = {}
+    if wanted:
+        components["schemas"] = {
+            schema: schemas[schema] for schema in sorted(wanted) if schema in schemas
+        }
+    if required:
+        components["securitySchemes"] = {
+            scheme: defined[scheme] for scheme in sorted(required) if scheme in defined
+        }
+
     contract: dict[str, object] = {
         "openapi": source["openapi"],
         "info": {
             **source["info"],
-            "title": f"{source['info']['title']} ({tag})",
+            "title": f"{source['info']['title']} ({name})",
         },
         "paths": paths,
     }
-    if wanted:
-        contract["components"] = {
-            "schemas": {
-                name: schemas[name] for name in sorted(wanted) if name in schemas
-            }
-        }
+    if components:
+        contract["components"] = components
     return contract
 
 

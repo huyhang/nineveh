@@ -13,10 +13,11 @@ import io
 import zipfile
 
 import pytest
-from conftest import authorization, image_bytes
+from conftest import authorization, image_bytes, wait_for_scan, write_cbz
 from fastapi.testclient import TestClient
 
 from nineveh import librarian
+from nineveh.app import create_app
 from nineveh.librarian import (
     LibrarianError,
     best_match,
@@ -360,6 +361,8 @@ def test_inventory_reports_volumes_and_filenames(client: TestClient, series_id: 
     assert body["inventory"]["latest"]["filename"] == "Issue 1.cbz"
     assert body["inventory"]["publications"][0]["id"]
     assert body["inventory"]["totalSize"] > 0
+    # Without metadata there are no totals: the keys are left out, not null.
+    assert body["providerTotals"] == {}
 
 
 def test_inventory_rejects_an_unknown_series(client: TestClient):
@@ -577,6 +580,51 @@ def test_the_outcome_survives_the_staged_record(client: TestClient, series_id: s
     assert later.status_code == 200
     assert later.json()["state"] == "placed"
     assert later.json()["relativePath"].endswith("Issue 2.cbz")
+
+
+def test_a_refused_commit_is_reported_without_a_path(
+    client: TestClient, series_id: str
+):
+    token = issue(client, ("catalog:read", "ingest:stage", "ingest:commit"))
+    staged = stage(client, token, series_id, "Issue 1.cbz", cbz_bytes(pages=5)).json()
+    location = f"/api/v1/librarian/ingest/{staged['ingestId']}"
+    assert client.post(f"{location}/commit", headers=bearer(token)).status_code == 409
+    assert client.delete(location, headers=bearer(token)).status_code == 204
+    outcome = client.get(location, headers=bearer(token))
+    assert outcome.status_code == 200
+    assert outcome.json()["state"] == "conflict"
+    assert outcome.json()["relativePath"] is None
+
+
+def test_a_staged_upload_reads_back_exactly_as_it_was_staged(
+    client: TestClient, series_id: str
+):
+    """The detail route answers in one of two shapes. A staged upload must come
+    back as the first, not coerced into the second."""
+    token = issue(client, ("catalog:read", "ingest:stage"))
+    staged = stage(client, token, series_id, "Issue 2.cbz").json()
+    later = client.get(
+        f"/api/v1/librarian/ingest/{staged['ingestId']}", headers=bearer(token)
+    )
+    assert later.status_code == 200
+    assert later.json() == staged
+
+
+def test_staging_beside_numbered_volumes_proposes_their_pattern(library):
+    settings, archive = library
+    write_cbz(archive.with_name("Issue 2.cbz"))
+    with TestClient(create_app(settings)) as client:
+        wait_for_scan(client)
+        token = issue(client, ("catalog:read", "ingest:stage"))
+        found = client.get(
+            "/api/v1/librarian/series",
+            headers=bearer(token),
+            params={"query": "Example"},
+        ).json()
+        response = stage(client, token, found["candidates"][0]["seriesId"], "i3.cbz")
+    assert response.status_code == 201, response.text
+    assert response.json()["siblingPattern"] == "Issue N.cbz"
+    assert response.json()["suggestedFilename"] == "Issue 3.cbz"
 
 
 # --------------------------------------------------------------------------

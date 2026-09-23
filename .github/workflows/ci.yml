@@ -39,7 +39,7 @@ jobs:
       - name: API contract is current
         run: |
           python scripts/export-openapi.py
-          git diff --exit-code -- docs/openapi.json docs/librarian-openapi.json
+          git diff --exit-code -- 'docs/*openapi.json'
 
       - name: Test
         run: pytest

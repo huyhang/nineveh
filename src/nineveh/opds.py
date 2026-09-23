@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from urllib.parse import urlencode
 
@@ -19,6 +20,8 @@ CATALOG_PATH = "/opds/v2/catalog.json"
 NAVIGATION_PATH = "/opds/v2/navigation.json"
 PUBLICATIONS_PATH = "/opds/v2/publications.json"
 AUTHENTICATION_PATH = "/opds/v2/authentication.json"
+
+NUMERIC = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 class OpdsBuilder:
@@ -149,6 +152,10 @@ class OpdsBuilder:
 
 
 def _publication_metadata(item: Publication) -> dict[str, object]:
+    series: dict[str, object] = {"name": item.series}
+    position = _series_position(item.number)
+    if position is not None:
+        series["position"] = position
     metadata: dict[str, object] = {
         "@type": "http://schema.org/ComicStory",
         "identifier": f"urn:uuid:{item.id}",
@@ -157,15 +164,26 @@ def _publication_metadata(item: Publication) -> dict[str, object]:
             item.modified_ns / 1_000_000_000, UTC
         ).isoformat(),
         "numberOfPages": item.page_count,
-        "belongsTo": {"series": [{"name": item.series}]},
+        "belongsTo": {"series": [series]},
     }
-    if item.number:
-        metadata["position"] = item.number
     if item.description:
         metadata["description"] = item.description
     if item.authors:
         metadata["author"] = [{"name": author} for author in item.authors]
     return metadata
+
+
+def _series_position(number: str | None) -> int | float | None:
+    """ComicInfo's free-text `Number` as the numeric position OPDS expects.
+
+    "007" and "1.5" convert. "12a" or "Special" name a volume that no number
+    orders, so they yield None and the position is left out, not guessed.
+    """
+    text = (number or "").strip()
+    if not NUMERIC.fullmatch(text):
+        return None
+    whole, _, fraction = text.partition(".")
+    return float(text) if fraction.strip("0") else int(whole)
 
 
 def _publication_links(base_url: str, item: Publication) -> list[dict[str, object]]:

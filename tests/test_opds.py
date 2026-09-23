@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from fakes import publication
 
@@ -137,9 +139,42 @@ def test_publication_exposes_acquisition_manifest_and_range_links(
 def test_publication_metadata_omits_absent_optional_fields(builder: OpdsBuilder):
     entry = builder.publication(BASE, publication())
     metadata = entry["metadata"]
-    assert metadata["position"] == "1"
     assert metadata["author"] == [{"name": "A. Writer"}]
     assert "description" not in metadata
+    assert metadata["belongsTo"]["series"] == [{"name": "Series", "position": 1}]
+
+
+@pytest.mark.parametrize(
+    ("number", "position"),
+    [
+        ("007", 7),
+        ("1.5", 1.5),
+        ("2.50", 2.5),
+        ("3.0", 3),
+        (" 4 ", 4),
+        ("0", 0),
+        ("-1", -1),
+    ],
+)
+def test_a_volume_number_becomes_a_numeric_series_position(
+    builder: OpdsBuilder, number: str, position: float
+):
+    """OPDS 2.0 places a volume's position under `belongsTo.series` as a
+    number; a string, or a top-level `position`, is ignored by OPDS readers."""
+    item = replace(publication(), number=number)
+    metadata = builder.publication(BASE, item)["metadata"]
+    [series] = metadata["belongsTo"]["series"]
+    assert series["position"] == position
+    assert type(series["position"]) is type(position)
+    assert "position" not in metadata
+
+
+@pytest.mark.parametrize("number", ["12a", "Special", "1-2", "", None])
+def test_a_volume_number_nothing_can_order_leaves_the_position_out(
+    builder: OpdsBuilder, number: str | None
+):
+    item = replace(publication(), number=number)
+    metadata = builder.publication(BASE, item)["metadata"]
     assert metadata["belongsTo"]["series"] == [{"name": "Series"}]
 
 

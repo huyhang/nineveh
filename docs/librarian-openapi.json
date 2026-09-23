@@ -27,6 +27,24 @@
         "title": "Body_librarian_ingest_stage_api_v1_librarian_ingest_post",
         "type": "object"
       },
+      "DuplicateVolume": {
+        "properties": {
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "publicationId": {
+            "title": "Publicationid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "publicationId",
+          "filename"
+        ],
+        "title": "DuplicateVolume",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -38,6 +56,106 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "IngestOutcome": {
+        "description": "What became of an upload whose staged record is gone.",
+        "properties": {
+          "committedAt": {
+            "format": "date-time",
+            "title": "Committedat",
+            "type": "string"
+          },
+          "ingestId": {
+            "title": "Ingestid",
+            "type": "string"
+          },
+          "relativePath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Relativepath"
+          },
+          "state": {
+            "description": "placed, conflict or rejected.",
+            "title": "State",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ingestId",
+          "state",
+          "relativePath",
+          "committedAt",
+          "summary"
+        ],
+        "title": "IngestOutcome",
+        "type": "object"
+      },
+      "IngestStatus": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/StagedIngest"
+          },
+          {
+            "$ref": "#/components/schemas/IngestOutcome"
+          }
+        ],
+        "description": "Still staged, or what became of it.",
+        "title": "IngestStatus"
+      },
+      "InventoryVolume": {
+        "properties": {
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "number": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Number"
+          },
+          "pageCount": {
+            "title": "Pagecount",
+            "type": "integer"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "filename",
+          "title",
+          "number",
+          "size",
+          "pageCount"
+        ],
+        "title": "InventoryVolume",
         "type": "object"
       },
       "LibrarianCommitInput": {
@@ -56,6 +174,399 @@
           }
         },
         "title": "LibrarianCommitInput",
+        "type": "object"
+      },
+      "LibraryEntry": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "relativePath": {
+            "title": "Relativepath",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "relativePath"
+        ],
+        "title": "LibraryEntry",
+        "type": "object"
+      },
+      "LibraryList": {
+        "properties": {
+          "libraries": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryEntry"
+            },
+            "title": "Libraries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "libraries"
+        ],
+        "title": "LibraryList",
+        "type": "object"
+      },
+      "PendingIngests": {
+        "properties": {
+          "pending": {
+            "items": {
+              "$ref": "#/components/schemas/StagedIngest"
+            },
+            "title": "Pending",
+            "type": "array"
+          }
+        },
+        "required": [
+          "pending"
+        ],
+        "title": "PendingIngests",
+        "type": "object"
+      },
+      "PlacedIngest": {
+        "properties": {
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "ingestId": {
+            "title": "Ingestid",
+            "type": "string"
+          },
+          "pageCount": {
+            "title": "Pagecount",
+            "type": "integer"
+          },
+          "relativePath": {
+            "title": "Relativepath",
+            "type": "string"
+          },
+          "scanStarted": {
+            "title": "Scanstarted",
+            "type": "boolean"
+          },
+          "seriesId": {
+            "title": "Seriesid",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "state": {
+            "const": "placed",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ingestId",
+          "state",
+          "seriesId",
+          "filename",
+          "relativePath",
+          "size",
+          "pageCount",
+          "scanStarted"
+        ],
+        "title": "PlacedIngest",
+        "type": "object"
+      },
+      "ProviderTotals": {
+        "description": "Keys stay snake_case, like the metadata values they are copied from.\nOne the provider has no figure for is left out rather than sent as null.",
+        "properties": {
+          "final_volume": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Volume"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "total_chapters": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Chapters"
+          }
+        },
+        "title": "ProviderTotals",
+        "type": "object"
+      },
+      "SeriesCandidates": {
+        "description": "Resolving a title ranks matches; a metadata search lists summaries and\nnever names a confident match.",
+        "properties": {
+          "ambiguous": {
+            "title": "Ambiguous",
+            "type": "boolean"
+          },
+          "candidates": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TitleMatch"
+                },
+                {
+                  "$ref": "#/components/schemas/SeriesSummary"
+                }
+              ]
+            },
+            "title": "Candidates",
+            "type": "array"
+          },
+          "confidentMatch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidentmatch"
+          }
+        },
+        "required": [
+          "candidates",
+          "confidentMatch",
+          "ambiguous"
+        ],
+        "title": "SeriesCandidates",
+        "type": "object"
+      },
+      "SeriesInventoryDetail": {
+        "properties": {
+          "inventory": {
+            "$ref": "#/components/schemas/VolumeInventory"
+          },
+          "providerTotals": {
+            "$ref": "#/components/schemas/ProviderTotals"
+          },
+          "series": {
+            "$ref": "#/components/schemas/SeriesSummary"
+          }
+        },
+        "required": [
+          "series",
+          "inventory",
+          "providerTotals"
+        ],
+        "title": "SeriesInventoryDetail",
+        "type": "object"
+      },
+      "SeriesSummary": {
+        "properties": {
+          "category": {
+            "enum": [
+              "comics",
+              "manga"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "library": {
+            "title": "Library",
+            "type": "string"
+          },
+          "libraryId": {
+            "title": "Libraryid",
+            "type": "string"
+          },
+          "localName": {
+            "title": "Localname",
+            "type": "string"
+          },
+          "publicationCount": {
+            "title": "Publicationcount",
+            "type": "integer"
+          },
+          "seriesId": {
+            "title": "Seriesid",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "seriesId",
+          "libraryId",
+          "library",
+          "category",
+          "localName",
+          "title",
+          "publicationCount"
+        ],
+        "title": "SeriesSummary",
+        "type": "object"
+      },
+      "StagedIngest": {
+        "properties": {
+          "createdAt": {
+            "format": "date-time",
+            "title": "Createdat",
+            "type": "string"
+          },
+          "duplicateOf": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DuplicateVolume"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "ingestId": {
+            "title": "Ingestid",
+            "type": "string"
+          },
+          "pageCount": {
+            "title": "Pagecount",
+            "type": "integer"
+          },
+          "seriesId": {
+            "title": "Seriesid",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "siblingPattern": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Siblingpattern"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          },
+          "state": {
+            "const": "staged",
+            "title": "State",
+            "type": "string"
+          },
+          "suggestedFilename": {
+            "title": "Suggestedfilename",
+            "type": "string"
+          },
+          "targetPath": {
+            "title": "Targetpath",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ingestId",
+          "state",
+          "seriesId",
+          "filename",
+          "suggestedFilename",
+          "siblingPattern",
+          "targetPath",
+          "size",
+          "pageCount",
+          "sha256",
+          "duplicateOf",
+          "createdAt"
+        ],
+        "title": "StagedIngest",
+        "type": "object"
+      },
+      "TitleMatch": {
+        "properties": {
+          "category": {
+            "enum": [
+              "comics",
+              "manga"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "library": {
+            "title": "Library",
+            "type": "string"
+          },
+          "libraryId": {
+            "title": "Libraryid",
+            "type": "string"
+          },
+          "localName": {
+            "title": "Localname",
+            "type": "string"
+          },
+          "matchedOn": {
+            "description": "localName, title or alternativeTitle.",
+            "title": "Matchedon",
+            "type": "string"
+          },
+          "matchedValue": {
+            "title": "Matchedvalue",
+            "type": "string"
+          },
+          "publicationCount": {
+            "title": "Publicationcount",
+            "type": "integer"
+          },
+          "score": {
+            "title": "Score",
+            "type": "number"
+          },
+          "seriesId": {
+            "title": "Seriesid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "seriesId",
+          "libraryId",
+          "library",
+          "category",
+          "localName",
+          "publicationCount",
+          "score",
+          "matchedOn",
+          "matchedValue"
+        ],
+        "title": "TitleMatch",
         "type": "object"
       },
       "ValidationError": {
@@ -97,6 +608,58 @@
         ],
         "title": "ValidationError",
         "type": "object"
+      },
+      "VolumeInventory": {
+        "properties": {
+          "filenames": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Filenames",
+            "type": "array"
+          },
+          "latest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InventoryVolume"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "publicationCount": {
+            "title": "Publicationcount",
+            "type": "integer"
+          },
+          "publications": {
+            "items": {
+              "$ref": "#/components/schemas/InventoryVolume"
+            },
+            "title": "Publications",
+            "type": "array"
+          },
+          "totalSize": {
+            "title": "Totalsize",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "publicationCount",
+          "totalSize",
+          "latest",
+          "filenames",
+          "publications"
+        ],
+        "title": "VolumeInventory",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "LibrarianToken": {
+        "description": "An `nvh_` secret, issued under Admin \u2192 Librarian.",
+        "scheme": "bearer",
+        "type": "http"
       }
     }
   },
@@ -111,48 +674,23 @@
       "get": {
         "description": "What is waiting for a commit \u2014 the approve-at-the-desk queue.",
         "operationId": "librarian_ingest_pending_api_v1_librarian_ingest_get",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Librarian Ingest Pending Api V1 Librarian Ingest Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/PendingIngests"
                 }
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Ingest Pending",
         "tags": [
           "librarian"
@@ -160,24 +698,6 @@
       },
       "post": {
         "operationId": "librarian_ingest_stage_api_v1_librarian_ingest_post",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "multipart/form-data": {
@@ -193,9 +713,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Librarian Ingest Stage Api V1 Librarian Ingest Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/StagedIngest"
                 }
               }
             },
@@ -212,6 +730,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Ingest Stage",
         "tags": [
           "librarian"
@@ -230,22 +753,6 @@
               "title": "Ingest Id",
               "type": "string"
             }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
           }
         ],
         "responses": {
@@ -263,6 +770,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Ingest Discard",
         "tags": [
           "librarian"
@@ -279,22 +791,6 @@
               "title": "Ingest Id",
               "type": "string"
             }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
           }
         ],
         "responses": {
@@ -302,9 +798,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Librarian Ingest Detail Api V1 Librarian Ingest  Ingest Id  Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/IngestStatus"
                 }
               }
             },
@@ -321,6 +815,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Ingest Detail",
         "tags": [
           "librarian"
@@ -338,22 +837,6 @@
             "schema": {
               "title": "Ingest Id",
               "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
             }
           }
         ],
@@ -379,9 +862,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Librarian Ingest Commit Api V1 Librarian Ingest  Ingest Id  Commit Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/PlacedIngest"
                 }
               }
             },
@@ -398,6 +879,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Ingest Commit",
         "tags": [
           "librarian"
@@ -407,48 +893,23 @@
     "/api/v1/librarian/libraries": {
       "get": {
         "operationId": "librarian_libraries_api_v1_librarian_libraries_get",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Librarian Libraries Api V1 Librarian Libraries Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/LibraryList"
                 }
               }
             },
             "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Libraries",
         "tags": [
           "librarian"
@@ -608,22 +1069,6 @@
               "title": "Limit",
               "type": "integer"
             }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
           }
         ],
         "responses": {
@@ -631,9 +1076,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Librarian Series Api V1 Librarian Series Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SeriesCandidates"
                 }
               }
             },
@@ -650,6 +1093,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Series",
         "tags": [
           "librarian"
@@ -668,22 +1116,6 @@
               "title": "Series Id",
               "type": "string"
             }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
           }
         ],
         "responses": {
@@ -691,9 +1123,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Librarian Series Detail Api V1 Librarian Series  Series Id  Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SeriesInventoryDetail"
                 }
               }
             },
@@ -710,6 +1140,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "LibrarianToken": []
+          }
+        ],
         "summary": "Librarian Series Detail",
         "tags": [
           "librarian"

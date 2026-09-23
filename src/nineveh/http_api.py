@@ -23,8 +23,14 @@ from fastapi import (
 )
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, Field
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBasic,
+    HTTPBasicCredentials,
+    HTTPBearer,
+)
+from pydantic import BaseModel, ConfigDict, Field, RootModel, WithJsonSchema
+from pydantic.alias_generators import to_camel
 from starlette.background import BackgroundTask
 
 from .archives import ArchiveChanged, ArchiveUnavailable
@@ -34,7 +40,7 @@ from .auth import (
     InvalidUserInput,
     LastAdministratorError,
 )
-from .catalog import InvalidLibrary
+from .catalog import IMAGE_TYPES, InvalidLibrary
 from .deployment import memory_limit_text
 from .domain import (
     AccessGrant,
@@ -65,6 +71,13 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checke
 SESSION_COOKIE = "nineveh_session"
 NavigationEntries = tuple[str, dict[str, str], list[tuple[str, int, str]]]
 basic_auth = HTTPBasic(auto_error=False)
+# A declared scheme rather than a hand-parsed header, so the contract says so
+# and a client generated from the librarian slice knows it needs a token.
+librarian_bearer = HTTPBearer(
+    scheme_name="LibrarianToken",
+    description="An `nvh_` secret, issued under Admin → Librarian.",
+    auto_error=False,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,10 +141,238 @@ class SpreadStartInput(BaseModel):
     page: int | None = Field(default=None, ge=2)
 
 
+ReadingMode = Literal["single", "double", "scroll"]
+
+
 class ProgressUpdate(BaseModel):
     page: int = Field(ge=1)
-    mode: Literal["single", "double", "scroll"]
+    mode: ReadingMode
     completed: bool = False
+
+
+# --------------------------------------------------------------------------
+# Response bodies of the reading app's slice of the contract
+# --------------------------------------------------------------------------
+
+# The builders emit `datetime.isoformat()`. Kept a string so validation cannot
+# re-render it (a parsed datetime would come back with `Z`, not `+00:00`), and
+# documented as a date so generators still decode one.
+Timestamp = Annotated[str, WithJsonSchema({"type": "string", "format": "date-time"})]
+# Metadata numbers arrive as whichever of int or float the provider or editor
+# produced. A `float` field would turn 91 into 91.0; this passes both through.
+Number = Annotated[int | float, WithJsonSchema({"type": "number"})]
+
+
+def _open_to_clients(schema: dict[str, object]) -> None:
+    """Publish a response as open to new fields, whatever the server enforces.
+
+    `extra="forbid"` checks our own builders. Published, it becomes
+    `additionalProperties: false`, which tells a client to reject any field
+    added later -- swift-openapi-generator enforces exactly that -- so every
+    compatible addition would break apps already installed.
+    """
+    schema.pop("additionalProperties", None)
+
+
+class ResponseBody(BaseModel):
+    """A response the route validates on the way out.
+
+    Handlers keep returning the builders' plain dicts. Unknown keys are refused
+    rather than dropped, so a builder that grows a field fails its tests until
+    its model grows too, and the published contract cannot fall behind. Strict,
+    so a value of the wrong type is refused too: lax validation would turn a
+    builder's "2" into the documented 2 here and nowhere else.
+    Fields defaulting to None are the ones a builder omits when they do not
+    apply; routes that carry any set `response_model_exclude_unset` so they
+    stay omitted instead of turning into nulls.
+    """
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        extra="forbid",
+        strict=True,
+        json_schema_extra=_open_to_clients,
+    )
+
+
+class UserAccount(ResponseBody):
+    id: str
+    username: str
+    is_admin: bool
+    enabled: bool
+    created_at: Timestamp
+
+
+class ReadingPosition(ResponseBody):
+    publication_id: str
+    page: int
+    mode: ReadingMode
+    completed: bool
+    updated_at: Timestamp
+
+
+class ManifestPage(ResponseBody):
+    number: int
+    href: str
+    type: str
+    length: int
+    # Null only when the image could not be measured.
+    width: int | None
+    height: int | None
+    spread: bool
+
+
+class PageManifest(ResponseBody):
+    publication_id: str
+    revision: str
+    total_pages: int
+    start: int
+    end: int
+    pages: list[ManifestPage]
+    next: str | None = None
+    pairing_anchor: int | None = None
+
+
+class MetadataValues(BaseModel):
+    """Keys stay snake_case: they are the field names the editor posts back."""
+
+    model_config = ConfigDict(
+        extra="forbid", strict=True, json_schema_extra=_open_to_clients
+    )
+
+    title: str | None
+    alternative_titles: list[str]
+    authors: list[str]
+    artists: list[str]
+    description: str | None
+    published_start: str | None
+    published_end: str | None
+    status: str | None
+    content_rating: str | None
+    media_type: str | None
+    rating: Number | None
+    publishers: list[str]
+    tags: list[str]
+    final_volume: Number | None
+    total_chapters: Number | None
+
+
+class SeriesMetadataRecord(ResponseBody):
+    provider: str
+    provider_id: int
+    source_url: str
+    fetched_at: Timestamp
+    # The provider's own string, passed through unparsed.
+    provider_updated_at: str | None
+    values: MetadataValues
+    edited_fields: list[str]
+    license: str
+
+
+class SeriesDetail(ResponseBody):
+    id: str
+    library_id: str
+    library: str
+    category: Literal["comics", "manga"]
+    local_name: str
+    title: str
+    publication_count: int
+    cover: str
+    metadata: SeriesMetadataRecord | None
+
+
+class NamedEntry(ResponseBody):
+    name: str
+
+
+class SeriesEntry(ResponseBody):
+    name: str
+    # Omitted when the volume's number is not one, such as "12a" or "Special".
+    position: Number | None = None
+
+
+class SeriesMembership(ResponseBody):
+    series: list[SeriesEntry]
+
+
+class PublicationMetadata(ResponseBody):
+    type: str = Field(alias="@type")
+    identifier: str
+    title: str
+    modified: Timestamp
+    number_of_pages: int
+    belongs_to: SeriesMembership
+    description: str | None = None
+    author: list[NamedEntry] | None = None
+
+
+class LinkProperties(ResponseBody):
+    length: int
+
+
+class PublicationLink(ResponseBody):
+    rel: str
+    href: str
+    type: str
+    title: str
+    templated: bool | None = None
+    properties: LinkProperties | None = None
+
+
+class PublicationImage(ResponseBody):
+    href: str
+    type: str
+    width: int
+
+
+class PublicationDetail(ResponseBody):
+    """The same OPDS 2.0 publication object a publications feed lists."""
+
+    metadata: PublicationMetadata
+    links: list[PublicationLink]
+    images: list[PublicationImage]
+
+
+# Routes that send a file. Left to FastAPI, each would be documented as JSON --
+# its default -- and a generated client would try to decode a cover as JSON.
+# A HEAD answer has no body at all, so its operation documents headers only:
+# a client told to expect a body fails every HEAD request it makes.
+ETAG_HEADER = {"ETag": {"schema": {"type": "string"}}}
+
+
+def _file_body(*media_types: str) -> dict[str, object]:
+    """Route options for a GET that answers with a file of one of these types."""
+    binary = {"schema": {"type": "string", "format": "binary"}}
+    return {
+        "response_class": Response,
+        "responses": {
+            200: {
+                "description": "The file.",
+                "headers": ETAG_HEADER,
+                "content": {media_type: binary for media_type in media_types},
+            }
+        },
+    }
+
+
+def _file_headers() -> dict[str, object]:
+    """Route options for the HEAD twin of a file route."""
+    return {
+        "response_class": Response,
+        "responses": {
+            200: {
+                "description": "The file's headers, without its body.",
+                "headers": {
+                    **ETAG_HEADER,
+                    "Content-Length": {"schema": {"type": "integer"}},
+                },
+            }
+        },
+    }
+
+
+# Every type the scanner admits as a page, plus the WebP of a resized copy.
+PAGE_TYPES = sorted({*IMAGE_TYPES.values(), "image/webp"})
 
 
 def _container(request: Request) -> Container:
@@ -331,7 +572,12 @@ async def opds_publications(
     )
 
 
-@router.get("/api/v1/publications/{publication_id}", tags=["publications"])
+@router.get(
+    "/api/v1/publications/{publication_id}",
+    response_model=PublicationDetail,
+    response_model_exclude_unset=True,
+    tags=["publications"],
+)
 async def publication_detail(
     request: Request,
     publication_id: str,
@@ -341,7 +587,7 @@ async def publication_detail(
     return _container(request).opds.publication(base_url(request), publication)
 
 
-@router.get("/api/v1/series/{series_id}", tags=["series"])
+@router.get("/api/v1/series/{series_id}", response_model=SeriesDetail, tags=["series"])
 async def series_detail(
     request: Request,
     series_id: str,
@@ -358,11 +604,13 @@ async def series_detail(
     "/api/v1/series/{series_id}/cover",
     tags=["series"],
     operation_id="readSeriesCover",
+    **_file_body("image/webp"),
 )
 @router.head(
     "/api/v1/series/{series_id}/cover",
     tags=["series"],
     operation_id="headSeriesCover",
+    **_file_headers(),
 )
 async def series_cover(
     request: Request,
@@ -420,11 +668,13 @@ async def series_cover(
     "/api/v1/publications/{publication_id}/file",
     tags=["publications"],
     operation_id="downloadPublicationFile",
+    **_file_body(CBZ_MEDIA_TYPE),
 )
 @router.head(
     "/api/v1/publications/{publication_id}/file",
     tags=["publications"],
     operation_id="headPublicationFile",
+    **_file_headers(),
 )
 async def publication_file(
     request: Request,
@@ -451,7 +701,12 @@ async def publication_file(
     )
 
 
-@router.get("/api/v1/publications/{publication_id}/pages", tags=["pages"])
+@router.get(
+    "/api/v1/publications/{publication_id}/pages",
+    response_model=PageManifest,
+    response_model_exclude_unset=True,
+    tags=["pages"],
+)
 async def page_manifest(
     request: Request,
     publication_id: str,
@@ -557,7 +812,11 @@ def _resolve_range(
     return start, last
 
 
-@router.get("/api/v1/publications/{publication_id}/range", tags=["pages"])
+@router.get(
+    "/api/v1/publications/{publication_id}/range",
+    tags=["pages"],
+    **_file_body(CBZ_MEDIA_TYPE),
+)
 async def publication_range(
     request: Request,
     publication_id: str,
@@ -617,11 +876,13 @@ def _build_range(
     "/api/v1/publications/{publication_id}/pages/{number}",
     tags=["pages"],
     operation_id="readPublicationPage",
+    **_file_body(*PAGE_TYPES),
 )
 @router.head(
     "/api/v1/publications/{publication_id}/pages/{number}",
     tags=["pages"],
     operation_id="headPublicationPage",
+    **_file_headers(),
 )
 async def publication_page(
     request: Request,
@@ -710,11 +971,13 @@ async def _page_rendition(request: Request, container, item, width: int, revisio
     "/api/v1/publications/{publication_id}/cover",
     tags=["pages"],
     operation_id="readPublicationCover",
+    **_file_body("image/webp"),
 )
 @router.head(
     "/api/v1/publications/{publication_id}/cover",
     tags=["pages"],
     operation_id="headPublicationCover",
+    **_file_headers(),
 )
 async def publication_cover(
     request: Request,
@@ -752,7 +1015,11 @@ async def publication_cover(
     )
 
 
-@router.get("/api/v1/publications/{publication_id}/progress", tags=["reader"])
+@router.get(
+    "/api/v1/publications/{publication_id}/progress",
+    response_model=ReadingPosition,
+    tags=["reader"],
+)
 async def reading_progress(
     request: Request,
     publication_id: str,
@@ -770,7 +1037,11 @@ async def reading_progress(
     return _public_progress(progress)
 
 
-@router.put("/api/v1/publications/{publication_id}/progress", tags=["reader"])
+@router.put(
+    "/api/v1/publications/{publication_id}/progress",
+    response_model=ReadingPosition,
+    tags=["reader"],
+)
 async def save_reading_progress(
     request: Request,
     publication_id: str,
@@ -826,7 +1097,7 @@ def _public_progress(progress: ReadingProgress) -> dict[str, object]:
     }
 
 
-@router.get("/api/v1/auth/me", tags=["authentication"])
+@router.get("/api/v1/auth/me", response_model=UserAccount, tags=["authentication"])
 async def me(
     identity: Annotated[Identity, Depends(authenticated)],
 ) -> dict[str, object]:
@@ -1241,6 +1512,7 @@ async def admin_series_metadata_lookup(
 @router.get(
     "/api/v1/admin/series/{series_id}/metadata/candidates/{provider_id}/cover",
     tags=["administration"],
+    **_file_body("image/webp"),
 )
 async def admin_series_metadata_candidate_cover(
     request: Request,
@@ -1617,13 +1889,147 @@ class LibrarianCommitInput(BaseModel):
     filename: str | None = Field(default=None, max_length=255)
 
 
+# Response bodies of the librarian's slice, held to the same rules as the
+# reading app's: validated on the way out, published open to new fields.
+
+
+class LibraryEntry(ResponseBody):
+    id: str
+    name: str
+    relative_path: str
+
+
+class LibraryList(ResponseBody):
+    libraries: list[LibraryEntry]
+
+
+class TitleMatch(ResponseBody):
+    series_id: str
+    library_id: str
+    library: str
+    category: Literal["comics", "manga"]
+    local_name: str
+    publication_count: int
+    score: float
+    matched_on: str = Field(description="localName, title or alternativeTitle.")
+    matched_value: str
+
+
+class SeriesSummary(ResponseBody):
+    series_id: str
+    library_id: str
+    library: str
+    category: Literal["comics", "manga"]
+    local_name: str
+    title: str
+    publication_count: int
+
+
+class SeriesCandidates(ResponseBody):
+    """Resolving a title ranks matches; a metadata search lists summaries and
+    never names a confident match."""
+
+    candidates: list[TitleMatch | SeriesSummary]
+    confident_match: str | None
+    ambiguous: bool
+
+
+class InventoryVolume(ResponseBody):
+    id: str
+    filename: str
+    title: str
+    number: str | None
+    size: int
+    page_count: int
+
+
+class VolumeInventory(ResponseBody):
+    publication_count: int
+    total_size: int
+    latest: InventoryVolume | None
+    filenames: list[str]
+    publications: list[InventoryVolume]
+
+
+class ProviderTotals(BaseModel):
+    """Keys stay snake_case, like the metadata values they are copied from.
+    One the provider has no figure for is left out rather than sent as null."""
+
+    model_config = ConfigDict(
+        extra="forbid", strict=True, json_schema_extra=_open_to_clients
+    )
+
+    total_chapters: Number | None = None
+    final_volume: Number | None = None
+    status: str | None = None
+
+
+class SeriesInventoryDetail(ResponseBody):
+    series: SeriesSummary
+    inventory: VolumeInventory
+    provider_totals: ProviderTotals
+
+
+class DuplicateVolume(ResponseBody):
+    publication_id: str
+    filename: str
+
+
+class StagedIngest(ResponseBody):
+    ingest_id: str
+    state: Literal["staged"]
+    series_id: str
+    filename: str
+    suggested_filename: str
+    # Null when the series' filenames share no numbering to follow.
+    sibling_pattern: str | None
+    target_path: str
+    size: int
+    page_count: int
+    sha256: str
+    duplicate_of: DuplicateVolume | None
+    created_at: Timestamp
+
+
+class PendingIngests(ResponseBody):
+    pending: list[StagedIngest]
+
+
+class IngestOutcome(ResponseBody):
+    """What became of an upload whose staged record is gone."""
+
+    ingest_id: str
+    state: str = Field(description="placed, conflict or rejected.")
+    # Null unless the upload was placed.
+    relative_path: str | None
+    committed_at: Timestamp
+    summary: str
+
+
+# Named, so a generated client gets a type called this rather than one named
+# after the route.
+class IngestStatus(RootModel[StagedIngest | IngestOutcome]):
+    """Still staged, or what became of it."""
+
+
+class PlacedIngest(ResponseBody):
+    ingest_id: str
+    state: Literal["placed"]
+    series_id: str
+    filename: str
+    relative_path: str
+    size: int
+    page_count: int
+    scan_started: bool
+
+
 async def librarian_identity(
     request: Request,
-    authorization: Annotated[str | None, Header()] = None,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(librarian_bearer)
+    ],
 ) -> LibrarianToken:
-    secret = None
-    if authorization and authorization.lower().startswith("bearer "):
-        secret = authorization[len("bearer ") :].strip()
+    secret = credentials.credentials if credentials else None
     token = await run_in_threadpool(_container(request).librarian_auth.verify, secret)
     if token is None:
         raise HTTPException(status_code=401, detail="Librarian authentication required")
@@ -1664,7 +2070,9 @@ def _librarian_error(error: LibrarianError) -> HTTPException:
     return HTTPException(status_code=422, detail=str(error))
 
 
-@router.get("/api/v1/librarian/libraries", tags=["librarian"])
+@router.get(
+    "/api/v1/librarian/libraries", response_model=LibraryList, tags=["librarian"]
+)
 async def librarian_libraries(
     request: Request,
     token: Annotated[LibrarianToken, Depends(librarian_identity)],
@@ -1690,7 +2098,9 @@ async def librarian_libraries(
     }
 
 
-@router.get("/api/v1/librarian/series", tags=["librarian"])
+@router.get(
+    "/api/v1/librarian/series", response_model=SeriesCandidates, tags=["librarian"]
+)
 async def librarian_series(
     request: Request,
     token: Annotated[LibrarianToken, Depends(librarian_identity)],
@@ -1795,7 +2205,12 @@ async def librarian_series(
     }
 
 
-@router.get("/api/v1/librarian/series/{series_id}", tags=["librarian"])
+@router.get(
+    "/api/v1/librarian/series/{series_id}",
+    response_model=SeriesInventoryDetail,
+    response_model_exclude_unset=True,
+    tags=["librarian"],
+)
 async def librarian_series_detail(
     request: Request,
     series_id: str,
@@ -1839,7 +2254,12 @@ async def librarian_series_detail(
     }
 
 
-@router.post("/api/v1/librarian/ingest", status_code=201, tags=["librarian"])
+@router.post(
+    "/api/v1/librarian/ingest",
+    status_code=201,
+    response_model=StagedIngest,
+    tags=["librarian"],
+)
 async def librarian_ingest_stage(
     request: Request,
     token: Annotated[LibrarianToken, Depends(librarian_identity)],
@@ -1887,7 +2307,9 @@ async def librarian_ingest_stage(
     return _staged_payload(staged)
 
 
-@router.get("/api/v1/librarian/ingest", tags=["librarian"])
+@router.get(
+    "/api/v1/librarian/ingest", response_model=PendingIngests, tags=["librarian"]
+)
 async def librarian_ingest_pending(
     request: Request,
     token: Annotated[LibrarianToken, Depends(librarian_identity)],
@@ -1898,7 +2320,11 @@ async def librarian_ingest_pending(
     return {"pending": [_staged_payload(item) for item in pending]}
 
 
-@router.get("/api/v1/librarian/ingest/{ingest_id}", tags=["librarian"])
+@router.get(
+    "/api/v1/librarian/ingest/{ingest_id}",
+    response_model=IngestStatus,
+    tags=["librarian"],
+)
 async def librarian_ingest_detail(
     request: Request,
     ingest_id: str,
@@ -1926,7 +2352,11 @@ async def librarian_ingest_detail(
     raise HTTPException(status_code=404, detail="Staged upload not found or expired")
 
 
-@router.post("/api/v1/librarian/ingest/{ingest_id}/commit", tags=["librarian"])
+@router.post(
+    "/api/v1/librarian/ingest/{ingest_id}/commit",
+    response_model=PlacedIngest,
+    tags=["librarian"],
+)
 async def librarian_ingest_commit(
     request: Request,
     ingest_id: str,
