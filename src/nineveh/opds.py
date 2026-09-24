@@ -153,6 +153,10 @@ class OpdsBuilder:
 
 def _publication_metadata(item: Publication) -> dict[str, object]:
     series: dict[str, object] = {"name": item.series}
+    # The series' own id is what `/api/v1/series/{id}` takes. A name alone
+    # cannot reach it: two libraries may file different series under one name.
+    if item.series_id:
+        series["identifier"] = f"urn:uuid:{item.series_id}"
     position = _series_position(item.number)
     if position is not None:
         series["position"] = position

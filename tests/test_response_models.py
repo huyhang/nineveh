@@ -43,10 +43,36 @@ def test_a_publication_without_optional_metadata_leaves_those_keys_out(
     response = fake_client.get("/api/v1/publications/bare-id", headers=authorization())
 
     assert response.status_code == 200
-    assert response.json() == fake_container.opds.publication("http://testserver", bare)
+    # The stored row, not `bare`: cataloguing is what assigns the series its id.
+    stored = fake_container.repository.publication_by_id("bare-id")
+    assert response.json() == fake_container.opds.publication(
+        "http://testserver", stored
+    )
     metadata = response.json()["metadata"]
     assert {"description", "author"}.isdisjoint(metadata)
-    assert metadata["belongsTo"]["series"] == [{"name": "Series"}]
+    [series] = metadata["belongsTo"]["series"]
+    assert set(series) == {"name", "identifier"}
+
+
+def test_a_publication_names_the_series_detail_it_belongs_to(
+    fake_client: TestClient, fake_container: Container
+):
+    member = replace(
+        publication("member-id", pages=1),
+        relative_path="Lib/comics/Series/Member.cbz",
+        filename="Member.cbz",
+    )
+    fake_container.repository.upsert_publication(ScannedPublication(member, (page(1),)))
+
+    response = fake_client.get(
+        "/api/v1/publications/member-id", headers=authorization()
+    )
+    [series] = response.json()["metadata"]["belongsTo"]["series"]
+    series_id = series["identifier"].removeprefix("urn:uuid:")
+    detail = fake_client.get(f"/api/v1/series/{series_id}", headers=authorization())
+
+    assert detail.status_code == 200
+    assert detail.json()["localName"] == series["name"]
 
 
 def test_a_fractional_volume_keeps_its_fraction(
@@ -127,6 +153,41 @@ def test_series_metadata_keeps_its_nulls_and_its_number_types(
     assert type(metadata["values"]["final_volume"]) is float
 
 
+def _nulls(node: object, path: str = "$"):
+    if node is None:
+        yield path
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield from _nulls(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _nulls(value, f"{path}[{index}]")
+
+
+def test_no_opds_document_turns_an_absent_field_into_null(
+    fake_client: TestClient, fake_container: Container
+):
+    """The OPDS builders leave out what they do not know. A feed route
+    without `response_model_exclude_unset` would send each of those as null
+    instead -- `templated` on every link -- and an OPDS client reading
+    `null` where the spec allows only a boolean may refuse the feed."""
+    [series] = fake_container.repository.catalog_series()
+    requests = [
+        ("/opds/v2/authentication.json", {}),
+        ("/opds/v2/catalog.json", {}),
+        ("/opds/v2/navigation.json", {"library": series.library}),
+        (
+            "/opds/v2/navigation.json",
+            {"library": series.library, "category": series.category},
+        ),
+        ("/opds/v2/publications.json", {"library": series.library}),
+    ]
+    for path, params in requests:
+        response = fake_client.get(path, params=params, headers=authorization())
+        assert response.status_code == 200, (path, params)
+        assert list(_nulls(response.json())) == [], (path, params)
+
+
 POSITION = {
     "publicationId": "fake-id",
     "page": 3,
@@ -145,7 +206,7 @@ def test_a_field_the_model_does_not_declare_is_refused_rather_than_dropped():
 
 
 def test_a_value_of_the_wrong_type_is_refused_rather_than_converted():
-    """Otherwise a builder sending "3" would pass here, as 3, while the OPDS
-    feeds, which share builders but have no model, went on sending "3"."""
+    """Otherwise a builder sending "3" would pass here, as 3, and stay wrong
+    with nothing pointing at it."""
     with pytest.raises(ValidationError, match="Input should be a valid integer"):
         ReadingPosition.model_validate({**POSITION, "page": "3"})

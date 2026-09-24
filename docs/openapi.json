@@ -17,6 +17,81 @@
         "title": "AccessUpdate",
         "type": "object"
       },
+      "AuthenticationDocument": {
+        "description": "OPDS Authentication 1.0: how to sign in, readable before signing in.",
+        "properties": {
+          "authentication": {
+            "items": {
+              "$ref": "#/components/schemas/AuthenticationMethod"
+            },
+            "title": "Authentication",
+            "type": "array"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/OpdsLink"
+            },
+            "title": "Links",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "description",
+          "authentication",
+          "links"
+        ],
+        "title": "AuthenticationDocument",
+        "type": "object"
+      },
+      "AuthenticationLabels": {
+        "properties": {
+          "login": {
+            "title": "Login",
+            "type": "string"
+          },
+          "password": {
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "login",
+          "password"
+        ],
+        "title": "AuthenticationLabels",
+        "type": "object"
+      },
+      "AuthenticationMethod": {
+        "properties": {
+          "labels": {
+            "$ref": "#/components/schemas/AuthenticationLabels"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "labels"
+        ],
+        "title": "AuthenticationMethod",
+        "type": "object"
+      },
       "Body_librarian_ingest_stage_api_v1_librarian_ingest_post": {
         "properties": {
           "file": {
@@ -59,6 +134,30 @@
           "filename"
         ],
         "title": "DuplicateVolume",
+        "type": "object"
+      },
+      "FeedMetadata": {
+        "properties": {
+          "modified": {
+            "format": "date-time",
+            "title": "Modified",
+            "type": "string"
+          },
+          "numberOfItems": {
+            "title": "Numberofitems",
+            "type": "integer"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "modified",
+          "numberOfItems"
+        ],
+        "title": "FeedMetadata",
         "type": "object"
       },
       "GrantInput": {
@@ -702,6 +801,110 @@
         "title": "NamedEntry",
         "type": "object"
       },
+      "NavigationFeed": {
+        "description": "The catalog root, a library's categories, or a category's series.",
+        "properties": {
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/OpdsLink"
+            },
+            "title": "Links",
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/FeedMetadata"
+          },
+          "navigation": {
+            "items": {
+              "$ref": "#/components/schemas/NavigationLink"
+            },
+            "title": "Navigation",
+            "type": "array"
+          }
+        },
+        "required": [
+          "metadata",
+          "links",
+          "navigation"
+        ],
+        "title": "NavigationFeed",
+        "type": "object"
+      },
+      "NavigationLink": {
+        "description": "A library, category or series one level down, with how much it holds.",
+        "properties": {
+          "href": {
+            "title": "Href",
+            "type": "string"
+          },
+          "properties": {
+            "$ref": "#/components/schemas/NavigationProperties"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "href",
+          "type",
+          "properties"
+        ],
+        "title": "NavigationLink",
+        "type": "object"
+      },
+      "NavigationProperties": {
+        "properties": {
+          "numberOfItems": {
+            "title": "Numberofitems",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "numberOfItems"
+        ],
+        "title": "NavigationProperties",
+        "type": "object"
+      },
+      "OpdsLink": {
+        "properties": {
+          "href": {
+            "title": "Href",
+            "type": "string"
+          },
+          "rel": {
+            "title": "Rel",
+            "type": "string"
+          },
+          "templated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Templated"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rel",
+          "href",
+          "type"
+        ],
+        "title": "OpdsLink",
+        "type": "object"
+      },
       "PageManifest": {
         "properties": {
           "end": {
@@ -926,6 +1129,69 @@
           "images"
         ],
         "title": "PublicationDetail",
+        "type": "object"
+      },
+      "PublicationFeed": {
+        "description": "One page of publications; the `next` link, when present, is the rest.",
+        "properties": {
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/OpdsLink"
+            },
+            "title": "Links",
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/PublicationFeedMetadata"
+          },
+          "publications": {
+            "items": {
+              "$ref": "#/components/schemas/PublicationDetail"
+            },
+            "title": "Publications",
+            "type": "array"
+          }
+        },
+        "required": [
+          "metadata",
+          "links",
+          "publications"
+        ],
+        "title": "PublicationFeed",
+        "type": "object"
+      },
+      "PublicationFeedMetadata": {
+        "properties": {
+          "currentPage": {
+            "title": "Currentpage",
+            "type": "integer"
+          },
+          "itemsPerPage": {
+            "title": "Itemsperpage",
+            "type": "integer"
+          },
+          "modified": {
+            "format": "date-time",
+            "title": "Modified",
+            "type": "string"
+          },
+          "numberOfItems": {
+            "title": "Numberofitems",
+            "type": "integer"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "modified",
+          "numberOfItems",
+          "itemsPerPage",
+          "currentPage"
+        ],
+        "title": "PublicationFeedMetadata",
         "type": "object"
       },
       "PublicationImage": {
@@ -1208,6 +1474,17 @@
       },
       "SeriesEntry": {
         "properties": {
+          "identifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Identifier"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -4299,6 +4576,11 @@
             "required": false,
             "schema": {
               "default": 320,
+              "enum": [
+                160,
+                320,
+                640
+              ],
               "title": "Width",
               "type": "integer"
             }
@@ -4378,6 +4660,11 @@
             "required": false,
             "schema": {
               "default": 320,
+              "enum": [
+                160,
+                320,
+                640
+              ],
               "title": "Width",
               "type": "integer"
             }
@@ -4663,6 +4950,11 @@
             "schema": {
               "anyOf": [
                 {
+                  "enum": [
+                    640,
+                    960,
+                    1280
+                  ],
                   "type": "integer"
                 },
                 {
@@ -4783,6 +5075,11 @@
             "schema": {
               "anyOf": [
                 {
+                  "enum": [
+                    640,
+                    960,
+                    1280
+                  ],
                   "type": "integer"
                 },
                 {
@@ -5283,9 +5580,7 @@
             "content": {
               "application/opds-authentication+json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Opds Authentication Opds V2 Authentication Json Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/AuthenticationDocument"
                 }
               }
             },
@@ -5306,9 +5601,7 @@
             "content": {
               "application/opds+json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Opds Catalog Opds V2 Catalog Json Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/NavigationFeed"
                 }
               }
             },
@@ -5361,9 +5654,7 @@
             "content": {
               "application/opds+json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Opds Navigation Opds V2 Navigation Json Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/NavigationFeed"
                 }
               }
             },
@@ -5477,9 +5768,7 @@
             "content": {
               "application/opds+json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Opds Publications Opds V2 Publications Json Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/PublicationFeed"
                 }
               }
             },

@@ -33,7 +33,12 @@ from pydantic import BaseModel, ConfigDict, Field, RootModel, WithJsonSchema
 from pydantic.alias_generators import to_camel
 from starlette.background import BackgroundTask
 
-from .archives import ArchiveChanged, ArchiveUnavailable
+from .archives import (
+    ArchiveChanged,
+    ArchiveUnavailable,
+    PageRenditionService,
+    ThumbnailService,
+)
 from .auth import (
     AuthenticationError,
     AuthService,
@@ -161,6 +166,20 @@ Timestamp = Annotated[str, WithJsonSchema({"type": "string", "format": "date-tim
 # Metadata numbers arrive as whichever of int or float the provider or editor
 # produced. A `float` field would turn 91 into 91.0; this passes both through.
 Number = Annotated[int | float, WithJsonSchema({"type": "number"})]
+# Pages and covers are rendered at a few fixed widths and any other is a 422,
+# so the contract lists them rather than leaving a client to learn from the
+# error. Validated as a plain int: a query value arrives as text, which a
+# `Literal[640, ...]` refuses outright; the service checks membership.
+PageWidth = Annotated[
+    int,
+    WithJsonSchema(
+        {"type": "integer", "enum": sorted(PageRenditionService.ALLOWED_WIDTHS)}
+    ),
+]
+CoverWidth = Annotated[
+    int,
+    WithJsonSchema({"type": "integer", "enum": sorted(ThumbnailService.ALLOWED_WIDTHS)}),
+]
 
 
 def _open_to_clients(schema: dict[str, object]) -> None:
@@ -287,6 +306,8 @@ class NamedEntry(ResponseBody):
 
 class SeriesEntry(ResponseBody):
     name: str
+    # `urn:uuid:` and the id `/api/v1/series/{series_id}` takes.
+    identifier: str | None = None
     # Omitted when the volume's number is not one, such as "12a" or "Special".
     position: Number | None = None
 
@@ -331,6 +352,79 @@ class PublicationDetail(ResponseBody):
     metadata: PublicationMetadata
     links: list[PublicationLink]
     images: list[PublicationImage]
+
+
+# The OPDS feeds follow a published spec, but which of its fields Nineveh
+# fills -- and the query values an app files its catalog by -- are Nineveh's,
+# so they are described like any other response.
+
+
+class OpdsLink(ResponseBody):
+    rel: str
+    href: str
+    type: str
+    # Set only on the search link, whose href is a URI template.
+    templated: bool | None = None
+
+
+class NavigationProperties(ResponseBody):
+    number_of_items: int
+
+
+class NavigationLink(ResponseBody):
+    """A library, category or series one level down, with how much it holds."""
+
+    title: str
+    href: str
+    type: str
+    properties: NavigationProperties
+
+
+class FeedMetadata(ResponseBody):
+    title: str
+    modified: Timestamp
+    number_of_items: int
+
+
+class PublicationFeedMetadata(FeedMetadata):
+    items_per_page: int
+    current_page: int
+
+
+class NavigationFeed(ResponseBody):
+    """The catalog root, a library's categories, or a category's series."""
+
+    metadata: FeedMetadata
+    links: list[OpdsLink]
+    navigation: list[NavigationLink]
+
+
+class PublicationFeed(ResponseBody):
+    """One page of publications; the `next` link, when present, is the rest."""
+
+    metadata: PublicationFeedMetadata
+    links: list[OpdsLink]
+    publications: list[PublicationDetail]
+
+
+class AuthenticationLabels(ResponseBody):
+    login: str
+    password: str
+
+
+class AuthenticationMethod(ResponseBody):
+    type: str
+    labels: AuthenticationLabels
+
+
+class AuthenticationDocument(ResponseBody):
+    """OPDS Authentication 1.0: how to sign in, readable before signing in."""
+
+    id: str
+    title: str
+    description: str
+    authentication: list[AuthenticationMethod]
+    links: list[OpdsLink]
 
 
 # Routes that send a file. Left to FastAPI, each would be documented as JSON --
@@ -456,13 +550,21 @@ async def ready(request: Request) -> dict[str, object]:
 @router.get(
     "/opds/v2/authentication.json",
     response_class=OpdsAuthenticationResponse,
+    response_model=AuthenticationDocument,
+    response_model_exclude_unset=True,
     tags=["opds"],
 )
 async def opds_authentication(request: Request) -> dict[str, object]:
     return _container(request).opds.authentication_document(base_url(request))
 
 
-@router.get("/opds/v2/catalog.json", response_class=OpdsResponse, tags=["opds"])
+@router.get(
+    "/opds/v2/catalog.json",
+    response_class=OpdsResponse,
+    response_model=NavigationFeed,
+    response_model_exclude_unset=True,
+    tags=["opds"],
+)
 async def opds_catalog(
     request: Request, identity: Annotated[Identity, Depends(authenticated)]
 ) -> dict[str, object]:
@@ -474,7 +576,13 @@ async def opds_catalog(
     )
 
 
-@router.get("/opds/v2/navigation.json", response_class=OpdsResponse, tags=["opds"])
+@router.get(
+    "/opds/v2/navigation.json",
+    response_class=OpdsResponse,
+    response_model=NavigationFeed,
+    response_model_exclude_unset=True,
+    tags=["opds"],
+)
 async def opds_navigation(
     request: Request,
     identity: Annotated[Identity, Depends(authenticated)],
@@ -535,7 +643,13 @@ async def _series_entries(
     return f"{library} — {category}", parameters, entries
 
 
-@router.get("/opds/v2/publications.json", response_class=OpdsResponse, tags=["opds"])
+@router.get(
+    "/opds/v2/publications.json",
+    response_class=OpdsResponse,
+    response_model=PublicationFeed,
+    response_model_exclude_unset=True,
+    tags=["opds"],
+)
 async def opds_publications(
     request: Request,
     identity: Annotated[Identity, Depends(authenticated)],
@@ -890,10 +1004,10 @@ async def publication_page(
     number: int,
     identity: Annotated[Identity, Depends(authenticated)],
     revision: str | None = None,
-    width: int | None = Query(
-        default=None,
-        description="Serve a copy no wider than this instead of the original.",
-    ),
+    width: Annotated[
+        PageWidth | None,
+        Query(description="Serve a copy no wider than this instead of the original."),
+    ] = None,
 ):
     container = _container(request)
     scope = container.authorization.read_scope(identity.user)
@@ -983,7 +1097,7 @@ async def publication_cover(
     request: Request,
     publication_id: str,
     identity: Annotated[Identity, Depends(authenticated)],
-    width: int = Query(default=320),
+    width: Annotated[CoverWidth, Query()] = 320,
     revision: str | None = None,
 ):
     container = _container(request)

@@ -144,6 +144,18 @@ def test_publication_metadata_omits_absent_optional_fields(builder: OpdsBuilder)
     assert metadata["belongsTo"]["series"] == [{"name": "Series", "position": 1}]
 
 
+def test_a_catalogued_series_is_identified_by_the_id_its_detail_route_takes(
+    builder: OpdsBuilder,
+):
+    item = replace(publication(), series_id="0b6c1e9e-5a4f-4f0e-9a51-3c1d2b7e8f90")
+    [series] = builder.publication(BASE, item)["metadata"]["belongsTo"]["series"]
+    assert series == {
+        "name": "Series",
+        "identifier": "urn:uuid:0b6c1e9e-5a4f-4f0e-9a51-3c1d2b7e8f90",
+        "position": 1,
+    }
+
+
 @pytest.mark.parametrize(
     ("number", "position"),
     [

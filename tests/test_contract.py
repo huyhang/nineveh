@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from nineveh import __version__
 from nineveh.app import CONTRACT_SLICES, openapi_document, tagged_contract
+from nineveh.archives import PageRenditionService, ThumbnailService
 from nineveh.http_api import router as api_router
 from nineveh.http_web import router as web_router
 from nineveh.opds import CBZ_MEDIA_TYPE
@@ -260,14 +261,14 @@ def test_each_slice_describes_every_json_body_it_returns(sliced: tuple[str, dict
     """A free-form object leaves a generated client decoding the body by hand,
     and no drift test notices a field that is renamed. An empty schema is no
     better, and it is what FastAPI documents for a route that sends a file.
-    The OPDS feeds are exempt: they carry their own media types and follow a
-    published spec."""
+    The OPDS feeds count: they follow a published spec, but which of its
+    optional fields Nineveh fills is Nineveh's to promise."""
     _, contract = sliced
     media = _success_media(contract)
     undescribed = [
         (path, method)
         for path, method, media_type, schema in media
-        if media_type == "application/json"
+        if (media_type == "application/json" or media_type.endswith("+json"))
         and (
             not schema
             or (schema.get("type") == "object" and "properties" not in schema)
@@ -320,6 +321,43 @@ def test_what_the_app_downloads_arrives_as_the_slice_says(
         missing = [name for name in documented_headers if name not in response.headers]
         assert missing == [], (method, path)
     assert {"application/json", "image/png", "image/webp", CBZ_MEDIA_TYPE} <= received
+
+
+def _listed(schema: dict) -> list:
+    """The enum of a parameter, looking through the `anyOf` an optional one has."""
+    for option in [schema, *schema.get("anyOf", [])]:
+        if "enum" in option:
+            return option["enum"]
+    return []
+
+
+def test_every_width_the_app_slice_lists_renders(
+    client: TestClient, publication_id: str
+):
+    """Pages and covers render at a few widths and refuse the rest, so the
+    slice lists them. Ask the routes that each listed width renders and that
+    the lists are the services' whole choice, not a stale copy of part of it."""
+    app = json.loads(_slice_path("app").read_text(encoding="utf-8"))
+    headers = authorization()
+    listed = {
+        path: _listed(parameter["schema"])
+        for path, method in _operations(app)
+        if method == "get"
+        for parameter in app["paths"][path][method].get("parameters") or []
+        if parameter["name"] == "width"
+    }
+    page = "/api/v1/publications/{publication_id}/pages/{number}"
+    cover = "/api/v1/publications/{publication_id}/cover"
+    assert set(listed) == {page, cover}
+    assert set(listed[page]) == PageRenditionService.ALLOWED_WIDTHS
+    assert set(listed[cover]) == ThumbnailService.ALLOWED_WIDTHS
+    for path, widths in listed.items():
+        url = path.format(publication_id=publication_id, number=1)
+        for width in widths:
+            response = client.get(url, params={"width": width}, headers=headers)
+            assert response.status_code == 200, (path, width, response.text)
+        refused = client.get(url, params={"width": max(widths) + 1}, headers=headers)
+        assert refused.status_code == 422, path
 
 
 def test_each_slice_is_versioned_with_the_package(sliced: tuple[str, dict]):

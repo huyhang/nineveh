@@ -16,7 +16,7 @@ change — a reader endpoint, a metadata filter — shows up as a diff in your
 client repo and you have to work out whether it affects you.
 
 `docs/librarian-openapi.json` carries only the `librarian`-tagged operations
-and the schemas they reference. It is 1,155 lines instead of 5,511, and it
+and the schemas they reference. It is 1,155 lines instead of 5,800, and it
 changes only when the surface you actually call changes. That is the signal
 worth reacting to.
 
@@ -217,15 +217,31 @@ vendor the file there rather than under `contracts/`. The generator does not
 act on security schemes itself; add the `Authorization` header in a
 `ClientMiddleware`.
 
-**Responses are typed, apart from the feeds.** The page manifest, progress,
-series and publication detail, and `/auth/me` each reference a schema, so the
-generated client decodes them and the drift test catches a response field
-that is renamed or removed. The OPDS feeds and the authentication document
-stay free-form objects under their own media types; decode them with an
-OPDS 2.0 model, since they follow a published spec rather than a Nineveh one.
-No schema sets `additionalProperties: false`, so a field Nineveh adds later is
-ignored by apps already installed instead of failing their decoding. Nineveh's
-contract tests keep it that way.
+**Every response is typed, the feeds included.** The page manifest, progress,
+series and publication detail, and `/auth/me` each reference a schema, and so
+do the OPDS feeds and the authentication document, under their own media
+types: `NavigationFeed` for the catalog root and a library's categories,
+`PublicationFeed` for a page of publications, `AuthenticationDocument` for the
+discovery document. They follow OPDS 2.0, but the spec leaves most fields
+optional, and the schemas say which of them Nineveh fills. A publication
+carries no `subject`, for instance: its category is the feed that lists it. So
+the generated client decodes all of them, and the drift test catches a field
+that is renamed or removed. No schema sets `additionalProperties: false`, so a
+field Nineveh adds later is ignored by apps already installed instead of
+failing their decoding. Nineveh's contract tests keep it that way.
+
+**Widths are an enum.** Pages render at 640, 960 or 1280 pixels wide and
+covers at 160, 320 or 640; any other `width` is a `422`. The slice lists them
+as each parameter's `enum`, so an app picks the narrowest listed width that
+covers its view rather than asking for its exact size. A page request without
+`width` gets the original.
+
+**A hand-written client can check itself instead.** Where an app keeps its own
+lenient decoders rather than generating a client, vendor the slice anyway and
+test the client against it: every path, method and query parameter it sends
+is in the slice, the widths it asks for are the listed ones, and the fields its
+decoders read are ones the schemas promise. Capture a few real responses from
+a running server as fixtures for the decoders.
 
 A publication's volume number is `belongsTo.series[].position`, a number, where
 OPDS 2.0 puts it. A number nothing can order, such as `12a`, is left out
