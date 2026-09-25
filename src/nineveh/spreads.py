@@ -5,7 +5,9 @@ the front matter shifts every later spread: the reader sees the right half of
 one spread beside the left half of the next. Page dimensions cannot reveal
 that — a leading single and half a spread are the same shape — so detection
 reads the printed gutter instead. Two halves of one spread continue across the
-seam; two unrelated pages meet margin to margin.
+seam; two unrelated pages meet margin to margin. A spread the scan left stitched
+into one wide image settles the question outright, so the gutter is only read
+in a volume that has none.
 
 Detection abstains whenever the evidence is weak. An abstaining volume keeps
 today's pairing, and an administrator can always pin the start page by hand.
@@ -77,6 +79,11 @@ class SeamSpreadDetector:
             if not self._continuous(publication, by_number, start, direction, cache):
                 continue
             if self._confirmed(publication, by_number, start, direction, cache):
+                # Spreads straight after the cover are how every volume pairs
+                # already, so there is nothing to move. Stopping here keeps a
+                # later seam from being mistaken for the start.
+                if start == FIRST_CANDIDATE:
+                    return SpreadGuess.none()
                 return SpreadGuess(start, GUTTER_SOURCE)
         return SpreadGuess.none()
 
@@ -177,6 +184,7 @@ class WidePageDetector:
     it. Anchoring there lets the pairing align backwards from a page we know is
     a real spread boundary, which is a far stronger signal than any guess about
     the front matter — and it costs nothing but the dimensions already indexed.
+    The cover is never taken for one: it stands alone however wide it is.
     """
 
     def detect(
@@ -191,7 +199,7 @@ class WidePageDetector:
 
 
 class LayeredSpreadDetector:
-    """Read the gutter first; fall back to the first stitched spread."""
+    """Ask each detector in turn; the first to find anything decides."""
 
     def __init__(self, *detectors: SpreadDetection) -> None:
         self._detectors = detectors
@@ -201,11 +209,20 @@ class LayeredSpreadDetector:
     ) -> SpreadGuess:
         for detector in self._detectors:
             guess = detector.detect(publication, pages, direction)
-            # An anchor of two is the default pairing, so it tells us nothing a
-            # later detector could not improve on.
-            if guess.anchor is not None and guess.anchor > FIRST_CANDIDATE:
+            if guess.anchor is not None:
                 return guess
         return SpreadGuess.none()
+
+
+def spread_detector(archives: ArchiveSource, max_image_pixels: int) -> SpreadDetection:
+    """Anchor on the first stitched spread, and read the gutter only without one.
+
+    A wide page is a spread boundary by construction, even straight after the
+    cover, so a volume that has one never has its pages opened.
+    """
+    return LayeredSpreadDetector(
+        WidePageDetector(), SeamSpreadDetector(archives, max_image_pixels)
+    )
 
 
 def _is_wide(page: Page) -> bool:

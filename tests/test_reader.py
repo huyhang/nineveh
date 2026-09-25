@@ -478,6 +478,48 @@ def test_upgrading_discards_anchors_from_the_old_detector_but_keeps_overrides(
     assert repository.publication_spread_override(item.id) == 4
 
 
+def test_upgrading_recomputes_every_anchor_but_a_wide_pages(tmp_path):
+    """A wide page used to be read only when the gutter found nothing, and now
+    decides before the gutter is read. Any other stored answer may have come
+    from a gutter the new order never reaches."""
+    from nineveh.database import WIDE_PAGE_FIRST_VERSION
+
+    path = tmp_path / "nineveh.sqlite3"
+    repository = SQLiteRepository(path)
+    repository.initialize()
+    items = {
+        source: replace(
+            publication(f"spread-{source}", pages=9),
+            relative_path=f"Lib/comics/Series/{source}.cbz",
+        )
+        for source in ("gutter", "wide page", None)
+    }
+    for source, item in items.items():
+        repository.upsert_publication(
+            ScannedPublication(item, tuple(page(number) for number in (1, 2, 3)))
+        )
+        repository.save_publication_spread_analysis(
+            item.id, item.revision, 3 if source else None, source
+        )
+    repository.set_publication_spread_override(items["gutter"].id, 4)
+
+    with repository._connect() as connection:
+        connection.execute(f"PRAGMA user_version = {WIDE_PAGE_FIRST_VERSION - 1}")
+    SQLiteRepository(path).initialize()
+
+    def stored(source):
+        item = items[source]
+        return repository.publication_spread_analysis(item.id, item.revision)
+
+    assert stored("gutter") is None
+    assert stored(None) is None
+    assert (stored("wide page").anchor_page, stored("wide page").source) == (
+        3,
+        "wide page",
+    )
+    assert repository.publication_spread_override(items["gutter"].id) == 4
+
+
 def test_the_detector_that_answered_is_recorded_with_the_anchor():
     """The panel names the evidence, so the service has to carry it through."""
     service, repository, _detector, _archives, _item = _spread_service()

@@ -35,7 +35,7 @@ from .domain import (
     User,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 # The release that began recording `ComicInfo.xml` spread markers. Databases
 # older than this need one reinspection pass to pick them up.
 SPREAD_MARKER_VERSION = 4
@@ -44,6 +44,10 @@ SPREAD_MARKER_VERSION = 4
 # is not where pairing should start, so those rows have to be recomputed rather
 # than trusted.
 SEAM_DETECTION_VERSION = 6
+# The release that made a stitched spread outrank the gutter. A volume with a
+# wide page may have stored whatever the gutter read first, so every anchor but
+# a wide page's own has to be recomputed.
+WIDE_PAGE_FIRST_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -331,6 +335,13 @@ class SQLiteRepository:
                 # Administrator overrides survive: only the detected anchors
                 # are discarded, and the next scan recomputes them.
                 connection.execute("DELETE FROM publication_spread_analysis")
+            if 0 < version < WIDE_PAGE_FIRST_VERSION:
+                # A wide page's anchor is what the new order finds first
+                # anyway. Overrides live elsewhere and survive, as above.
+                connection.execute(
+                    "DELETE FROM publication_spread_analysis"
+                    " WHERE source IS NOT 'wide page'"
+                )
             if 0 < version < SCHEMA_VERSION:
                 self._backfill_scope(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

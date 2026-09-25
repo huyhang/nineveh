@@ -49,7 +49,7 @@ from .ports import (
 )
 from .reader import ReaderService, SpreadDetectionService
 from .restart import DisabledRestartController, ProcessRestartController
-from .spreads import LayeredSpreadDetector, SeamSpreadDetector, WidePageDetector
+from .spreads import spread_detector
 
 LOGGER = logging.getLogger(__name__)
 
@@ -96,10 +96,7 @@ def build_container(settings: Settings) -> Container:
     spreads = SpreadDetectionService(
         repository,
         archives,
-        LayeredSpreadDetector(
-            SeamSpreadDetector(archives, effective.max_image_pixels),
-            WidePageDetector(),
-        ),
+        spread_detector(archives, effective.max_image_pixels),
     )
     return Container(
         settings=effective,

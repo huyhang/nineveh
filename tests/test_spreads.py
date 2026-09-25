@@ -24,6 +24,7 @@ from nineveh.spreads import (
     SeamSpreadDetector,
     WidePageDetector,
     seam_continuity,
+    spread_detector,
 )
 
 WIDTH = 100
@@ -116,6 +117,12 @@ def test_it_reads_the_gutter_on_the_correct_side_for_right_to_left_scans():
 
 def test_a_volume_of_ordinary_single_pages_moves_nothing():
     assert _detect(_volume(10, first_spread=None), 10) is None
+
+
+def test_spreads_straight_after_the_cover_move_nothing():
+    """Every volume pairs from page two already. A run found there is no
+    anchor, and it must not let a later seam be reported as the start."""
+    assert _guess(_volume(10, first_spread=2), 10) == SpreadGuess.none()
 
 
 def test_blank_margins_meeting_are_not_mistaken_for_a_spread():
@@ -249,21 +256,57 @@ def test_the_first_detector_with_a_real_answer_wins():
     assert second.calls == 0, "a confident answer must not cost a second read"
 
 
-def test_a_detector_that_only_confirms_the_default_falls_through():
-    """Anchoring on page two is what already happens, so it is not an answer
-    that should shadow a detector with a stronger signal."""
-    for weak in (None, 2):
-        guess = LayeredSpreadDetector(StubDetection(weak), StubDetection(33)).detect(
-            None, [], "ltr"
-        )
-        assert guess.anchor == 33
+def test_an_answer_at_page_two_still_decides():
+    """A detector that found something has answered, even where pairing would
+    have started anyway; only an abstention falls through."""
+    first, second = StubDetection(2), StubDetection(33)
+    assert LayeredSpreadDetector(first, second).detect(None, [], "ltr").anchor == 2
+    assert second.calls == 0
+
+    abstaining = StubDetection(None)
+    guess = LayeredSpreadDetector(abstaining, StubDetection(33)).detect(None, [], "ltr")
+    assert guess.anchor == 33
 
 
 def test_layering_abstains_when_nothing_has_a_signal():
-    guess = LayeredSpreadDetector(StubDetection(None), StubDetection(2)).detect(
-        None, [], "ltr"
-    )
+    first, second = StubDetection(None), StubDetection(None)
+    guess = LayeredSpreadDetector(first, second).detect(None, [], "ltr")
     assert guess.anchor is None and guess.source is None
+    assert (first.calls, second.calls) == (1, 1)
+
+
+# --- The detector Nineveh runs ---------------------------------------------
+
+
+def _run(images, pages, direction="ltr"):
+    archives = StubArchives(images)
+    item = publication("vol", pages=len(pages))
+    guess = spread_detector(archives, 10_000_000).detect(item, pages, direction)
+    return guess, archives.opened
+
+
+@pytest.mark.parametrize("wide", [2, 5, 33])
+def test_a_wide_page_decides_before_a_single_page_is_opened(wide):
+    """A stitched spread outranks the gutter wherever it falls, even straight
+    after the cover, where it leaves pairing as it was. Pages whose gutter
+    would name another start are never read."""
+    guess, opened = _run(_volume(40, first_spread=3), _pages_with_wide(40, {wide}))
+    assert guess == SpreadGuess(wide, WIDE_PAGE_SOURCE)
+    assert opened == []
+
+
+def test_without_a_wide_page_the_gutter_is_read():
+    guess, opened = _run(_volume(10, first_spread=3), _pages_with_wide(10, set()))
+    assert guess == SpreadGuess(3, GUTTER_SOURCE)
+    assert opened
+
+
+def test_a_wide_cover_is_no_reason_to_skip_the_gutter():
+    """The cover stands alone however wide it is, so it says nothing about
+    where the spreads inside begin."""
+    guess, opened = _run(_volume(10, first_spread=3), _pages_with_wide(10, {1}))
+    assert guess == SpreadGuess(3, GUTTER_SOURCE)
+    assert opened
 
 
 def test_each_detector_names_the_evidence_it_used():

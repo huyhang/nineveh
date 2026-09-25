@@ -106,6 +106,13 @@ def test_the_cover_never_pairs_however_the_anchor_falls():
                 )
 
 
+def test_the_cover_stands_alone_beside_a_wide_page_at_either_end():
+    """A wide cover is still only the cover, and a spread straight after it is
+    anchored at page two, where pairing starts anyway."""
+    assert grouped(volume(7, wide={1})) == [[1], [2, 3], [4, 5], [6, 7]]
+    assert grouped(volume(8, wide={2}), 2) == [[1], [2], [3, 4], [5, 6], [7, 8]]
+
+
 def test_a_real_volume_keeps_its_cover_separate_from_page_two():
     """`7thGARDEN v01` shipped a stitched page at 3, and detection anchoring
     there used to pair the cover with page 2 in the live reader."""
