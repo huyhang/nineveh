@@ -1,5 +1,9 @@
 export const READING_MODES = Object.freeze(["single", "double", "scroll"]);
 
+export function readerModeStorageKey(userId, seriesId) {
+  return `nineveh-reader-mode:${userId}:${seriesId}`;
+}
+
 export function navigationDelta(key, readingDirection = "ltr") {
   const forwardArrow = readingDirection === "rtl" ? "ArrowLeft" : "ArrowRight";
   const backwardArrow = readingDirection === "rtl" ? "ArrowRight" : "ArrowLeft";

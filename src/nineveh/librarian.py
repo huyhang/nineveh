@@ -35,6 +35,7 @@ from typing import BinaryIO, Protocol
 from .catalog import UnsafeArchive
 from .domain import (
     CatalogSeries,
+    CatalogVisibility,
     LibrarianEvent,
     LibrarianToken,
     ManagedLibrary,
@@ -449,7 +450,9 @@ class LibrarianService:
         stored = self._repository.all_series_metadata()
         matches: list[SeriesMatch] = []
         for managed in allowed:
-            for series in self._repository.catalog_series(library_id=managed.id):
+            for series in self._repository.catalog_series(
+                library_id=managed.id, visibility=CatalogVisibility.ALL
+            ):
                 score, source, value = best_match(
                     query, _known_titles(series, stored.get(series.id))
                 )
@@ -506,7 +509,7 @@ class LibrarianService:
         reachable = {library.id for library in self.libraries(token)}
         stored = self._repository.all_series_metadata()
         found = []
-        for series in self._repository.catalog_series():
+        for series in self._repository.catalog_series(visibility=CatalogVisibility.ALL):
             if series.library_id not in reachable:
                 continue
             metadata = stored.get(series.id)

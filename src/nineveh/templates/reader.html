@@ -16,6 +16,7 @@
       data-reading-direction="{{ reading_direction }}"
       data-default-direction="{{ reading_direction }}"
       data-publication-id="{{ publication.id }}"
+      data-series-id="{{ publication.series_id }}"
       data-user-id="{{ session.user.id }}"
       data-revision="{{ publication.revision }}"
       data-page-count="{{ publication.page_count }}"
@@ -25,12 +26,14 @@
       data-explicit-mode="{{ 'true' if explicit_mode else 'false' }}"
       data-completed="{{ 'true' if completed else 'false' }}"
       data-progress-updated-at="{{ progress_updated_at }}"
-      data-mode-updated-at="{{ mode_updated_at }}"
       data-csrf-token="{{ session.csrf_token }}"
       data-series-url="/series/{{ publication.series_id }}"
     >
       <header class="reader-toolbar" data-reader-toolbar>
-        <a class="reader-back" href="/series/{{ publication.series_id }}" aria-label="Back to {{ publication.series }}">← <span>Series</span></a>
+        <a class="reader-back" href="/series/{{ publication.series_id }}" aria-label="Back to {{ publication.series }}">
+          <svg class="reader-back-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+          <span>Series</span>
+        </a>
         <div class="reader-title">
           <strong>{{ publication.title }}</strong>
           <span>{{ publication.series }}</span>

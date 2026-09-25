@@ -11,6 +11,7 @@ def test_every_catalog_endpoint_requires_authentication(client: TestClient):
     for path in (
         "/opds/v2/catalog.json",
         "/opds/v2/publications.json",
+        "/opds/v2/private.json",
         "/opds/v2/navigation.json?library=Main%20Library",
         "/api/v1/auth/me",
     ):
@@ -53,6 +54,82 @@ def test_opds_navigation_walks_library_then_category(client: TestClient):
     series = client.get(category["navigation"][0]["href"], headers=authorization())
     assert series.status_code == 200
     assert series.json()["metadata"]["numberOfItems"] == 1
+
+
+def test_private_series_use_the_separate_opds_hierarchy(client: TestClient):
+    [series] = client.app.state.container.repository.catalog_series()
+    before = client.get("/opds/v2/catalog.json", headers=authorization()).json()[
+        "metadata"
+    ]["modified"]
+
+    updated = client.put(
+        f"/api/v1/series/{series.id}/privacy",
+        headers=authorization(),
+        json={"private": True},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["isPrivate"] is True
+    catalog = client.get("/opds/v2/catalog.json", headers=authorization()).json()
+    assert catalog["metadata"]["modified"] != before
+    assert [item["title"] for item in catalog["navigation"]] == ["Private Collection"]
+    private_root = client.get(
+        catalog["navigation"][0]["href"], headers=authorization()
+    ).json()
+    assert [item["title"] for item in private_root["navigation"]] == ["Main Library"]
+    library = client.get(
+        private_root["navigation"][0]["href"], headers=authorization()
+    ).json()
+    category = client.get(
+        library["navigation"][0]["href"], headers=authorization()
+    ).json()
+    feed = client.get(category["navigation"][0]["href"], headers=authorization())
+    assert feed.json()["metadata"]["numberOfItems"] == 1
+    assert (
+        client.get("/opds/v2/publications.json", headers=authorization()).json()[
+            "publications"
+        ]
+        == []
+    )
+
+
+def test_a_browser_session_needs_a_csrf_token_to_change_privacy(client: TestClient):
+    [series] = client.app.state.container.repository.catalog_series()
+    url = f"/api/v1/series/{series.id}/privacy"
+    client.post(
+        "/login",
+        data={"username": "admin", "password": ADMIN_PASSWORD},
+        follow_redirects=False,
+    )
+
+    assert client.put(url, json={"private": True}).status_code == 403
+    assert not client.app.state.container.repository.catalog_series_by_id(
+        series.id
+    ).is_private
+
+    token = client.get("/").text.split('name="csrf_token" value="')[1].split('"')[0]
+    updated = client.put(url, headers={"X-CSRF-Token": token}, json={"private": True})
+    assert updated.status_code == 200
+    assert updated.json()["isPrivate"] is True
+
+
+def test_only_an_administrator_can_change_privacy(client: TestClient, reader: dict):
+    [series] = client.app.state.container.repository.catalog_series()
+    url = f"/api/v1/series/{series.id}/privacy"
+
+    refused = client.put(url, headers=reader, json={"private": True})
+    assert refused.status_code == 403
+    assert not client.app.state.container.repository.catalog_series_by_id(
+        series.id
+    ).is_private
+
+    client.put(url, headers=authorization(), json={"private": True}).raise_for_status()
+    restored = client.put(url, headers=authorization(), json={"private": False})
+    assert restored.json()["isPrivate"] is False
+    missing = client.put(
+        "/api/v1/series/absent/privacy", headers=authorization(), json={"private": True}
+    )
+    assert missing.status_code == 404
 
 
 def test_search_matches_the_title(client: TestClient):
@@ -250,11 +327,20 @@ def test_reading_progress_round_trips_for_an_api_client(
     )
     assert saved.status_code == 200
     assert saved.json()["publicationId"] == publication_id
-    assert (saved.json()["page"], saved.json()["mode"]) == (2, "double")
+    assert saved.json()["page"] == 2
+    assert saved.json()["mode"] == "double"
+
+    browser_save = client.put(
+        url,
+        headers=authorization(),
+        json={"page": 3, "completed": False},
+    )
+    assert browser_save.json()["page"] == 3
+    assert browser_save.json()["mode"] == "double", "a save without a mode keeps it"
 
     fetched = client.get(url, headers=authorization())
     assert fetched.status_code == 200
-    assert fetched.json() == saved.json()
+    assert fetched.json() == browser_save.json()
 
     assert client.delete(url, headers=authorization()).status_code == 204
     assert client.get(url, headers=authorization()).status_code == 404

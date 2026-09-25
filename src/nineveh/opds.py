@@ -18,6 +18,7 @@ PAGE_RANGE_REL = "urn:nineveh:rel:page-range"
 
 CATALOG_PATH = "/opds/v2/catalog.json"
 NAVIGATION_PATH = "/opds/v2/navigation.json"
+PRIVATE_NAVIGATION_PATH = "/opds/v2/private.json"
 PUBLICATIONS_PATH = "/opds/v2/publications.json"
 AUTHENTICATION_PATH = "/opds/v2/authentication.json"
 
@@ -49,13 +50,29 @@ class OpdsBuilder:
         }
 
     def root_feed(
-        self, base_url: str, libraries: list[tuple[str, int]], modified: str
+        self,
+        base_url: str,
+        libraries: list[tuple[str, int]],
+        modified: str,
+        *,
+        private_count: int | None = None,
     ) -> dict[str, object]:
+        private_entries = (
+            [
+                _navigation_entry(
+                    "Private Collection",
+                    private_count,
+                    f"{base_url}{PRIVATE_NAVIGATION_PATH}",
+                )
+            ]
+            if private_count
+            else []
+        )
         return {
             "metadata": {
                 "title": self._title,
                 "modified": modified,
-                "numberOfItems": len(libraries),
+                "numberOfItems": len(libraries) + len(private_entries),
             },
             "links": [
                 _link("self", f"{base_url}{CATALOG_PATH}"),
@@ -76,7 +93,8 @@ class OpdsBuilder:
                     library, count, url(base_url, NAVIGATION_PATH, {"library": library})
                 )
                 for library, count in libraries
-            ],
+            ]
+            + private_entries,
         }
 
     def navigation_feed(
@@ -87,6 +105,7 @@ class OpdsBuilder:
         parameters: dict[str, str],
         entries: list[tuple[str, int, str]],
         modified: str,
+        path: str = NAVIGATION_PATH,
     ) -> dict[str, object]:
         return {
             "metadata": {
@@ -95,7 +114,7 @@ class OpdsBuilder:
                 "numberOfItems": len(entries),
             },
             "links": [
-                _link("self", url(base_url, NAVIGATION_PATH, parameters)),
+                _link("self", url(base_url, path, parameters)),
                 _link("start", f"{base_url}{CATALOG_PATH}"),
             ],
             "navigation": [
@@ -116,8 +135,15 @@ class OpdsBuilder:
         series: str | None,
         query: str | None,
         modified: str,
+        collection: str = "public",
     ) -> dict[str, object]:
-        filters = _filters(library=library, category=category, series=series, q=query)
+        filters = _filters(
+            library=library,
+            category=category,
+            series=series,
+            q=query,
+            collection=collection if collection == "private" else None,
+        )
         title = " — ".join(
             part for part in (self._title, library, category, series) if part
         )

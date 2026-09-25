@@ -15,6 +15,7 @@ from xml.etree import ElementTree
 
 from .config import Settings
 from .domain import (
+    CatalogSeries,
     ManagedLibrary,
     Page,
     Publication,
@@ -29,12 +30,29 @@ class CatalogManagementRepository(CatalogRepository, LibraryRepository, Protocol
     pass
 
 
+class SeriesManagementRepository(Protocol):
+    def set_series_private(
+        self, series_id: str, is_private: bool
+    ) -> CatalogSeries | None: ...
+
+
+class SeriesService:
+    """Administrative series changes, independent of the HTTP transport."""
+
+    def __init__(self, repository: SeriesManagementRepository) -> None:
+        self._repository = repository
+
+    def set_private(self, series_id: str, is_private: bool) -> CatalogSeries | None:
+        return self._repository.set_series_private(series_id, is_private)
+
+
 __all__ = [
     "ArchiveInspector",
     "CatalogScanner",
     "InvalidLibrary",
     "LibraryService",
     "ScanStatus",
+    "SeriesService",
     "UnsafeArchive",
 ]
 

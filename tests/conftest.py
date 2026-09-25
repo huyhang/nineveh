@@ -25,7 +25,7 @@ from PIL import Image
 from nineveh.app import Container, create_app
 from nineveh.auth import AuthService
 from nineveh.authorization import AccessService, ReadAllPolicy
-from nineveh.catalog import ArchiveInspector, LibraryService
+from nineveh.catalog import ArchiveInspector, LibraryService, SeriesService
 from nineveh.config import Settings, SettingsService
 from nineveh.database import SQLiteRepository
 from nineveh.domain import ScannedPublication
@@ -166,6 +166,7 @@ def fake_container(tmp_path: Path) -> Container:
         opds=OpdsBuilder("Nineveh"),
         access=AccessService(repository),
         libraries=LibraryService(settings.data_dir, repository),
+        series=SeriesService(repository),
         configuration=SettingsService(settings, repository),
         restarter=FakeRestartController(enabled=False),
         reader=ReaderService(repository, repository),

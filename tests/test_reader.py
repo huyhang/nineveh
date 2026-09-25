@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -28,7 +30,6 @@ class ReaderRepositoryStub:
         self.publications = publications
         self.saved = None
         self.progress = None
-        self.preferred_mode = None
 
     def publication_by_id(self, publication_id, _scope=None):
         return next(
@@ -46,24 +47,12 @@ class ReaderRepositoryStub:
             return {}
         return {self.progress.publication_id: self.progress}
 
-    def latest_reading_progress(self, _user_id):
-        if not self.preferred_mode:
-            return None
-        return ReadingProgress(
-            "user",
-            "preferred-publication",
-            1,
-            self.preferred_mode,
-            False,
-            datetime.now(UTC),
-        )
-
     def save_reading_progress(self, user_id, publication_id, page, mode, completed):
         self.saved = ReadingProgress(
             user_id,
             publication_id,
             page,
-            mode,
+            mode or "single",
             completed,
             datetime.now(UTC),
         )
@@ -262,7 +251,7 @@ def test_detection_that_abstains_leaves_pairing_where_it_was():
     assert service.anchor_for(item) is None
 
 
-def test_reader_uses_the_latest_mode_as_the_cross_publication_preference():
+def test_reader_state_contains_only_account_synced_progress():
     item = _publication("one", "1", "Volume 1")
     repository = ReaderRepositoryStub([item])
     repository.progress = ReadingProgress(
@@ -273,12 +262,10 @@ def test_reader_uses_the_latest_mode_as_the_cross_publication_preference():
         False,
         datetime.now(UTC),
     )
-    repository.preferred_mode = "scroll"
-
     saved = ReaderService(repository, repository).reading_state("user", "one")
 
     assert saved is not None
-    assert (saved.page, saved.mode) == (7, "scroll")
+    assert (saved.page, saved.completed) == (7, False)
 
 
 def test_reader_collects_progress_for_visible_publications():
@@ -308,26 +295,29 @@ def test_reader_validates_progress_before_persisting_it():
     repository = ReaderRepositoryStub([item])
     service = ReaderService(repository, repository)
 
-    saved = service.save_progress("user", item, 12, "double", True)
-    assert (saved.page, saved.mode, saved.completed) == (12, "double", True)
+    saved = service.save_progress("user", item, 12, None, True)
+    assert (saved.page, saved.completed) == (12, True)
 
     with pytest.raises(ValueError, match="outside"):
-        service.save_progress("user", item, 13, "single", False)
-    with pytest.raises(ValueError, match="mode"):
-        service.save_progress("user", item, 1, "sideways", False)
+        service.save_progress("user", item, 13, None, False)
     with pytest.raises(ValueError, match="final page"):
-        service.save_progress("user", item, 2, "single", True)
+        service.save_progress("user", item, 2, None, True)
+    with pytest.raises(ValueError, match="reading mode"):
+        service.save_progress("user", item, 1, "sideways", False)
 
 
 def test_reader_marks_publications_read_and_unread():
     item = _publication("one", "1", "Volume 1")
     repository = ReaderRepositoryStub([item])
-    repository.preferred_mode = "scroll"
+    repository.progress = ReadingProgress(
+        "user", "one", 3, "double", False, datetime.now(UTC)
+    )
     service = ReaderService(repository, repository)
 
     saved = service.mark_as_read("user", item)
 
-    assert (saved.page, saved.mode, saved.completed) == (12, "scroll", True)
+    assert (saved.page, saved.completed) == (12, True)
+    assert repository.saved.mode == "single", "the stub keeps what the service passes"
     service.mark_as_unread("user", item.id)
     assert repository.progress is None
 
@@ -340,18 +330,98 @@ def test_sqlite_progress_is_private_to_each_user(tmp_path):
     item = publication()
     repository.upsert_publication(ScannedPublication(item, (page(1), page(2))))
 
-    saved = repository.save_reading_progress(first_user.id, item.id, 2, "double", True)
+    saved = repository.save_reading_progress(first_user.id, item.id, 2, None, True)
 
-    assert (saved.page, saved.mode, saved.completed) == (2, "double", True)
+    assert (saved.page, saved.completed) == (2, True)
     assert repository.reading_progress_for_publications(first_user.id, [item.id]) == {
         item.id: saved
     }
     assert repository.reading_progress_for_publications(first_user.id, []) == {}
     assert repository.reading_progress_for_publications(second_user.id, [item.id]) == {}
-    assert repository.latest_reading_progress(first_user.id).mode == "double"
     assert repository.reading_progress(second_user.id, item.id) is None
     repository.delete_reading_progress(first_user.id, item.id)
     assert repository.reading_progress(first_user.id, item.id) is None
+
+
+def _progress_columns(path) -> set[str]:
+    with closing(sqlite3.connect(path)) as connection:
+        return {
+            row[1] for row in connection.execute("PRAGMA table_info(reading_progress)")
+        }
+
+
+def test_upgrade_keeps_the_legacy_reading_mode_older_apps_read(tmp_path):
+    path = tmp_path / "nineveh.sqlite3"
+    repository = SQLiteRepository(path)
+    repository.initialize()
+    user = repository.create_user("reader", "hash", False)
+    item = publication()
+    repository.upsert_publication(ScannedPublication(item, (page(1), page(2))))
+    repository.save_reading_progress(user.id, item.id, 2, "double", True)
+    with repository._connect() as connection:
+        connection.execute("PRAGMA user_version = 7")
+
+    repository.initialize()
+
+    saved = repository.reading_progress(user.id, item.id)
+    assert saved is not None
+    assert (saved.page, saved.mode, saved.completed) == (2, "double", True)
+
+
+def test_a_save_without_a_mode_keeps_the_one_an_older_app_stored(tmp_path):
+    repository = SQLiteRepository(tmp_path / "nineveh.sqlite3")
+    repository.initialize()
+    user = repository.create_user("reader", "hash", False)
+    item = publication()
+    repository.upsert_publication(ScannedPublication(item, (page(1), page(2))))
+
+    assert repository.save_reading_progress(user.id, item.id, 1, None, False).mode == (
+        "single"
+    )
+    repository.save_reading_progress(user.id, item.id, 1, "scroll", False)
+    saved = repository.save_reading_progress(user.id, item.id, 2, None, True)
+
+    assert (saved.page, saved.mode, saved.completed) == (2, "scroll", True)
+
+
+def test_upgrade_restores_the_mode_a_pre_release_build_dropped(tmp_path):
+    """An interim v8 build removed the column; older apps fail without it."""
+    path = tmp_path / "nineveh.sqlite3"
+    repository = SQLiteRepository(path)
+    repository.initialize()
+    user = repository.create_user("reader", "hash", False)
+    item = publication()
+    repository.upsert_publication(ScannedPublication(item, (page(1), page(2))))
+    repository.save_reading_progress(user.id, item.id, 2, "double", False)
+    with repository._connect() as connection:
+        connection.execute("ALTER TABLE reading_progress DROP COLUMN mode")
+    assert "mode" not in _progress_columns(path)
+
+    repository.initialize()
+
+    assert "mode" in _progress_columns(path)
+    saved = repository.reading_progress(user.id, item.id)
+    assert saved is not None and (saved.page, saved.mode) == (2, "single")
+    updated = repository.save_reading_progress(user.id, item.id, 1, "scroll", False)
+    assert updated.mode == "scroll"
+
+
+def test_upgrade_adds_privacy_and_leaves_existing_series_public(tmp_path):
+    path = tmp_path / "nineveh.sqlite3"
+    repository = SQLiteRepository(path)
+    repository.initialize()
+    item = publication()
+    repository.upsert_publication(ScannedPublication(item, (page(1), page(2))))
+    with repository._connect() as connection:
+        connection.execute("ALTER TABLE catalog_series DROP COLUMN is_private")
+        connection.execute("PRAGMA user_version = 7")
+
+    repository.initialize()
+
+    [series] = repository.catalog_series()
+    assert series.is_private is False
+    assert repository.set_series_private(series.id, True) is not None
+    assert repository.catalog_series() == []
 
 
 def test_sqlite_stores_series_setting_and_revision_bound_spread_result(tmp_path):

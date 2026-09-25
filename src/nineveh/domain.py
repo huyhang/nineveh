@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
+
+
+class CatalogVisibility(StrEnum):
+    """Which collection a catalog query should expose."""
+
+    PUBLIC = "public"
+    PRIVATE = "private"
+    ALL = "all"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +64,7 @@ class CatalogSeries:
     library: str
     category: str
     name: str
+    is_private: bool
     publication_count: int
     first_publication_id: str
     first_publication_revision: str
@@ -261,6 +271,7 @@ class ReadingProgress:
     user_id: str
     publication_id: str
     page: int
+    # Kept for older native clients; the browser reader stores mode per series.
     mode: str
     completed: bool
     updated_at: datetime
@@ -269,10 +280,8 @@ class ReadingProgress:
 @dataclass(frozen=True, slots=True)
 class ReadingState:
     page: int
-    mode: str
     completed: bool
     progress_updated_at: datetime | None
-    mode_updated_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)

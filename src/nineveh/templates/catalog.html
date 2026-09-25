@@ -3,36 +3,67 @@
   <div class="catalog-toolbar">
     <div>
       {% if mode == "libraries" %}
-        <p class="eyebrow">Your collection</p><h1>Libraries</h1>
+        <p class="eyebrow">{{ 'Private collection' if private_collection else 'Your collection' }}</p><h1>{{ 'Private Collection' if private_collection else 'Libraries' }}</h1>
         <p>{{ total }} publication{% if total != 1 %}s{% endif %} across {{ libraries|length }} librar{% if libraries|length == 1 %}y{% else %}ies{% endif %}</p>
       {% elif mode == "categories" %}
-        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><span>{{ library.name }}</span></nav>
+        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="{{ catalog_root }}">{{ 'Private Collection' if private_collection else 'Libraries' }}</a><span>/</span><span>{{ library.name }}</span></nav>
         <h1>{{ library.name }}</h1><p>{{ total }} publication{% if total != 1 %}s{% endif %}</p>
       {% elif mode == "series" %}
-        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><a href="/libraries/{{ library.id }}">{{ library.name }}</a><span>/</span><span>{{ category|title }}</span></nav>
+        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="{{ catalog_root }}">{{ 'Private Collection' if private_collection else 'Libraries' }}</a><span>/</span><a href="{{ library_prefix }}/{{ library.id }}">{{ library.name }}</a><span>/</span><span>{{ category|title }}</span></nav>
         <h1>{{ category|title }}</h1><p>{{ series_cards|length }} series · {{ total }} publication{% if total != 1 %}s{% endif %}</p>
       {% else %}
-        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Libraries</a><span>/</span><span>Search</span></nav>
+        <nav class="breadcrumbs" aria-label="Breadcrumb"><a href="{{ catalog_root }}">{{ 'Private Collection' if private_collection else 'Libraries' }}</a><span>/</span><span>Search</span></nav>
         <h1>Search results</h1><p>{{ total }} series for “{{ query }}”</p>
       {% endif %}
     </div>
     <div class="catalog-actions">
       {% if mode == 'series' and category == 'manga' and session.user.is_admin %}<a class="button" href="/libraries/{{ library.id }}/{{ category }}/metadata">Manage metadata</a>{% endif %}
-      <a class="button secondary" href="/opds/v2/catalog.json">OPDS feed</a>
+      <a class="button secondary" href="{{ opds_url }}">OPDS feed</a>
     </div>
+    <details class="mobile-catalog-more{% if mode != 'libraries' %} has-breadcrumbs{% endif %}">
+      <summary aria-label="More catalog actions" title="More catalog actions">•••</summary>
+      <div class="mobile-catalog-menu">
+        {% if mode == 'series' and category == 'manga' and session.user.is_admin %}<a href="/libraries/{{ library.id }}/{{ category }}/metadata">Manage metadata</a>{% endif %}
+        <a href="{{ opds_url }}">OPDS feed</a>
+      </div>
+    </details>
   </div>
 
-  <form method="get" action="/" class="catalog-search" role="search">
-    <label class="sr-only" for="catalog-query">Search your library</label>
-    <input id="catalog-query" name="q" value="{{ query or '' }}" placeholder="Search titles, alternate titles, or creators">
-    <button type="submit">Search</button>
-  </form>
+  <div class="catalog-controls{% if mode == 'series' or mode == 'search' %} has-layouts{% endif %}">
+    <form method="get" action="{{ catalog_root }}" class="catalog-search" role="search">
+      <label class="sr-only" for="catalog-query">Search your library</label>
+      <input id="catalog-query" name="q" value="{{ query or '' }}" placeholder="Search titles, alternate titles, or creators">
+      <button type="submit" aria-label="Search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>
+        <span class="search-label">Search</span>
+      </button>
+    </form>
+
+    {% if mode == 'series' or mode == 'search' %}
+      <div class="series-tools">
+      <div class="layout-picker" role="group" aria-label="Series layout">
+        <button type="button" data-layout-option="default" aria-pressed="true" aria-label="Default layout" title="Default layout">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/></svg>
+          <span class="layout-label">Default</span>
+        </button>
+        <button type="button" data-layout-option="dense" aria-pressed="false" aria-label="Dense layout" title="Dense layout">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="5" height="7" rx="1"/><rect x="9.5" y="3" width="5" height="7" rx="1"/><rect x="17" y="3" width="5" height="7" rx="1"/><rect x="2" y="14" width="5" height="7" rx="1"/><rect x="9.5" y="14" width="5" height="7" rx="1"/><rect x="17" y="14" width="5" height="7" rx="1"/></svg>
+          <span class="layout-label">Dense</span>
+        </button>
+        <button type="button" data-layout-option="list" aria-pressed="false" aria-label="List layout" title="List layout">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="5" height="5" rx="1"/><path d="M11 6.5h10"/><rect x="3" y="15" width="5" height="5" rx="1"/><path d="M11 17.5h10"/></svg>
+          <span class="layout-label">List</span>
+        </button>
+      </div>
+      </div>
+    {% endif %}
+  </div>
 
   {% if mode == "libraries" %}
     {% if libraries %}
       <div class="browse-grid">
         {% for item, count in libraries %}
-          <a class="browse-card library-tile" href="/libraries/{{ item.id }}">
+          <a class="browse-card library-tile" href="{{ library_prefix }}/{{ item.id }}">
             <span class="browse-icon" aria-hidden="true">▥</span>
             <span><strong>{{ item.name }}</strong><small>{{ count }} publication{% if count != 1 %}s{% endif %}</small></span>
             <span class="browse-arrow" aria-hidden="true">→</span>
@@ -50,13 +81,13 @@
         </section>
       {% endif %}
     {% else %}
-      <div class="empty-state"><h2>No accessible libraries</h2><p>Ask an administrator for access or add a library from the administration area.</p></div>
+      <div class="empty-state"><h2>{{ 'No private series' if private_collection else 'No accessible libraries' }}</h2><p>{% if private_collection %}Series marked Private will appear here when your library access permits them.{% else %}Ask an administrator for access or add a library from the administration area.{% endif %}</p></div>
     {% endif %}
   {% elif mode == "categories" %}
     {% if categories %}
       <div class="browse-grid">
         {% for name, count in categories %}
-          <a class="browse-card category-tile" href="/libraries/{{ library.id }}/{{ name }}">
+          <a class="browse-card category-tile" href="{{ library_prefix }}/{{ library.id }}/{{ name }}">
             <span class="browse-icon" aria-hidden="true">{% if name == 'manga' %}❖{% else %}✦{% endif %}</span>
             <span><strong>{{ name|title }}</strong><small>{{ count }} publication{% if count != 1 %}s{% endif %}</small></span>
             <span class="browse-arrow" aria-hidden="true">→</span>
@@ -97,3 +128,4 @@
     {% endif %}
   {% endif %}
 {% endblock %}
+{% block head_scripts %}<script src="{{ url_for('static', path='catalog-layout.js') }}"></script>{% endblock %}

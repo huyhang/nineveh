@@ -8,6 +8,7 @@ from typing import Any, BinaryIO, Protocol
 from .domain import (
     AccessGrant,
     CatalogSeries,
+    CatalogVisibility,
     LibrarianEvent,
     LibrarianToken,
     LibraryUsage,
@@ -54,14 +55,25 @@ class CatalogRepository(Protocol):
         self, relative_paths: set[str], library_id: str | None = None
     ) -> int: ...
 
-    def libraries(self, scope: ReadScope | None = None) -> list[tuple[str, int]]: ...
+    def libraries(
+        self,
+        scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
+    ) -> list[tuple[str, int]]: ...
 
     def categories(
-        self, library: str, scope: ReadScope | None = None
+        self,
+        library: str,
+        scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> list[tuple[str, int]]: ...
 
     def series(
-        self, library: str, category: str, scope: ReadScope | None = None
+        self,
+        library: str,
+        category: str,
+        scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> list[tuple[str, int]]: ...
 
     def publications(
@@ -74,6 +86,7 @@ class CatalogRepository(Protocol):
         limit: int = 24,
         offset: int = 0,
         scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> tuple[list[Publication], int]: ...
 
     def catalog_series(
@@ -84,11 +97,18 @@ class CatalogRepository(Protocol):
         category: str | None = None,
         query: str | None = None,
         scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> list[CatalogSeries]: ...
 
     def catalog_series_by_id(
         self, series_id: str, scope: ReadScope | None = None
     ) -> CatalogSeries | None: ...
+
+    def set_series_private(
+        self, series_id: str, is_private: bool
+    ) -> CatalogSeries | None: ...
+
+    def catalog_visibility_modified_at(self) -> str | None: ...
 
     def publications_in_series(
         self, series_id: str, scope: ReadScope | None = None
@@ -104,14 +124,12 @@ class ReadingRepository(Protocol):
         self, user_id: str, publication_ids: list[str]
     ) -> dict[str, ReadingProgress]: ...
 
-    def latest_reading_progress(self, user_id: str) -> ReadingProgress | None: ...
-
     def save_reading_progress(
         self,
         user_id: str,
         publication_id: str,
         page: int,
-        mode: str,
+        mode: str | None,
         completed: bool,
     ) -> ReadingProgress: ...
 

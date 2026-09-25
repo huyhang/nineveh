@@ -204,6 +204,12 @@ def test_the_module_stays_free_of_browser_globals():
         assert global_name not in source, f"{global_name} leaked into the model"
 
 
+def test_reading_mode_storage_is_isolated_by_user_and_series():
+    assert evaluate("readerModeStorageKey('reader-1', 'series-2')") == (
+        "nineveh-reader-mode:reader-1:series-2"
+    )
+
+
 def test_the_reader_passes_the_manifest_anchor_into_every_pairing_call():
     """`reader.js` owns the anchor; the model only honours what it is given."""
     reader = (MODEL.parent / "reader.js").read_text(encoding="utf-8")

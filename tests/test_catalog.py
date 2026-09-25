@@ -8,6 +8,7 @@ from conftest import image_bytes, write_cbz
 
 from nineveh.catalog import ArchiveInspector, CatalogScanner, UnsafeArchive
 from nineveh.database import SQLiteRepository
+from nineveh.domain import CatalogVisibility
 
 
 def _scanner(settings) -> tuple[CatalogScanner, SQLiteRepository]:
@@ -66,6 +67,41 @@ def test_a_second_scan_reports_everything_unchanged(library):
     scanner.scan()
     second = scanner.scan()
     assert (second.unchanged, second.indexed) == (1, 0)
+
+
+def test_private_series_are_selected_as_a_separate_collection_and_survive_scans(
+    library,
+):
+    settings, _ = library
+    scanner, repository = _scanner(settings)
+    scanner.scan()
+    [series] = repository.catalog_series()
+    assert repository.catalog_visibility_modified_at() is None
+
+    updated = repository.set_series_private(series.id, True)
+
+    assert updated is not None and updated.is_private
+    assert repository.catalog_visibility_modified_at() is not None
+    assert repository.catalog_series() == []
+    assert repository.catalog_series(visibility=CatalogVisibility.PRIVATE) == [updated]
+    assert repository.catalog_series(visibility=CatalogVisibility.ALL) == [updated]
+    assert repository.publications(limit=10)[1] == 0
+    assert (
+        repository.publications(limit=10, visibility=CatalogVisibility.PRIVATE)[1] == 1
+    )
+    assert repository.libraries() == []
+    assert repository.libraries(visibility=CatalogVisibility.PRIVATE) == [
+        ("Main Library", 1)
+    ]
+    assert repository.categories(
+        "Main Library", visibility=CatalogVisibility.PRIVATE
+    ) == [("comics", 1)]
+    assert repository.series(
+        "Main Library", "comics", visibility=CatalogVisibility.PRIVATE
+    ) == [("Example Series", 1)]
+
+    scanner.scan()
+    assert repository.catalog_series_by_id(series.id).is_private
 
 
 def test_the_publication_identifier_survives_a_reindex(library):

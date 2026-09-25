@@ -540,13 +540,22 @@
             "type": "boolean"
           },
           "mode": {
-            "enum": [
-              "single",
-              "double",
-              "scroll"
+            "anyOf": [
+              {
+                "enum": [
+                  "single",
+                  "double",
+                  "scroll"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Mode",
-            "type": "string"
+            "deprecated": true,
+            "description": "Legacy account-wide reading mode, kept for older clients. Omit it: readers keep the mode on the device, per series.",
+            "title": "Mode"
           },
           "page": {
             "minimum": 1.0,
@@ -555,8 +564,7 @@
           }
         },
         "required": [
-          "page",
-          "mode"
+          "page"
         ],
         "title": "ProgressUpdate",
         "type": "object"
@@ -795,6 +803,8 @@
             "type": "boolean"
           },
           "mode": {
+            "deprecated": true,
+            "description": "Legacy account-wide reading mode, kept for older clients. Omit it: readers keep the mode on the device, per series.",
             "enum": [
               "single",
               "double",
@@ -845,6 +855,10 @@
             "title": "Id",
             "type": "string"
           },
+          "isPrivate": {
+            "title": "Isprivate",
+            "type": "boolean"
+          },
           "library": {
             "title": "Library",
             "type": "string"
@@ -883,6 +897,7 @@
           "category",
           "localName",
           "title",
+          "isPrivate",
           "publicationCount",
           "cover",
           "metadata"
@@ -997,6 +1012,19 @@
           "license"
         ],
         "title": "SeriesMetadataRecord",
+        "type": "object"
+      },
+      "SeriesPrivacyInput": {
+        "properties": {
+          "private": {
+            "title": "Private",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "private"
+        ],
+        "title": "SeriesPrivacyInput",
         "type": "object"
       },
       "UserAccount": {
@@ -2176,6 +2204,79 @@
         ]
       }
     },
+    "/api/v1/series/{series_id}/privacy": {
+      "put": {
+        "operationId": "series_privacy_api_v1_series__series_id__privacy_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "series_id",
+            "required": true,
+            "schema": {
+              "title": "Series Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeriesPrivacyInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeriesDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Series Privacy",
+        "tags": [
+          "series"
+        ]
+      }
+    },
     "/opds/v2/authentication.json": {
       "get": {
         "operationId": "opds_authentication_opds_v2_authentication_json_get",
@@ -2251,6 +2352,20 @@
               ],
               "title": "Category"
             }
+          },
+          {
+            "in": "query",
+            "name": "collection",
+            "required": false,
+            "schema": {
+              "default": "public",
+              "enum": [
+                "public",
+                "private"
+              ],
+              "title": "Collection",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2281,6 +2396,32 @@
           }
         ],
         "summary": "Opds Navigation",
+        "tags": [
+          "opds"
+        ]
+      }
+    },
+    "/opds/v2/private.json": {
+      "get": {
+        "operationId": "opds_private_navigation_opds_v2_private_json_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/opds+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NavigationFeed"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Opds Private Navigation",
         "tags": [
           "opds"
         ]
@@ -2364,6 +2505,20 @@
               "minimum": 1,
               "title": "Page",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "collection",
+            "required": false,
+            "schema": {
+              "default": "public",
+              "enum": [
+                "public",
+                "private"
+              ],
+              "title": "Collection",
+              "type": "string"
             }
           }
         ],

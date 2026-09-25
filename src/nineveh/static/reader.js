@@ -7,6 +7,7 @@ import {
   isStitched,
   navigationDelta,
   pageGroups,
+  readerModeStorageKey,
   visiblePages,
 } from "/static/reader-model.js";
 
@@ -87,7 +88,6 @@ class ReaderController {
       mode: this.validMode(this.root.dataset.initialMode),
       completed: this.root.dataset.completed === "true",
       pageUpdatedAt: Number(this.root.dataset.progressUpdatedAt),
-      modeUpdatedAt: Number(this.root.dataset.modeUpdatedAt),
     };
     const local = this.readLocalProgress();
     const preference = this.readLocalMode();
@@ -101,15 +101,10 @@ class ReaderController {
       state.page = local.page;
       state.completed = Boolean(local.completed);
     }
-    const localModeWins = (
-      this.root.dataset.explicitMode !== "true"
-      && preference
-      && preference.updatedAt > server.modeUpdatedAt
-    );
-    if (localModeWins) {
+    if (this.root.dataset.explicitMode !== "true" && preference) {
       state.mode = this.validMode(preference.mode);
     }
-    this.needsSync = Boolean(localPageWins || localModeWins);
+    this.needsSync = Boolean(localPageWins);
     state.page = clampPage(state.page, totalPages);
     return state;
   }
@@ -123,7 +118,10 @@ class ReaderController {
   }
 
   get modeStorageKey() {
-    return `nineveh-reader-mode:${this.root.dataset.userId}`;
+    return readerModeStorageKey(
+      this.root.dataset.userId,
+      this.root.dataset.seriesId,
+    );
   }
 
   get directionStorageKey() {
@@ -644,7 +642,7 @@ class ReaderController {
     this.state.mode = nextMode;
     this.finished = false;
     await this.render();
-    this.scheduleSave();
+    this.persistMode();
   }
 
   showEndCard() {
@@ -717,18 +715,25 @@ class ReaderController {
   persistLocal(updatedAt = Date.now()) {
     const saved = {
       page: this.state.page,
-      mode: this.state.mode,
       completed: this.state.completed,
       updatedAt,
     };
     try {
       this.storage.setItem(this.storageKey, JSON.stringify(saved));
-      this.storage.setItem(
-        this.modeStorageKey,
-        JSON.stringify({ mode: saved.mode, updatedAt: saved.updatedAt }),
-      );
+      this.persistMode();
     } catch (_error) {
       // Private browsing or a full quota must never stop the reader.
+    }
+  }
+
+  persistMode() {
+    try {
+      this.storage.setItem(
+        this.modeStorageKey,
+        JSON.stringify({ mode: this.state.mode }),
+      );
+    } catch (_error) {
+      // The preference still applies for this tab when storage is unavailable.
     }
   }
 
@@ -761,7 +766,6 @@ class ReaderController {
           },
           body: JSON.stringify({
             page: this.state.page,
-            mode: this.state.mode,
             completed: this.state.completed,
           }),
         },

@@ -2,17 +2,26 @@
 {% block title %}{{ display_title }} · {{ service_title }}{% endblock %}
 {% block content %}
   <nav class="breadcrumbs" aria-label="Breadcrumb">
-    <a href="/">Libraries</a><span>/</span>
-    <a href="/libraries/{{ series.library_id }}">{{ series.library }}</a><span>/</span>
-    <a href="/libraries/{{ series.library_id }}/{{ series.category }}">{{ series.category|title }}</a><span>/</span>
+    <a href="{{ catalog_root }}">{{ 'Private Collection' if private_collection else 'Libraries' }}</a><span>/</span>
+    <a href="{{ library_prefix }}/{{ series.library_id }}">{{ series.library }}</a><span>/</span>
+    <a href="{{ library_prefix }}/{{ series.library_id }}/{{ series.category }}">{{ series.category|title }}</a><span>/</span>
     <span>{{ display_title }}</span>
   </nav>
   <section class="series-hero">
     <img class="hero-cover" src="/api/v1/series/{{ series.id }}/cover?revision={{ series.first_publication_revision }}" alt="Cover for {{ display_title }}" width="640">
     <div class="series-summary">
-      <p class="eyebrow">{{ series.category }} · {{ series.publication_count }} volume{% if series.publication_count != 1 %}s{% endif %}</p>
+      <p class="eyebrow">{{ series.category }} · {{ series.publication_count }} volume{% if series.publication_count != 1 %}s{% endif %}{% if series.is_private %} · Private{% endif %}</p>
       <h1>{{ display_title }}</h1>
-      {% if series.category == 'manga' and session.user.is_admin %}<a class="button metadata-manage-button" href="/series/{{ series.id }}/metadata">Manage metadata</a>{% endif %}
+      {% if session.user.is_admin %}
+        <div class="series-admin-actions">
+          {% if series.category == 'manga' %}<a class="button metadata-manage-button" href="/series/{{ series.id }}/metadata">Manage metadata</a>{% endif %}
+          <form method="post" action="/series/{{ series.id }}/privacy">
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+            <input type="hidden" name="is_private" value="{{ 'false' if series.is_private else 'true' }}">
+            <button class="secondary" type="submit">{{ 'Move to Library' if series.is_private else 'Make Private' }}</button>
+          </form>
+        </div>
+      {% endif %}
       {% if display_title != series.name %}<p class="local-title">Filed locally as {{ series.name }}</p>{% endif %}
       {% if metadata %}
         <div class="metadata-badges">

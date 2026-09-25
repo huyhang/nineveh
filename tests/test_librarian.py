@@ -848,6 +848,28 @@ def matched(client: TestClient, series_id: str) -> str:
     return series_id
 
 
+def test_private_series_stay_within_the_librarians_reach(
+    client: TestClient, matched: str
+):
+    """Privacy hides a series from browsing, not from the one managing it."""
+    token = issue(client, ("catalog:read", "metadata:read"))
+    client.app.state.container.series.set_private(matched, True)
+
+    by_title = client.get(
+        "/api/v1/librarian/series",
+        headers=bearer(token),
+        params={"query": "Example Series"},
+    ).json()
+    by_author = client.get(
+        "/api/v1/librarian/series",
+        headers=bearer(token),
+        params={"author": "A. Writer"},
+    ).json()
+
+    assert by_title["confidentMatch"] == matched
+    assert [item["seriesId"] for item in by_author["candidates"]] == [matched]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -113,6 +113,45 @@ def test_readers_are_default_deny_and_library_grants_filter_every_surface(
     assert cleared.json()["grants"] == []
 
 
+def test_private_collection_uses_existing_reader_grants(client: TestClient):
+    user_id, reader = _create_reader(client, "private-reader")
+    library = client.get("/api/v1/admin/libraries", headers=authorization()).json()[
+        "libraries"
+    ][0]
+    client.put(
+        f"/api/v1/admin/users/{user_id}/access",
+        headers=authorization(),
+        json={"grants": [{"library_id": library["id"]}]},
+    ).raise_for_status()
+    series_id = library["categories"][0]["series"][0]["id"]
+    client.put(
+        f"/api/v1/series/{series_id}/privacy",
+        headers=authorization(),
+        json={"private": True},
+    ).raise_for_status()
+
+    assert (
+        client.get("/opds/v2/publications.json", headers=reader).json()["publications"]
+        == []
+    )
+    private_feed = client.get(
+        "/opds/v2/publications.json?collection=private", headers=reader
+    ).json()
+    assert len(private_feed["publications"]) == 1
+
+    client.put(
+        f"/api/v1/admin/users/{user_id}/access",
+        headers=authorization(),
+        json={"grants": []},
+    ).raise_for_status()
+    assert (
+        client.get(
+            "/opds/v2/publications.json?collection=private", headers=reader
+        ).json()["publications"]
+        == []
+    )
+
+
 def test_content_type_and_series_grants_are_scoped_to_their_library(library):
     settings, _ = library
     manga = settings.data_dir / "Main Library" / "manga" / "Manga Series" / "One.cbz"

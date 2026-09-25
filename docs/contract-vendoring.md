@@ -10,13 +10,13 @@ gone stale. No submodule, no build-time network call.
 
 ## Why the slice and not the whole document
 
-`docs/openapi.json` describes all 60 operations Nineveh publishes. A librarian
+`docs/openapi.json` describes all 62 operations Nineveh publishes. A librarian
 agent calls eight of them. If you vendor the full document, every unrelated
 change — a reader endpoint, a metadata filter — shows up as a diff in your
 client repo and you have to work out whether it affects you.
 
 `docs/librarian-openapi.json` carries only the `librarian`-tagged operations
-and the schemas they reference. It is 1,155 lines instead of 5,800, and it
+and the schemas they reference. It is 1,155 lines instead of 5,950, and it
 changes only when the surface you actually call changes. That is the signal
 worth reacting to.
 
@@ -175,10 +175,14 @@ required field is a real review.
 ## Vendoring the app contract
 
 `docs/app-openapi.json` is the slice for a native reading app, such as a
-macOS or iPadOS client: the 20 operations tagged `authentication`, `opds`,
+macOS or iPadOS client: the 22 operations tagged `authentication`, `opds`,
 `pages`, `publications`, `reader` and `series`. That covers the OPDS feeds,
-series and publication detail, covers, the page manifest and individual pages,
-page-range and full-file downloads, reading progress, and `/api/v1/auth/me`.
+the Private Collection's included, series and publication detail, covers, the
+page manifest and individual pages, page-range and full-file downloads,
+reading progress, and `/api/v1/auth/me`. One of them writes to the catalog:
+`PUT /api/v1/series/{series_id}/privacy` moves a series into or out of the
+Private Collection, and answers `403` unless the account is an administrator.
+`isAdmin` on `/auth/me` tells an app whether to offer it.
 Health checks are left out. The unauthenticated `/opds/v2/authentication.json`
 already tells an app it has reached an OPDS server, and `/auth/me` tells it
 whether the credentials work.

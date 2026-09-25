@@ -22,7 +22,7 @@ from .archives import (
 )
 from .auth import AuthService
 from .authorization import AccessService, AuthorizationPolicy, GrantPolicy
-from .catalog import ArchiveInspector, CatalogScanner, LibraryService
+from .catalog import ArchiveInspector, CatalogScanner, LibraryService, SeriesService
 from .config import Settings, SettingsService
 from .database import SQLiteRepository
 from .deployment import discarded_forwarded_proto, proxy_trust_advice
@@ -70,6 +70,7 @@ class Container:
     opds: OpdsBuilder
     access: AccessService
     libraries: LibraryService
+    series: SeriesService
     configuration: SettingsService
     restarter: RestartController
     reader: ReaderService
@@ -123,6 +124,7 @@ def build_container(settings: Settings) -> Container:
         opds=OpdsBuilder(effective.service_title),
         access=AccessService(repository),
         libraries=LibraryService(effective.data_dir, repository),
+        series=SeriesService(repository),
         configuration=configuration,
         restarter=ProcessRestartController()
         if effective.restart_enabled

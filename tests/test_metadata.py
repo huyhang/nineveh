@@ -783,7 +783,7 @@ def test_a_rate_limit_reply_reports_when_to_retry(monkeypatch):
         raise error
 
     monkeypatch.setattr("nineveh.metadata.urlopen", fail)
-    with pytest.raises(MetadataError, match="try again in 45 seconds"):
+    with error, pytest.raises(MetadataError, match="try again in 45 seconds"):
         UrllibTransport().get_json("https://api.mangabaka.org/v2/series/1")
 
 
@@ -924,6 +924,40 @@ def test_the_browser_batch_lookup_matches_only_the_selected_series(library):
             "Started looking up 1 series."
             in client.get(f"/libraries/{library_id}/manga/metadata").text
         )
+
+
+def test_the_browser_batch_lookup_includes_private_series(library):
+    """The metadata page lists private series too, so it must accept them."""
+    settings, _ = library
+    archive = settings.data_dir / "Main Library" / "manga" / "Alchemy" / "01.cbz"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    write_cbz(archive)
+    provider = StubProvider(image_bytes((20, 40, 60)))
+    container = _metadata_client(settings, provider)
+
+    with TestClient(create_app(container=container)) as client:
+        wait_for_scan(client)
+        client.post("/login", data={"username": "admin", "password": ADMIN_PASSWORD})
+        [series] = client.get("/api/v1/admin/metadata", headers=authorization()).json()[
+            "series"
+        ]
+        container.series.set_private(series["id"], True)
+        page = client.get(f"/libraries/{series['libraryId']}/manga/metadata")
+        csrf = page.text.split('name="csrf_token" value="')[1].split('"')[0]
+
+        started = client.post(
+            f"/libraries/{series['libraryId']}/manga/metadata/lookup",
+            data={"csrf_token": csrf, "series_id": series["id"]},
+            follow_redirects=True,
+        )
+
+        assert "Started looking up 1 series." in started.text
+        task = client.app.state.metadata_task
+        for _ in range(200):
+            if task is None or task.done():
+                break
+            time.sleep(0.01)
+        assert provider.searches == ["Alchemy"]
 
 
 def test_library_auto_match_links_only_confident_unmatched_series(library):

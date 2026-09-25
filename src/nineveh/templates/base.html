@@ -6,9 +6,26 @@
     <title>{% block title %}{{ service_title }}{% endblock %}</title>
     <link rel="icon" href="{{ url_for('static', path='icon.svg') }}" type="image/svg+xml">
     <script src="{{ url_for('static', path='theme.js') }}"></script>
+    {% block head_scripts %}{% endblock %}
     <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
   </head>
-  <body>
+  {% macro theme_toggle(extra_class="") %}
+    <button class="theme-toggle {{ extra_class }}" type="button" data-theme-toggle aria-label="Switch color theme" title="Switch color theme">
+      <span class="theme-icon" aria-hidden="true">◐</span>
+      <span data-theme-label>System</span>
+    </button>
+  {% endmacro %}
+  {% macro sign_out(csrf_token, form_class, button_class) %}
+    <form method="post" action="/logout"{% if form_class %} class="{{ form_class }}"{% endif %}>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="{{ button_class }}">Sign out</button>
+    </form>
+  {% endmacro %}
+  {# One answer to "which section is this?" for both the header tabs and the bottom nav. #}
+  {% if request.url.path.startswith('/admin') %}{% set nav_section = 'admin' %}
+  {% elif request.url.path.startswith('/private') or (series is defined and series.is_private) %}{% set nav_section = 'private' %}
+  {% else %}{% set nav_section = 'library' %}{% endif %}
+  <body class="{% if session %}has-mobile-nav{% endif %}">
     <header class="site-header">
       <a class="brand" href="/">
         <img src="{{ url_for('static', path='icon.svg') }}" alt="" width="34" height="34">
@@ -17,22 +34,24 @@
       <div class="header-navigation">
         {% if session %}
           <nav class="primary-tabs" aria-label="Main navigation">
-            <a href="/" {% if not request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>Library</a>
-            {% if session.user.is_admin %}<a href="/admin" {% if request.url.path.startswith('/admin') %}aria-current="page"{% endif %}>Admin</a>{% endif %}
+            <a href="/" {% if nav_section == 'library' %}aria-current="page"{% endif %}>Library</a>
+            <a href="/private" {% if nav_section == 'private' %}aria-current="page"{% endif %}>Private <span class="private-tab-long">Collection</span></a>
+            {% if session.user.is_admin %}<a href="/admin" {% if nav_section == 'admin' %}aria-current="page"{% endif %}>Admin</a>{% endif %}
           </nav>
         {% endif %}
-        <button class="theme-toggle" type="button" data-theme-toggle aria-label="Switch color theme" title="Switch color theme">
-          <span class="theme-icon" aria-hidden="true">◐</span>
-          <span data-theme-label>System</span>
-        </button>
+        {{ theme_toggle("desktop-theme-toggle") }}
         {% if session %}
-          <div class="account-menu">
+          <div class="account-menu desktop-account">
             <span>{{ session.user.username }}</span>
-            <form method="post" action="/logout" class="inline-form">
-              <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-              <button type="submit" class="link-button">Sign out</button>
-            </form>
+            {{ sign_out(session.csrf_token, "inline-form", "link-button") }}
           </div>
+          <details class="mobile-account">
+            <summary>{{ session.user.username }}</summary>
+            <div class="mobile-account-menu">
+              {{ theme_toggle() }}
+              {{ sign_out(session.csrf_token, "", "account-signout") }}
+            </div>
+          </details>
         {% endif %}
       </div>
     </header>
@@ -41,6 +60,24 @@
       {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
       {% block content %}{% endblock %}
     </main>
+    {% if session %}
+      <nav class="mobile-bottom-nav" aria-label="Main navigation">
+        <a href="/" {% if nav_section == 'library' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h6v14H4zM14 5h6v14h-6z"/></svg>
+          <span>Library</span>
+        </a>
+        <a href="/private" {% if nav_section == 'private' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+          <span>Private</span>
+        </a>
+        {% if session.user.is_admin %}
+          <a href="/admin" {% if nav_section == 'admin' %}aria-current="page"{% endif %}>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3"/><path d="M5 20c.6-4 2.9-6 7-6s6.4 2 7 6"/></svg>
+            <span>Admin</span>
+          </a>
+        {% endif %}
+      </nav>
+    {% endif %}
     {% block scripts %}{% endblock %}
   </body>
 </html>

@@ -12,6 +12,7 @@ from .domain import (
     SEVERITY_ORDER,
     AccessGrant,
     CatalogSeries,
+    CatalogVisibility,
     CategoryUsage,
     LibrarianEvent,
     LibrarianToken,
@@ -34,7 +35,7 @@ from .domain import (
     User,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # The release that began recording `ComicInfo.xml` spread markers. Databases
 # older than this need one reinspection pass to pick them up.
 SPREAD_MARKER_VERSION = 4
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS catalog_series (
     library_id TEXT NOT NULL REFERENCES managed_libraries(id) ON DELETE CASCADE,
     category TEXT NOT NULL COLLATE NOCASE,
     name TEXT NOT NULL COLLATE NOCASE,
+    is_private INTEGER NOT NULL DEFAULT 0,
     UNIQUE(library_id, category, name)
 );
 
@@ -315,6 +317,8 @@ class SQLiteRepository:
             # the database on "table already exists".
             connection.executescript(SCHEMA)
             self._ensure_scope_columns(connection)
+            self._ensure_series_private_column(connection)
+            self._ensure_progress_mode_column(connection)
             self._ensure_session_flash_columns(connection)
             self._ensure_page_spread_column(connection)
             self._ensure_spread_source_column(connection)
@@ -347,6 +351,36 @@ class SQLiteRepository:
             connection.execute(
                 "ALTER TABLE publications "
                 "ADD COLUMN series_id TEXT REFERENCES catalog_series(id)"
+            )
+
+    @staticmethod
+    def _ensure_series_private_column(connection: sqlite3.Connection) -> None:
+        """Existing series remain public when collection privacy is introduced."""
+        present = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(catalog_series)"
+            ).fetchall()
+        }
+        if "is_private" not in present:
+            connection.execute(
+                "ALTER TABLE catalog_series "
+                "ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0"
+            )
+
+    @staticmethod
+    def _ensure_progress_mode_column(connection: sqlite3.Connection) -> None:
+        """A pre-release v8 build dropped the legacy mode; older apps still read it."""
+        present = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(reading_progress)"
+            ).fetchall()
+        }
+        if "mode" not in present:
+            connection.execute(
+                "ALTER TABLE reading_progress ADD COLUMN mode TEXT NOT NULL "
+                "DEFAULT 'single' CHECK(mode IN ('single', 'double', 'scroll'))"
             )
 
     @staticmethod
@@ -1510,42 +1544,43 @@ class SQLiteRepository:
             ).fetchall()
         return {row["publication_id"]: self._reading_progress(row) for row in rows}
 
-    def latest_reading_progress(self, user_id: str) -> ReadingProgress | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM reading_progress
-                WHERE user_id = ?
-                ORDER BY updated_at DESC, publication_id
-                LIMIT 1
-                """,
-                (user_id,),
-            ).fetchone()
-        return self._reading_progress(row) if row else None
-
     def save_reading_progress(
         self,
         user_id: str,
         publication_id: str,
         page: int,
-        mode: str,
+        mode: str | None,
         completed: bool,
     ) -> ReadingProgress:
-        updated_at = _now_iso()
+        """Save a position; `mode` only records what a legacy client sent.
+
+        Callers that no longer send a mode leave the stored one untouched, so
+        an older app sharing the account keeps reading back what it last saved.
+        """
         with self._connect() as connection:
             row = connection.execute(
                 """
                 INSERT INTO reading_progress(
                     user_id, publication_id, page_number, mode, completed, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (
+                    :user_id, :publication_id, :page, COALESCE(:mode, 'single'),
+                    :completed, :updated_at
+                )
                 ON CONFLICT(user_id, publication_id) DO UPDATE SET
                     page_number=excluded.page_number,
-                    mode=excluded.mode,
+                    mode=COALESCE(:mode, reading_progress.mode),
                     completed=excluded.completed,
                     updated_at=excluded.updated_at
                 RETURNING *
                 """,
-                (user_id, publication_id, page, mode, int(completed), updated_at),
+                {
+                    "user_id": user_id,
+                    "publication_id": publication_id,
+                    "page": page,
+                    "mode": mode,
+                    "completed": int(completed),
+                    "updated_at": _now_iso(),
+                },
             ).fetchone()
         return self._reading_progress(row)
 
@@ -1722,9 +1757,13 @@ class SQLiteRepository:
         category: str | None = None,
         query: str | None = None,
         scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> list[CatalogSeries]:
         clauses = ["managed_libraries.enabled = 1"]
         parameters: list[object] = []
+        visibility_clause = _visibility_predicate(visibility, "catalog_series")
+        if visibility_clause:
+            clauses.append(visibility_clause)
         if series_id:
             clauses.append("catalog_series.id = ?")
             parameters.append(series_id)
@@ -1765,6 +1804,7 @@ class SQLiteRepository:
                     SELECT catalog_series.id, catalog_series.library_id,
                            managed_libraries.name AS library,
                            catalog_series.category, catalog_series.name,
+                           catalog_series.is_private,
                            publications.id AS publication_id,
                            publications.revision AS publication_revision,
                            COUNT(*) OVER (
@@ -1796,8 +1836,42 @@ class SQLiteRepository:
     def catalog_series_by_id(
         self, series_id: str, scope: ReadScope | None = None
     ) -> CatalogSeries | None:
-        items = self.catalog_series(series_id=series_id, scope=scope)
+        items = self.catalog_series(
+            series_id=series_id, scope=scope, visibility=CatalogVisibility.ALL
+        )
         return items[0] if items else None
+
+    def set_series_private(
+        self, series_id: str, is_private: bool
+    ) -> CatalogSeries | None:
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT is_private FROM catalog_series WHERE id = ?", (series_id,)
+            ).fetchone()
+            if not current:
+                return None
+            if bool(current["is_private"]) != is_private:
+                connection.execute(
+                    "UPDATE catalog_series SET is_private = ? WHERE id = ?",
+                    (int(is_private), series_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO application_metadata(key, value)
+                    VALUES ('catalog_visibility_modified_at', ?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """,
+                    (_now_iso(),),
+                )
+        return self.catalog_series_by_id(series_id)
+
+    def catalog_visibility_modified_at(self) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM application_metadata "
+                "WHERE key = 'catalog_visibility_modified_at'"
+            ).fetchone()
+        return row["value"] if row else None
 
     def publications_in_series(
         self, series_id: str, scope: ReadScope | None = None
@@ -2070,28 +2144,47 @@ class SQLiteRepository:
             library=row["library"],
             category=row["category"],
             name=row["name"],
+            is_private=bool(row["is_private"]),
             publication_count=row["publication_count"],
             first_publication_id=row["publication_id"],
             first_publication_revision=row["publication_revision"],
         )
 
-    def libraries(self, scope: ReadScope | None = None) -> list[tuple[str, int]]:
-        return self._grouped("library", (), scope)
+    def libraries(
+        self,
+        scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
+    ) -> list[tuple[str, int]]:
+        return self._grouped("library", (), scope, visibility)
 
     def categories(
-        self, library: str, scope: ReadScope | None = None
+        self,
+        library: str,
+        scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> list[tuple[str, int]]:
-        return self._grouped("category", ("library = ?", library), scope)
+        return self._grouped("category", ("library = ?", library), scope, visibility)
 
     def series(
-        self, library: str, category: str, scope: ReadScope | None = None
+        self,
+        library: str,
+        category: str,
+        scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> list[tuple[str, int]]:
         return self._grouped(
-            "series", ("library = ? AND category = ?", library, category), scope
+            "series",
+            ("library = ? AND category = ?", library, category),
+            scope,
+            visibility,
         )
 
     def _grouped(
-        self, column: str, where: tuple[object, ...], scope: ReadScope | None
+        self,
+        column: str,
+        where: tuple[object, ...],
+        scope: ReadScope | None,
+        visibility: CatalogVisibility,
     ) -> list[tuple[str, int]]:
         allowed = {"library", "category", "series"}
         if column not in allowed:
@@ -2101,6 +2194,9 @@ class SQLiteRepository:
         scope_clause, scope_parameters = _scope_predicate(scope)
         clauses.append(scope_clause)
         parameters.extend(scope_parameters)
+        visibility_clause = _visibility_predicate(visibility)
+        if visibility_clause:
+            clauses.append(visibility_clause)
         clause = f" WHERE {' AND '.join(f'({item})' for item in clauses)}"
         with self._connect() as connection:
             rows = connection.execute(
@@ -2124,8 +2220,11 @@ class SQLiteRepository:
         limit: int = 24,
         offset: int = 0,
         scope: ReadScope | None = None,
+        visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> tuple[list[Publication], int]:
-        where, parameters = _publication_filter(library, category, series, query, scope)
+        where, parameters = _publication_filter(
+            library, category, series, query, scope, visibility
+        )
         with self._connect() as connection:
             total = int(
                 connection.execute(
@@ -2179,6 +2278,7 @@ def _publication_filter(
     series: str | None,
     query: str | None,
     scope: ReadScope | None = None,
+    visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
 ) -> tuple[str, list[object]]:
     """Build the WHERE fragment and bound parameters for a publication search."""
     clauses: list[str] = []
@@ -2201,7 +2301,25 @@ def _publication_filter(
     scope_clause, scope_parameters = _scope_predicate(scope)
     clauses.append(scope_clause)
     parameters.extend(scope_parameters)
+    visibility_clause = _visibility_predicate(visibility)
+    if visibility_clause:
+        clauses.append(visibility_clause)
     return (f" WHERE {' AND '.join(clauses)}" if clauses else ""), parameters
+
+
+def _visibility_predicate(
+    visibility: CatalogVisibility, series_table: str | None = None
+) -> str:
+    if visibility == CatalogVisibility.ALL:
+        return ""
+    expected = 1 if visibility == CatalogVisibility.PRIVATE else 0
+    if series_table:
+        return f"{series_table}.is_private = {expected}"
+    return (
+        "EXISTS (SELECT 1 FROM catalog_series AS visible_series "
+        "WHERE visible_series.id = publications.series_id "
+        f"AND visible_series.is_private = {expected})"
+    )
 
 
 def _scope_predicate(scope: ReadScope | None) -> tuple[str, list[object]]:

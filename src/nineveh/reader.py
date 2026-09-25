@@ -167,13 +167,10 @@ class ReaderService:
 
     def reading_state(self, user_id: str, publication_id: str) -> ReadingState:
         saved = self._progress.reading_progress(user_id, publication_id)
-        preference = self._progress.latest_reading_progress(user_id)
         return ReadingState(
             page=saved.page if saved else 1,
-            mode=preference.mode if preference else "single",
             completed=saved.completed if saved else False,
             progress_updated_at=saved.updated_at if saved else None,
-            mode_updated_at=preference.updated_at if preference else None,
         )
 
     def save_progress(
@@ -181,10 +178,10 @@ class ReaderService:
         user_id: str,
         publication: Publication,
         page: int,
-        mode: str,
+        mode: str | None,
         completed: bool,
     ) -> ReadingProgress:
-        if mode not in READING_MODES:
+        if mode is not None and mode not in READING_MODES:
             raise ValueError("Unsupported reading mode")
         if not 1 <= page <= publication.page_count:
             raise ValueError("Page is outside the publication")
@@ -195,12 +192,11 @@ class ReaderService:
         )
 
     def mark_as_read(self, user_id: str, publication: Publication) -> ReadingProgress:
-        state = self.reading_state(user_id, publication.id)
         return self.save_progress(
             user_id,
             publication,
             publication.page_count,
-            state.mode,
+            None,
             True,
         )
 

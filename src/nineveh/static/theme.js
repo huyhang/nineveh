@@ -18,27 +18,29 @@
 
   function applyTheme(theme) {
     document.documentElement.dataset.theme = theme;
-    const button = document.querySelector("[data-theme-toggle]");
-    if (!button) return;
     const [icon, label] = labels[theme];
-    button.querySelector(".theme-icon").textContent = icon;
-    button.querySelector("[data-theme-label]").textContent = label;
-    button.setAttribute("aria-label", `Current theme: ${label}. Switch color theme`);
+    document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+      button.querySelector(".theme-icon").textContent = icon;
+      button.querySelector("[data-theme-label]").textContent = label;
+      button.setAttribute("aria-label", `Current theme: ${label}. Switch color theme`);
+    });
   }
 
   const initial = storedTheme();
   applyTheme(initial);
   document.addEventListener("DOMContentLoaded", () => {
     applyTheme(initial);
-    document.querySelector("[data-theme-toggle]")?.addEventListener("click", () => {
-      const current = document.documentElement.dataset.theme || "system";
-      const next = themes[(themes.indexOf(current) + 1) % themes.length];
-      try {
-        window.localStorage.setItem("nineveh-theme", next);
-      } catch {
-        // The theme still applies for this page when storage is unavailable.
-      }
-      applyTheme(next);
+    document.querySelectorAll("[data-theme-toggle]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const current = document.documentElement.dataset.theme || "system";
+        const next = themes[(themes.indexOf(current) + 1) % themes.length];
+        try {
+          window.localStorage.setItem("nineveh-theme", next);
+        } catch {
+          // The theme still applies for this page when storage is unavailable.
+        }
+        applyTheme(next);
+      });
     });
   });
 })();

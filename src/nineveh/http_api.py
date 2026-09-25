@@ -50,6 +50,7 @@ from .deployment import memory_limit_text
 from .domain import (
     AccessGrant,
     CatalogSeries,
+    CatalogVisibility,
     LibrarianEvent,
     LibrarianToken,
     LibraryUsage,
@@ -67,7 +68,12 @@ from .librarian import (
     LibrarianTooLarge,
 )
 from .metadata import MetadataError
-from .opds import CBZ_MEDIA_TYPE, NAVIGATION_PATH, PUBLICATIONS_PATH
+from .opds import (
+    CBZ_MEDIA_TYPE,
+    NAVIGATION_PATH,
+    PRIVATE_NAVIGATION_PATH,
+    PUBLICATIONS_PATH,
+)
 from .opds import url as opds_url
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
@@ -146,12 +152,24 @@ class SpreadStartInput(BaseModel):
     page: int | None = Field(default=None, ge=2)
 
 
+class SeriesPrivacyInput(BaseModel):
+    private: bool
+
+
 ReadingMode = Literal["single", "double", "scroll"]
+# Reading mode used to be one account-wide value; readers now keep it on the
+# device, per series. It is still stored and returned for apps built against
+# the older contract, and only for them.
+LEGACY_MODE = {
+    "deprecated": True,
+    "description": "Legacy account-wide reading mode, kept for older clients. "
+    "Omit it: readers keep the mode on the device, per series.",
+}
 
 
 class ProgressUpdate(BaseModel):
     page: int = Field(ge=1)
-    mode: ReadingMode
+    mode: ReadingMode | None = Field(default=None, json_schema_extra=LEGACY_MODE)
     completed: bool = False
 
 
@@ -178,7 +196,9 @@ PageWidth = Annotated[
 ]
 CoverWidth = Annotated[
     int,
-    WithJsonSchema({"type": "integer", "enum": sorted(ThumbnailService.ALLOWED_WIDTHS)}),
+    WithJsonSchema(
+        {"type": "integer", "enum": sorted(ThumbnailService.ALLOWED_WIDTHS)}
+    ),
 ]
 
 
@@ -225,7 +245,7 @@ class UserAccount(ResponseBody):
 class ReadingPosition(ResponseBody):
     publication_id: str
     page: int
-    mode: ReadingMode
+    mode: ReadingMode = Field(json_schema_extra=LEGACY_MODE)
     completed: bool
     updated_at: Timestamp
 
@@ -295,6 +315,7 @@ class SeriesDetail(ResponseBody):
     category: Literal["comics", "manga"]
     local_name: str
     title: str
+    is_private: bool
     publication_count: int
     cover: str
     metadata: SeriesMetadataRecord | None
@@ -571,8 +592,55 @@ async def opds_catalog(
     container = _container(request)
     scope = container.authorization.read_scope(identity.user)
     libraries = await run_in_threadpool(container.repository.libraries, scope)
+    _, private_count = await run_in_threadpool(
+        container.repository.publications,
+        limit=1,
+        scope=scope,
+        visibility=CatalogVisibility.PRIVATE,
+    )
     return container.opds.root_feed(
-        base_url(request), libraries, _catalog_modified(container)
+        base_url(request),
+        libraries,
+        await _catalog_modified(container),
+        private_count=private_count,
+    )
+
+
+@router.get(
+    PRIVATE_NAVIGATION_PATH,
+    response_class=OpdsResponse,
+    response_model=NavigationFeed,
+    response_model_exclude_unset=True,
+    tags=["opds"],
+)
+async def opds_private_navigation(
+    request: Request, identity: Annotated[Identity, Depends(authenticated)]
+) -> dict[str, object]:
+    container = _container(request)
+    root = base_url(request)
+    scope = container.authorization.read_scope(identity.user)
+    groups = await run_in_threadpool(
+        container.repository.libraries, scope, CatalogVisibility.PRIVATE
+    )
+    entries = [
+        (
+            name,
+            count,
+            opds_url(
+                root,
+                NAVIGATION_PATH,
+                {"collection": "private", "library": name},
+            ),
+        )
+        for name, count in groups
+    ]
+    return container.opds.navigation_feed(
+        root,
+        title="Private Collection",
+        parameters={},
+        entries=entries,
+        modified=await _catalog_modified(container),
+        path=PRIVATE_NAVIGATION_PATH,
     )
 
 
@@ -588,45 +656,71 @@ async def opds_navigation(
     identity: Annotated[Identity, Depends(authenticated)],
     library: str,
     category: str | None = None,
+    collection: Literal["public", "private"] = "public",
 ) -> dict[str, object]:
     container = _container(request)
     root = base_url(request)
     scope = container.authorization.read_scope(identity.user)
+    visibility = CatalogVisibility(collection)
     title, parameters, entries = await (
-        _category_entries(container, root, library, scope)
+        _category_entries(container, root, library, scope, visibility)
         if category is None
-        else _series_entries(container, root, library, category, scope)
+        else _series_entries(container, root, library, category, scope, visibility)
     )
     return container.opds.navigation_feed(
         root,
         title=title,
         parameters=parameters,
         entries=entries,
-        modified=_catalog_modified(container),
+        modified=await _catalog_modified(container),
     )
 
 
 async def _category_entries(
-    container: Container, root: str, library: str, scope
+    container: Container,
+    root: str,
+    library: str,
+    scope,
+    visibility: CatalogVisibility,
 ) -> NavigationEntries:
-    groups = await run_in_threadpool(container.repository.categories, library, scope)
+    groups = await run_in_threadpool(
+        container.repository.categories, library, scope, visibility
+    )
+    collection = visibility.value if visibility == CatalogVisibility.PRIVATE else None
     entries = [
         (
             name,
             count,
-            opds_url(root, NAVIGATION_PATH, {"library": library, "category": name}),
+            opds_url(
+                root,
+                NAVIGATION_PATH,
+                {
+                    "library": library,
+                    "category": name,
+                    **({"collection": collection} if collection else {}),
+                },
+            ),
         )
         for name, count in groups
     ]
-    return library, {"library": library}, entries
+    parameters = {"library": library}
+    if collection:
+        parameters["collection"] = collection
+    return library, parameters, entries
 
 
 async def _series_entries(
-    container: Container, root: str, library: str, category: str, scope
+    container: Container,
+    root: str,
+    library: str,
+    category: str,
+    scope,
+    visibility: CatalogVisibility,
 ) -> NavigationEntries:
     groups = await run_in_threadpool(
-        container.repository.series, library, category, scope
+        container.repository.series, library, category, scope, visibility
     )
+    collection = visibility.value if visibility == CatalogVisibility.PRIVATE else None
     entries = [
         (
             name,
@@ -634,12 +728,19 @@ async def _series_entries(
             opds_url(
                 root,
                 PUBLICATIONS_PATH,
-                {"library": library, "category": category, "series": name},
+                {
+                    "library": library,
+                    "category": category,
+                    "series": name,
+                    **({"collection": collection} if collection else {}),
+                },
             ),
         )
         for name, count in groups
     ]
     parameters = {"library": library, "category": category}
+    if collection:
+        parameters["collection"] = collection
     return f"{library} — {category}", parameters, entries
 
 
@@ -658,6 +759,7 @@ async def opds_publications(
     series: str | None = None,
     q: str | None = Query(default=None, max_length=200),
     page: int = Query(default=1, ge=1),
+    collection: Literal["public", "private"] = "public",
 ) -> dict[str, object]:
     container = _container(request)
     scope = container.authorization.read_scope(identity.user)
@@ -671,6 +773,7 @@ async def opds_publications(
         limit=page_size,
         offset=(page - 1) * page_size,
         scope=scope,
+        visibility=CatalogVisibility(collection),
     )
     return container.opds.publication_feed(
         base_url(request),
@@ -682,7 +785,8 @@ async def opds_publications(
         category=category,
         series=series,
         query=q,
-        modified=_catalog_modified(container),
+        modified=await _catalog_modified(container),
+        collection=collection,
     )
 
 
@@ -712,6 +816,30 @@ async def series_detail(
         _container(request).repository.series_metadata, series_id
     )
     return _public_series(item, metadata)
+
+
+# Filed under `series` rather than the admin surface, so a reading app can
+# offer the same Make Private control as the series page. Only an
+# administrator may still use it.
+@router.put(
+    "/api/v1/series/{series_id}/privacy", response_model=SeriesDetail, tags=["series"]
+)
+async def series_privacy(
+    request: Request,
+    series_id: str,
+    body: SeriesPrivacyInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    series = await run_in_threadpool(
+        container.series.set_private, series_id, body.private
+    )
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+    metadata = await run_in_threadpool(container.repository.series_metadata, series_id)
+    return _public_series(series, metadata)
 
 
 @router.get(
@@ -1430,7 +1558,9 @@ async def admin_metadata(
 ) -> dict[str, object]:
     container = _container(request)
     items = await run_in_threadpool(
-        container.repository.catalog_series, category="manga"
+        container.repository.catalog_series,
+        category="manga",
+        visibility=CatalogVisibility.ALL,
     )
     metadata = await run_in_threadpool(container.repository.all_series_metadata)
     return {
@@ -1479,7 +1609,10 @@ async def admin_library_metadata_auto_match(
     if current is not None and not current.done():
         raise HTTPException(status_code=409, detail="A metadata job is already running")
     items = await run_in_threadpool(
-        container.repository.catalog_series, library_id=library_id, category="manga"
+        container.repository.catalog_series,
+        library_id=library_id,
+        category="manga",
+        visibility=CatalogVisibility.ALL,
     )
     if not items:
         raise HTTPException(status_code=409, detail="This library has no manga series")
@@ -1846,6 +1979,7 @@ def _public_series(series: CatalogSeries, metadata) -> dict[str, object]:
         "category": series.category,
         "localName": series.name,
         "title": title,
+        "isPrivate": series.is_private,
         "publicationCount": series.publication_count,
         "cover": f"/api/v1/series/{series.id}/cover",
         "metadata": {
@@ -1968,10 +2102,19 @@ def _not_modified_response(etag: str) -> Response:
     return Response(status_code=304, headers={"ETag": etag})
 
 
-def _catalog_modified(container: Container) -> str:
-    return (
-        container.scanner.status.catalog_modified_at
-        or datetime.fromtimestamp(0, UTC).isoformat()
+async def _catalog_modified(container: Container) -> str:
+    visibility_modified = await run_in_threadpool(
+        container.repository.catalog_visibility_modified_at
+    )
+    return max(
+        filter(
+            None,
+            (
+                container.scanner.status.catalog_modified_at,
+                visibility_modified,
+                datetime.fromtimestamp(0, UTC).isoformat(),
+            ),
+        )
     )
 
 

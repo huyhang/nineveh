@@ -6,7 +6,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from conftest import ADMIN_PASSWORD, READER_PASSWORD, authorization
+from conftest import (
+    ADMIN_PASSWORD,
+    READER_PASSWORD,
+    authorization,
+    scanned_client,
+    write_cbz,
+)
 from fakes import publication
 from fastapi.testclient import TestClient
 
@@ -96,6 +102,170 @@ def test_the_catalog_filters_and_paginates(client: TestClient):
     assert "No publications found" in empty.text
 
 
+def test_private_collection_mirrors_library_browsing_and_excludes_default_views(
+    client: TestClient,
+):
+    _login(client)
+    [series] = client.app.state.container.repository.catalog_series()
+
+    moved = client.post(
+        f"/series/{series.id}/privacy",
+        data={
+            "csrf_token": _csrf(client, f"/series/{series.id}"),
+            "is_private": "true",
+        },
+        follow_redirects=False,
+    )
+
+    assert moved.status_code == 303
+    assert moved.headers["location"] == f"/series/{series.id}"
+    assert "Example Series" not in client.get("/").text
+    assert "Example Series" not in client.get("/?q=Example").text
+
+    private_root = client.get("/private")
+    assert "Private Collection" in private_root.text
+    assert f'href="/private/libraries/{series.library_id}"' in private_root.text
+
+    private_library = client.get(f"/private/libraries/{series.library_id}")
+    assert f'href="/private/libraries/{series.library_id}/comics"' in (
+        private_library.text
+    )
+    category = client.get(f"/private/libraries/{series.library_id}/comics")
+    assert "Example Series" in category.text
+    assert 'data-layout-option="default"' in category.text
+    assert 'data-layout-option="dense"' in category.text
+    assert 'data-layout-option="list"' in category.text
+    assert "catalog-layout.js" in category.text
+
+    detail = client.get(f"/series/{series.id}")
+    assert 'href="/private" aria-current="page">Private ' in detail.text
+    assert "Move to Library" in detail.text
+
+
+def test_narrow_catalog_controls_use_deliberate_mobile_grids(client: TestClient):
+    _login(client)
+    [series] = client.app.state.container.repository.catalog_series()
+    category = client.get(f"/libraries/{series.library_id}/{series.category}")
+    stylesheet = client.get("/static/style.css").text
+
+    assert 'class="mobile-catalog-more' in category.text
+    assert 'class="mobile-bottom-nav"' in category.text
+    assert 'class="catalog-controls has-layouts"' in category.text
+    assert 'class="series-tools"' in category.text
+    assert ">View<" not in category.text
+    assert ".header-navigation { display: contents; }" in stylesheet
+    assert "  .series-grid { grid-template-columns: repeat(2" in stylesheet
+    assert (
+        ':root[data-catalog-layout="dense"] .series-grid '
+        "{ grid-template-columns: repeat(3" in stylesheet
+    )
+    assert ".mobile-bottom-nav { position: fixed" in stylesheet
+
+
+def test_only_an_administrator_can_change_series_privacy(
+    client: TestClient, reader: dict
+):
+    [series] = client.app.state.container.repository.catalog_series()
+    _login(client, "reader", READER_PASSWORD)
+
+    response = client.post(
+        f"/series/{series.id}/privacy",
+        data={"csrf_token": _csrf(client, "/"), "is_private": "true"},
+    )
+
+    assert response.status_code == 403
+    assert not client.app.state.container.repository.catalog_series_by_id(
+        series.id
+    ).is_private
+
+
+def test_a_privacy_change_without_the_session_token_is_refused(client: TestClient):
+    _login(client)
+    [series] = client.app.state.container.repository.catalog_series()
+
+    forged = client.post(
+        f"/series/{series.id}/privacy",
+        data={"csrf_token": "forged", "is_private": "true"},
+    )
+
+    assert forged.status_code == 403
+    assert not client.app.state.container.repository.catalog_series_by_id(
+        series.id
+    ).is_private
+
+
+def _make_private(client: TestClient, series_id: str) -> None:
+    client.app.state.container.series.set_private(series_id, True)
+
+
+def test_a_private_series_page_leads_back_into_the_private_collection(
+    client: TestClient,
+):
+    _login(client)
+    [series] = client.app.state.container.repository.catalog_series()
+    _make_private(client, series.id)
+
+    page = client.get(f"/series/{series.id}").text
+    breadcrumbs = page.split('aria-label="Breadcrumb"', 1)[1].split("</nav>", 1)[0]
+
+    assert '<a href="/private">Private Collection</a>' in breadcrumbs
+    assert f'href="/private/libraries/{series.library_id}"' in breadcrumbs
+    assert f'href="/private/libraries/{series.library_id}/comics"' in breadcrumbs
+    assert 'href="/libraries/' not in breadcrumbs
+
+
+def test_links_from_before_the_private_collection_find_a_series_that_moved(
+    client: TestClient,
+):
+    _login(client)
+    [series] = client.app.state.container.repository.catalog_series()
+    legacy = "/?library=Main%20Library&category=comics"
+    assert client.get(legacy, follow_redirects=False).headers["location"] == (
+        f"/libraries/{series.library_id}/comics"
+    )
+    _make_private(client, series.id)
+
+    def location(url: str) -> str:
+        return client.get(url, follow_redirects=False).headers["location"]
+
+    assert location(f"{legacy}&series=Example%20Series") == f"/series/{series.id}"
+    assert location(legacy) == f"/private/libraries/{series.library_id}/comics"
+    assert location("/?library=Main%20Library") == (
+        f"/private/libraries/{series.library_id}"
+    )
+
+
+@pytest.fixture
+def two_series_client(library):
+    settings, archive = library
+    sequel = archive.parent.parent / "Example Sequel" / "Issue 1.cbz"
+    sequel.parent.mkdir()
+    write_cbz(sequel)
+    yield from scanned_client(replace(settings, feed_page_size=1))
+
+
+def test_private_search_pages_through_private_series_only(two_series_client):
+    client = two_series_client
+    _login(client)
+    for series in client.app.state.container.repository.catalog_series():
+        _make_private(client, series.id)
+
+    first = client.get("/private?q=Example")
+    assert 'href="/private?q=Example&amp;page=2"' in first.text
+    assert "Page 1 of 2" in first.text
+    second = client.get("/private?q=Example&page=2")
+    assert 'href="/private?q=Example&amp;page=1"' in second.text
+    assert "Page 2 of 2" in second.text
+    listed = {
+        name
+        for page in (first.text, second.text)
+        for name in ("Example Series", "Example Sequel")
+        if name in page
+    }
+    assert listed == {"Example Series", "Example Sequel"}
+    assert "No publications found" in client.get("/?q=Example").text
+
+
 def test_a_publication_opens_in_the_browser_reader(
     client: TestClient, publication_id: str
 ):
@@ -111,6 +281,7 @@ def test_a_publication_opens_in_the_browser_reader(
     assert 'data-mode="single"' in page.text
     assert 'data-mode="double"' in page.text
     assert 'data-mode="scroll"' in page.text
+    assert 'class="reader-back-icon"' in page.text
     assert "/static/reader.js" in page.text
     assert "/static/reader.css" in page.text
     series_url = next(
@@ -287,7 +458,9 @@ def test_reader_progress_is_csrf_protected_and_restored(
 
     restored = client.get(f"/read/{publication_id}")
     assert 'data-initial-page="3"' in restored.text
-    assert 'data-initial-mode="scroll"' in restored.text
+    # The account-wide mode is for older apps; the browser keeps its own per series.
+    assert 'data-initial-mode="single"' in restored.text
+    assert 'data-series-id="' in restored.text
     assert 'data-completed="true"' in restored.text
 
     linked = client.get(f"/read/{publication_id}?page=3&mode=double")
@@ -447,6 +620,16 @@ def test_reader_styles_honour_the_reading_direction(client: TestClient):
         ".reader-shell.direction-rtl .reader-page-nav.next",
     ):
         assert rule in stylesheet, rule
+
+
+def test_mobile_reader_uses_the_full_width_without_side_buttons(client: TestClient):
+    stylesheet = client.get("/static/reader.css").text
+    mobile = stylesheet.split("@media (max-width: 640px) {", 1)[1]
+    mobile = mobile.split("@media (prefers-reduced-motion", 1)[0]
+
+    assert ".reader-page-nav { display: none; }" in mobile
+    assert "padding-right: env(safe-area-inset-right)" in mobile
+    assert "padding-left: env(safe-area-inset-left)" in mobile
 
 
 def _rule(stylesheet: str, selector: str) -> str:

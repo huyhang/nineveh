@@ -22,7 +22,13 @@ from fastapi.templating import Jinja2Templates
 from .auth import AuthenticationError, InvalidUserInput, LastAdministratorError
 from .catalog import InvalidLibrary
 from .deployment import memory_limit_text
-from .domain import SEVERITY_ORDER, AccessGrant, Publication, Session
+from .domain import (
+    SEVERITY_ORDER,
+    AccessGrant,
+    CatalogVisibility,
+    Publication,
+    Session,
+)
 from .http_api import SESSION_COOKIE, scan_active
 from .librarian import PURGE_OPTIONS, SCOPE_OPTIONS, LibrarianError
 from .metadata import (
@@ -150,6 +156,31 @@ async def catalog(
     q: str | None = Query(default=None, max_length=200),
     page: int = Query(default=1, ge=1),
 ):
+    return await _catalog_page(
+        request, CatalogVisibility.PUBLIC, library, category, series, q, page
+    )
+
+
+@router.get("/private", response_class=HTMLResponse)
+async def private_catalog(
+    request: Request,
+    q: str | None = Query(default=None, max_length=200),
+    page: int = Query(default=1, ge=1),
+):
+    return await _catalog_page(
+        request, CatalogVisibility.PRIVATE, None, None, None, q, page
+    )
+
+
+async def _catalog_page(
+    request: Request,
+    visibility: CatalogVisibility,
+    library: str | None,
+    category: str | None,
+    series: str | None,
+    q: str | None,
+    page: int,
+):
     session = await _browser_session(request)
     if not session:
         return RedirectResponse("/login", status_code=303)
@@ -162,9 +193,9 @@ async def catalog(
 
     query = (q or "").strip()
     view = (
-        await _search_results(container, scope, query, page)
+        await _search_results(container, scope, query, page, visibility)
         if query
-        else await _library_shelves(container, scope)
+        else await _library_shelves(container, scope, visibility)
     )
     return templates.TemplateResponse(
         request,
@@ -174,13 +205,18 @@ async def catalog(
             "session": session,
             "mode": "search" if query else "libraries",
             "query": query,
+            **_collection_context(visibility),
             **view,
         },
     )
 
 
 async def _legacy_filter_redirect(container, scope, library, category, series):
-    """Keep the pre-hierarchy `?library=&category=&series=` links working."""
+    """Keep the pre-hierarchy `?library=&category=&series=` links working.
+
+    Those links predate the Private Collection, so they resolve against both
+    collections and land wherever the target now lives.
+    """
     if not library:
         return None
     managed = await _managed_library_named(container, library, scope)
@@ -193,18 +229,31 @@ async def _legacy_filter_redirect(container, scope, library, category, series):
             category=category,
             query=series,
             scope=scope,
+            visibility=CatalogVisibility.ALL,
         )
         exact = next((item for item in matches if item.name == series), None)
         if exact:
             return RedirectResponse(f"/series/{exact.id}", status_code=303)
+    public_categories = dict(
+        await run_in_threadpool(container.repository.categories, managed.name, scope)
+    )
+    public = category in public_categories if category else bool(public_categories)
+    prefix = _collection_context(
+        CatalogVisibility.PUBLIC if public else CatalogVisibility.PRIVATE
+    )["library_prefix"]
     if category:
-        return RedirectResponse(f"/libraries/{managed.id}/{category}", status_code=303)
-    return RedirectResponse(f"/libraries/{managed.id}", status_code=303)
+        return RedirectResponse(f"{prefix}/{managed.id}/{category}", status_code=303)
+    return RedirectResponse(f"{prefix}/{managed.id}", status_code=303)
 
 
-async def _search_results(container, scope, query: str, page: int) -> dict[str, object]:
+async def _search_results(
+    container, scope, query: str, page: int, visibility: CatalogVisibility
+) -> dict[str, object]:
     matches = await run_in_threadpool(
-        container.repository.catalog_series, query=query, scope=scope
+        container.repository.catalog_series,
+        query=query,
+        scope=scope,
+        visibility=visibility,
     )
     summaries = await run_in_threadpool(container.repository.series_metadata_summaries)
     page_size = container.settings.feed_page_size
@@ -220,18 +269,27 @@ async def _search_results(container, scope, query: str, page: int) -> dict[str, 
         "metadata_attribution": any(card["metadata"] for card in cards),
         "recent_publications": [],
         "total": len(matches),
-        "previous_url": _search_url(query, page - 1) if page > 1 else None,
-        "next_url": _search_url(query, page + 1) if page < page_count else None,
+        "previous_url": _search_url(query, page - 1, visibility) if page > 1 else None,
+        "next_url": _search_url(query, page + 1, visibility)
+        if page < page_count
+        else None,
     }
 
 
-async def _library_shelves(container, scope) -> dict[str, object]:
+async def _library_shelves(
+    container, scope, visibility: CatalogVisibility
+) -> dict[str, object]:
     """The landing view reads neither the series index nor stored metadata."""
-    visible = dict(await run_in_threadpool(container.repository.libraries, scope))
+    visible = dict(
+        await run_in_threadpool(container.repository.libraries, scope, visibility)
+    )
     managed = await run_in_threadpool(container.repository.managed_libraries)
     libraries = [(item, visible[item.name]) for item in managed if item.name in visible]
     recent = await run_in_threadpool(
-        container.repository.publications, limit=6, scope=scope
+        container.repository.publications,
+        limit=6,
+        scope=scope,
+        visibility=visibility,
     )
     return {
         "page": 1,
@@ -248,15 +306,28 @@ async def _library_shelves(container, scope) -> dict[str, object]:
 
 @router.get("/libraries/{library_id}", response_class=HTMLResponse)
 async def library_detail(request: Request, library_id: str):
+    return await _library_detail(request, library_id, CatalogVisibility.PUBLIC)
+
+
+@router.get("/private/libraries/{library_id}", response_class=HTMLResponse)
+async def private_library_detail(request: Request, library_id: str):
+    return await _library_detail(request, library_id, CatalogVisibility.PRIVATE)
+
+
+async def _library_detail(
+    request: Request, library_id: str, visibility: CatalogVisibility
+):
     session = await _require_browser_session(request)
     container = _container(request)
     scope = container.authorization.read_scope(session.user)
     library = await run_in_threadpool(container.repository.managed_library, library_id)
-    visible = dict(await run_in_threadpool(container.repository.libraries, scope))
+    visible = dict(
+        await run_in_threadpool(container.repository.libraries, scope, visibility)
+    )
     if not library or library.name not in visible:
         raise HTTPException(status_code=404, detail="Library not found")
     categories = await run_in_threadpool(
-        container.repository.categories, library.name, scope
+        container.repository.categories, library.name, scope, visibility
     )
     return templates.TemplateResponse(
         request,
@@ -265,6 +336,7 @@ async def library_detail(request: Request, library_id: str):
             "service_title": container.settings.service_title,
             "session": session,
             "mode": "categories",
+            **_collection_context(visibility),
             "library": library,
             "categories": categories,
             "total": visible[library.name],
@@ -274,6 +346,24 @@ async def library_detail(request: Request, library_id: str):
 
 @router.get("/libraries/{library_id}/{category}", response_class=HTMLResponse)
 async def category_detail(request: Request, library_id: str, category: str):
+    return await _category_detail(
+        request, library_id, category, CatalogVisibility.PUBLIC
+    )
+
+
+@router.get("/private/libraries/{library_id}/{category}", response_class=HTMLResponse)
+async def private_category_detail(request: Request, library_id: str, category: str):
+    return await _category_detail(
+        request, library_id, category, CatalogVisibility.PRIVATE
+    )
+
+
+async def _category_detail(
+    request: Request,
+    library_id: str,
+    category: str,
+    visibility: CatalogVisibility,
+):
     session = await _require_browser_session(request)
     container = _container(request)
     scope = container.authorization.read_scope(session.user)
@@ -285,9 +375,12 @@ async def category_detail(request: Request, library_id: str, category: str):
         library_id=library_id,
         category=category,
         scope=scope,
+        visibility=visibility,
     )
     visible_categories = dict(
-        await run_in_threadpool(container.repository.categories, library.name, scope)
+        await run_in_threadpool(
+            container.repository.categories, library.name, scope, visibility
+        )
     )
     if category not in visible_categories:
         raise HTTPException(status_code=404, detail="Category not found")
@@ -300,6 +393,7 @@ async def category_detail(request: Request, library_id: str, category: str):
             "service_title": container.settings.service_title,
             "session": session,
             "mode": "series",
+            **_collection_context(visibility),
             "library": library,
             "category": category,
             "series_cards": series_cards,
@@ -344,6 +438,11 @@ async def series_detail(request: Request, series_id: str):
             "service_title": container.settings.service_title,
             "session": session,
             "series": item,
+            **_collection_context(
+                CatalogVisibility.PRIVATE
+                if item.is_private
+                else CatalogVisibility.PUBLIC
+            ),
             "metadata": metadata,
             "details": metadata.effective if metadata else {},
             "display_title": _series_title(item, metadata),
@@ -354,6 +453,28 @@ async def series_detail(request: Request, series_id: str):
             "message": message,
             "error": error,
         },
+    )
+
+
+@router.post("/series/{series_id}/privacy")
+async def update_series_privacy(
+    request: Request,
+    series_id: str,
+    csrf_token: str = Form(...),
+    is_private: bool = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    updated = await run_in_threadpool(
+        _container(request).series.set_private, series_id, is_private
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Series not found")
+    destination = "Private Collection" if is_private else "Library"
+    return await _flash_redirect(
+        request,
+        f"/series/{series_id}",
+        message=f"Moved {updated.name} to {destination}.",
     )
 
 
@@ -468,7 +589,7 @@ async def reader(
         page or state.page,
         context.publication.page_count,
     )
-    initial_mode = mode or state.mode
+    initial_mode = mode or "single"
     return templates.TemplateResponse(
         request,
         "reader.html",
@@ -486,9 +607,6 @@ async def reader(
             and initial_page == context.publication.page_count,
             "progress_updated_at": int(state.progress_updated_at.timestamp() * 1000)
             if state.progress_updated_at
-            else 0,
-            "mode_updated_at": int(state.mode_updated_at.timestamp() * 1000)
-            if state.mode_updated_at
             else 0,
         },
     )
@@ -586,12 +704,14 @@ async def library_metadata_page(
         library_id=library_id,
         category="manga",
         query=(q or "").strip() or None,
+        visibility=CatalogVisibility.ALL,
     )
     states = await run_in_threadpool(container.repository.series_metadata_states)
     all_items = await run_in_threadpool(
         container.repository.catalog_series,
         library_id=library_id,
         category="manga",
+        visibility=CatalogVisibility.ALL,
     )
     unmatched_count = sum(
         1
@@ -900,6 +1020,7 @@ async def library_bulk_metadata_lookup(
             _container(request).repository.catalog_series,
             library_id=library_id,
             category=category,
+            visibility=CatalogVisibility.ALL,
         )
     }
     if category.casefold() != "manga" or any(
@@ -939,7 +1060,10 @@ async def library_auto_match_metadata(
             request, library_id, "manga", error="A metadata job is already running."
         )
     items = await run_in_threadpool(
-        container.repository.catalog_series, library_id=library_id, category="manga"
+        container.repository.catalog_series,
+        library_id=library_id,
+        category="manga",
+        visibility=CatalogVisibility.ALL,
     )
     if not items:
         return await _admin_redirect(
@@ -1345,7 +1469,11 @@ def _grant_key(grant: AccessGrant) -> str:
 
 
 async def _managed_library_named(container, name: str, scope):
-    visible = dict(await run_in_threadpool(container.repository.libraries, scope))
+    visible = dict(
+        await run_in_threadpool(
+            container.repository.libraries, scope, CatalogVisibility.ALL
+        )
+    )
     if name not in visible:
         return None
     libraries = await run_in_threadpool(container.repository.managed_libraries)
@@ -1371,8 +1499,21 @@ def _series_cards(series_items, metadata_by_series) -> list[dict[str, object]]:
     ]
 
 
-def _search_url(query: str, page: int) -> str:
-    return f"/?{urlencode({'q': query, 'page': page})}"
+def _search_url(
+    query: str, page: int, visibility: CatalogVisibility = CatalogVisibility.PUBLIC
+) -> str:
+    root = "/private" if visibility == CatalogVisibility.PRIVATE else "/"
+    return f"{root}?{urlencode({'q': query, 'page': page})}"
+
+
+def _collection_context(visibility: CatalogVisibility) -> dict[str, object]:
+    private = visibility == CatalogVisibility.PRIVATE
+    return {
+        "private_collection": private,
+        "catalog_root": "/private" if private else "/",
+        "library_prefix": "/private/libraries" if private else "/libraries",
+        "opds_url": ("/opds/v2/private.json" if private else "/opds/v2/catalog.json"),
+    }
 
 
 @router.get("/admin/librarian", response_class=HTMLResponse)
