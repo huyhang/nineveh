@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
-from collections.abc import Collection
+from collections.abc import Collection, Coroutine
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -26,6 +27,7 @@ from .catalog import ArchiveInspector, CatalogScanner, LibraryService, SeriesSer
 from .config import Settings, SettingsService
 from .database import SQLiteRepository
 from .deployment import discarded_forwarded_proto, proxy_trust_advice
+from .domain import MountHealth, ScanReport
 from .http_api import router as api_router
 from .http_web import router as web_router
 from .librarian import AuditTrail, IngestService, LibrarianAuth, LibrarianService
@@ -49,7 +51,9 @@ from .ports import (
 )
 from .reader import ReaderService, SpreadDetectionService
 from .restart import DisabledRestartController, ProcessRestartController
+from .search import CatalogSearchService
 from .spreads import spread_detector
+from .storage import MountService, StoragePathResolver
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +82,8 @@ class Container:
     librarian_auth: LibrarianAuth
     librarian: LibrarianService
     ingest: IngestService
+    mounts: MountService
+    search: CatalogSearchService
     metadata: MetadataService | None = None
     spreads: SpreadDetectionService | None = None
 
@@ -90,7 +96,13 @@ def build_container(settings: Settings) -> Container:
     repository.initialize()
     configuration = SettingsService(settings, repository)
     effective = configuration.activate()
-    archives = ArchiveService(effective)
+    # One resolver, shared by everything that touches media, so a mount is
+    # described in exactly one place.
+    mounts = MountService(repository, effective.state_dir, effective.data_dir)
+    mounts.initialize()
+    paths = StoragePathResolver(repository, effective.data_dir)
+    libraries = LibraryService(repository, paths)
+    archives = ArchiveService(effective, paths)
     audit = AuditTrail(repository)
     limiter = PersistentRateLimiter(repository, configuration.mangabaka_request_limit)
     spreads = SpreadDetectionService(
@@ -104,7 +116,7 @@ def build_container(settings: Settings) -> Container:
         auth=AuthService(repository, effective.session_hours, effective.hash_workers),
         authorization=GrantPolicy(repository),
         scanner=CatalogScanner(
-            effective.data_dir, repository, ArchiveInspector(effective)
+            repository, ArchiveInspector(effective), paths, libraries
         ),
         archives=archives,
         thumbnails=ThumbnailService(
@@ -120,7 +132,7 @@ def build_container(settings: Settings) -> Container:
         page_cache=PageCacheService(effective, archives),
         opds=OpdsBuilder(effective.service_title),
         access=AccessService(repository),
-        libraries=LibraryService(effective.data_dir, repository),
+        libraries=libraries,
         series=SeriesService(repository),
         configuration=configuration,
         restarter=ProcessRestartController()
@@ -131,12 +143,14 @@ def build_container(settings: Settings) -> Container:
         librarian_auth=LibrarianAuth(repository, audit),
         librarian=LibrarianService(repository),
         ingest=IngestService(
-            effective.data_dir,
             effective.ingest_staging_dir,
             repository,
             ArchiveInspector(effective),
             effective.max_upload_bytes,
+            paths,
         ),
+        mounts=mounts,
+        search=CatalogSearchService(repository, effective.feed_page_size),
         metadata=MetadataService(
             repository,
             MangaBakaProvider(UrllibTransport(), limiter),
@@ -170,6 +184,9 @@ def create_app(
             directory.mkdir(parents=True, exist_ok=True)
         _discard_stale_ranges(configured.range_dir)
         _discard_flat_candidate_covers(configured.metadata_cover_dir)
+        # The configured root still has to exist: a mistyped bind mount should
+        # stop the container, not quietly serve an empty catalog. Mounts added
+        # later are the administrator's to fix, so those only warn.
         if not configured.data_dir.is_dir():
             raise RuntimeError(f"Data directory does not exist: {configured.data_dir}")
         advice = await asyncio.to_thread(
@@ -178,6 +195,10 @@ def create_app(
         if advice:
             LOGGER.warning("%s", advice)
         await asyncio.to_thread(container.repository.initialize)
+        await asyncio.to_thread(container.mounts.initialize)
+        for status in await asyncio.to_thread(container.mounts.statuses):
+            if status.detail and status.health is not MountHealth.DISCONNECTED:
+                LOGGER.warning("%s: %s", status.mount.name, status.detail)
         await asyncio.to_thread(container.libraries.initialize)
         if await asyncio.to_thread(container.repository.user_count) == 0:
             await asyncio.to_thread(
@@ -227,15 +248,13 @@ def create_app(
     application.state.untrusted_proxy = None
 
     def start_scan(library_id: str | None = None) -> bool:
-        current = application.state.scan_task
-        if current is not None and not current.done():
-            return False
-        application.state.scan_task = asyncio.create_task(
-            _run_scan(application, library_id)
-        )
-        return True
+        return _start_scan_task(application, _run_scan(application, library_id))
+
+    def start_mount_scan(mount_id: str) -> bool:
+        return _start_scan_task(application, _run_mount_scan(application, mount_id))
 
     application.state.start_scan = start_scan
+    application.state.start_mount_scan = start_mount_scan
 
     def start_metadata_lookup(series_ids: list[str]) -> bool:
         current = application.state.metadata_task
@@ -379,7 +398,15 @@ CONTRACT_SLICES: dict[str, frozenset[str]] = {
     # stay out; the OPDS authentication document and `/auth/me` already tell
     # an app whether a server is Nineveh and whether its credentials work.
     "app": frozenset(
-        {"authentication", "opds", "pages", "publications", "reader", "series"}
+        {
+            "authentication",
+            "opds",
+            "pages",
+            "publications",
+            "reader",
+            "search",
+            "series",
+        }
     ),
 }
 
@@ -510,25 +537,49 @@ async def _drain_scan(scan_task: asyncio.Task | None) -> None:
         LOGGER.exception("Catalog scan failed during shutdown")
 
 
+def _start_scan_task(application: FastAPI, work: Coroutine[Any, Any, None]) -> bool:
+    """One scan at a time, whatever started it."""
+    current = application.state.scan_task
+    if current is not None and not current.done():
+        work.close()
+        return False
+    application.state.scan_task = asyncio.create_task(work)
+    return True
+
+
 async def _run_scan(application: FastAPI, library_id: str | None = None) -> None:
     container = application.state.container
     try:
         report = await asyncio.to_thread(container.scanner.scan, library_id)
-        LOGGER.info(
-            "Catalog scan completed: discovered=%d indexed=%d unchanged=%d removed=%d failed=%d",
-            report.discovered,
-            report.indexed,
-            report.unchanged,
-            report.removed,
-            report.failed,
-        )
-        series_ids = await asyncio.to_thread(
-            container.repository.spread_detection_series_ids
-        )
-        if series_ids:
-            application.state.start_spread_detection(series_ids)
+        await _finish_scan(application, report)
     except Exception:
         LOGGER.exception("Background catalog scan failed")
+
+
+async def _run_mount_scan(application: FastAPI, mount_id: str) -> None:
+    container = application.state.container
+    try:
+        report = await asyncio.to_thread(container.scanner.scan_mount, mount_id)
+        await _finish_scan(application, report)
+    except Exception:
+        LOGGER.exception("Background catalog scan failed")
+
+
+async def _finish_scan(application: FastAPI, report: ScanReport) -> None:
+    container = application.state.container
+    LOGGER.info(
+        "Catalog scan completed: discovered=%d indexed=%d unchanged=%d removed=%d failed=%d",
+        report.discovered,
+        report.indexed,
+        report.unchanged,
+        report.removed,
+        report.failed,
+    )
+    series_ids = await asyncio.to_thread(
+        container.repository.spread_detection_series_ids
+    )
+    if series_ids:
+        application.state.start_spread_detection(series_ids)
 
 
 async def _run_metadata_lookup(application: FastAPI, series_ids: list[str]) -> None:

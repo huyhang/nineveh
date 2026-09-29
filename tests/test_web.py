@@ -98,8 +98,13 @@ def test_the_catalog_filters_and_paginates(client: TestClient):
     assert filtered.status_code == 200
     assert "Example Series" in filtered.text
 
-    empty = client.get("/?q=nothing-matches-this")
-    assert "No publications found" in empty.text
+    # Searching from the catalog toolbar lands on the search page.
+    moved = client.get("/?q=nothing-matches-this", follow_redirects=False)
+    assert moved.status_code == 303
+    assert (
+        moved.headers["location"] == "/search?q=nothing-matches-this&collection=public"
+    )
+    assert "No matches" in client.get("/?q=nothing-matches-this").text
 
 
 def test_private_collection_mirrors_library_browsing_and_excludes_default_views(
@@ -120,7 +125,9 @@ def test_private_collection_mirrors_library_browsing_and_excludes_default_views(
     assert moved.status_code == 303
     assert moved.headers["location"] == f"/series/{series.id}"
     assert "Example Series" not in client.get("/").text
-    assert "Example Series" not in client.get("/?q=Example").text
+    assert (
+        "Example Series" not in client.get("/search?q=Example&collection=public").text
+    )
 
     private_root = client.get("/private")
     assert "Private Collection" in private_root.text
@@ -250,11 +257,9 @@ def test_private_search_pages_through_private_series_only(two_series_client):
     for series in client.app.state.container.repository.catalog_series():
         _make_private(client, series.id)
 
-    first = client.get("/private?q=Example")
-    assert 'href="/private?q=Example&amp;page=2"' in first.text
+    first = client.get("/search?q=Example&collection=private")
     assert "Page 1 of 2" in first.text
-    second = client.get("/private?q=Example&page=2")
-    assert 'href="/private?q=Example&amp;page=1"' in second.text
+    second = client.get("/search?q=Example&collection=private&page=2")
     assert "Page 2 of 2" in second.text
     listed = {
         name
@@ -263,7 +268,7 @@ def test_private_search_pages_through_private_series_only(two_series_client):
         if name in page
     }
     assert listed == {"Example Series", "Example Sequel"}
-    assert "No publications found" in client.get("/?q=Example").text
+    assert "No matches" in client.get("/search?q=Example&collection=public").text
 
 
 def test_a_publication_opens_in_the_browser_reader(
@@ -947,7 +952,7 @@ def test_browser_library_and_settings_errors_are_friendly(client: TestClient):
         data={"relative_path": "missing", "csrf_token": token},
         follow_redirects=True,
     )
-    assert "No directory named missing under the data root" in missing_library.text
+    assert "No directory named missing on Primary" in missing_library.text
     missing_scan = client.post(
         "/admin/libraries/missing/scan",
         data={"csrf_token": token},

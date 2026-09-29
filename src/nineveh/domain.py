@@ -24,6 +24,64 @@ class User:
     created_at: datetime
 
 
+DEFAULT_MOUNT_ID = "default"
+
+
+class MountHealth(StrEnum):
+    """What an administrator needs to know about a mount at a glance."""
+
+    HEALTHY = "healthy"
+    DISCONNECTED = "disconnected"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True, slots=True)
+class DataMount:
+    """One storage root the administrator has registered.
+
+    The path is a location *inside the container*: Nineveh can register a
+    directory the deployment already exposed, but it cannot create a bind
+    mount. Libraries are always direct children of a mount root.
+    """
+
+    id: str
+    name: str
+    path: str
+    allow_ingest: bool
+    scan_enabled: bool
+    enabled: bool
+    created_at: datetime
+
+    @property
+    def is_default(self) -> bool:
+        return self.id == DEFAULT_MOUNT_ID
+
+
+@dataclass(frozen=True, slots=True)
+class MountStatus:
+    """A mount plus the filesystem and catalog facts the admin page shows."""
+
+    mount: DataMount
+    health: MountHealth
+    writable: bool
+    detail: str | None
+    library_count: int
+    publication_count: int
+    size: int
+
+    @property
+    def available(self) -> bool:
+        return self.health is MountHealth.HEALTHY
+
+
+@dataclass(frozen=True, slots=True)
+class AvailableDirectory:
+    """A top-level directory on a mount that is not managed as a library yet."""
+
+    mount_id: str
+    name: str
+
+
 @dataclass(frozen=True, slots=True)
 class ManagedLibrary:
     id: str
@@ -31,6 +89,7 @@ class ManagedLibrary:
     relative_path: str
     enabled: bool
     created_at: datetime
+    mount_id: str = DEFAULT_MOUNT_ID
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +127,136 @@ class CatalogSeries:
     publication_count: int
     first_publication_id: str
     first_publication_revision: str
+
+
+READ_UNREAD = "unread"
+READ_IN_PROGRESS = "in-progress"
+READ_COMPLETED = "completed"
+READ_STATES = (READ_UNREAD, READ_IN_PROGRESS, READ_COMPLETED)
+
+SEARCH_SORTS = ("relevance", "title", "recent")
+
+
+@dataclass(frozen=True, slots=True)
+class SearchVolume:
+    """The part of a publication that search can match or link to."""
+
+    id: str
+    title: str
+    filename: str
+
+
+@dataclass(frozen=True, slots=True)
+class SearchDocument:
+    """Everything about one series that search can match or show.
+
+    The repository fills this for a bounded candidate set; ranking is a pure
+    function of these fields, so the engine unit-tests without a database.
+    """
+
+    series: CatalogSeries
+    titles: tuple[str, ...]
+    volumes: tuple[SearchVolume, ...]
+    creators: tuple[str, ...]
+    publishers: tuple[str, ...]
+    tags: tuple[str, ...]
+    description: str | None
+    status: str | None
+    year: str | None
+    read_state: str
+    newest_modified_ns: int
+
+    @property
+    def title(self) -> str:
+        return self.titles[0] if self.titles else self.series.name
+
+
+@dataclass(frozen=True, slots=True)
+class SearchVolumeMatch:
+    volume: SearchVolume
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SearchHit:
+    document: SearchDocument
+    score: float
+    reasons: tuple[str, ...]
+    volumes: tuple[SearchVolumeMatch, ...] = ()
+
+    @property
+    def series(self) -> CatalogSeries:
+        return self.document.series
+
+    @property
+    def title(self) -> str:
+        return self.document.title
+
+
+@dataclass(frozen=True, slots=True)
+class SearchFilters:
+    library_ids: tuple[str, ...] = ()
+    categories: tuple[str, ...] = ()
+    collections: tuple[str, ...] = ()
+    reading_state: str | None = None
+    creators: tuple[str, ...] = ()
+    publishers: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+    statuses: tuple[str, ...] = ()
+    years: tuple[str, ...] = ()
+    sort: str = "relevance"
+
+    @property
+    def active(self) -> bool:
+        return bool(
+            self.library_ids
+            or self.categories
+            or self.collections
+            or self.reading_state
+            or self.creators
+            or self.publishers
+            or self.tags
+            or self.statuses
+            or self.years
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SearchFacet:
+    value: str
+    label: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SearchFacets:
+    """Counts for each filter family, narrowed by every *other* active filter."""
+
+    libraries: tuple[SearchFacet, ...] = ()
+    categories: tuple[SearchFacet, ...] = ()
+    collections: tuple[SearchFacet, ...] = ()
+    creators: tuple[SearchFacet, ...] = ()
+    publishers: tuple[SearchFacet, ...] = ()
+    tags: tuple[SearchFacet, ...] = ()
+    statuses: tuple[SearchFacet, ...] = ()
+    years: tuple[SearchFacet, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SearchPage:
+    results: tuple[SearchHit, ...]
+    total: int
+    page: int
+    page_count: int
+    facets: SearchFacets = SearchFacets()
+
+
+@dataclass(frozen=True, slots=True)
+class SearchSuggestion:
+    kind: str
+    title: str
+    subtitle: str
+    url: str
 
 
 @dataclass(frozen=True, slots=True)

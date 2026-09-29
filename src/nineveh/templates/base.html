@@ -6,6 +6,8 @@
     <title>{% block title %}{{ service_title }}{% endblock %}</title>
     <link rel="icon" href="{{ url_for('static', path='icon.svg') }}" type="image/svg+xml">
     <script src="{{ url_for('static', path='theme.js') }}"></script>
+    {# Global, so "/" jumps to search from any page. #}
+    <script src="{{ url_for('static', path='search.js') }}" defer></script>
     {% block head_scripts %}{% endblock %}
     <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
   </head>
@@ -23,6 +25,7 @@
   {% endmacro %}
   {# One answer to "which section is this?" for both the header tabs and the bottom nav. #}
   {% if request.url.path.startswith('/admin') %}{% set nav_section = 'admin' %}
+  {% elif request.url.path.startswith('/search') %}{% set nav_section = 'search' %}
   {% elif request.url.path.startswith('/private') or (series is defined and series.is_private) %}{% set nav_section = 'private' %}
   {% else %}{% set nav_section = 'library' %}{% endif %}
   <body class="{% if session %}has-mobile-nav{% endif %}">
@@ -35,6 +38,7 @@
         {% if session %}
           <nav class="primary-tabs" aria-label="Main navigation">
             <a href="/" {% if nav_section == 'library' %}aria-current="page"{% endif %}>Library</a>
+            <a href="/search" {% if nav_section == 'search' %}aria-current="page"{% endif %}>Search</a>
             <a href="/private" {% if nav_section == 'private' %}aria-current="page"{% endif %}>Private <span class="private-tab-long">Collection</span></a>
             {% if session.user.is_admin %}<a href="/admin" {% if nav_section == 'admin' %}aria-current="page"{% endif %}>Admin</a>{% endif %}
           </nav>
@@ -65,6 +69,10 @@
         <a href="/" {% if nav_section == 'library' %}aria-current="page"{% endif %}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h6v14H4zM14 5h6v14h-6z"/></svg>
           <span>Library</span>
+        </a>
+        <a href="/search" {% if nav_section == 'search' %}aria-current="page"{% endif %}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg>
+          <span>Search</span>
         </a>
         <a href="/private" {% if nav_section == 'private' %}aria-current="page"{% endif %}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>

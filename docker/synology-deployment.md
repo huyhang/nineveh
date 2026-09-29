@@ -27,6 +27,32 @@ Keep the state directory outside the media tree. The media mount is writable so 
 librarian agent can place validated volumes; scans never modify it, and placement
 never replaces an existing file.
 
+### More than one media root
+
+Nineveh indexes several *data mounts*. Docker attaches the host directory; the
+admin page then registers it. Add a line per root to the service's `volumes`,
+at a stable container path:
+
+```yaml
+volumes:
+  - "/volume1/media/nineveh:/data"
+  - "/volume2/media/archive:/media/archive:ro"
+  - "/volume3/comics:/media/comics"
+```
+
+Recreate the service, then open **Admin → Libraries → Add data mount** and enter
+the *container* path — `/media/archive`, not `/volume2/media/archive`. Choose
+which of its directories to index; a folder whose name is already taken by
+another mount's library needs a display name of its own.
+
+`:ro` is the right default. Leave it off only where librarian ingest is meant
+to be enabled, and turn ingest on for that mount explicitly — mounts are
+read-only to the agent until you do.
+
+Disconnecting a mount in Nineveh hides its libraries and changes nothing in
+Docker; the media, the index and the grants all survive. Remove the Compose
+volume only after disconnecting, or the mount simply reports itself as missing.
+
 ## 2. Determine the service account IDs
 
 Through SSH, run `id USERNAME` for the DSM account that should run Nineveh. Record its numeric UID and GID. That account needs:

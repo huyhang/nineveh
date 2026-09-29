@@ -12,6 +12,7 @@ from conftest import (
     READER_PASSWORD,
     authorization,
     image_bytes,
+    storage,
     wait_for_scan,
     write_cbz,
 )
@@ -20,7 +21,7 @@ from fastapi.testclient import TestClient
 from nineveh import database
 from nineveh.app import create_app
 from nineveh.authorization import AccessService, GrantPolicy
-from nineveh.catalog import InvalidLibrary, LibraryService
+from nineveh.catalog import InvalidLibrary
 from nineveh.config import Settings, SettingsService
 from nineveh.database import SQLiteRepository
 from nineveh.domain import AccessGrant
@@ -281,9 +282,8 @@ def test_library_service_rejects_unsafe_or_unavailable_directories(
     """The shape check and the existence check are separate lines of defence."""
     data = tmp_path / "data"
     data.mkdir()
-    repository = SQLiteRepository(tmp_path / "state.sqlite3")
-    repository.initialize()
-    service = LibraryService(data, repository)
+    settings = Settings(data_dir=data, state_dir=tmp_path / "state")
+    service = storage(settings).libraries
     with pytest.raises(InvalidLibrary, match=reason):
         service.add(name)
 

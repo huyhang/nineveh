@@ -50,6 +50,7 @@ from .ports import (
     MetadataRepository,
 )
 from .reader import publication_order_key
+from .storage import StorageError, StoragePathResolver
 
 SCOPE_OPTIONS: tuple[tuple[str, str, str], ...] = (
     (
@@ -541,13 +542,13 @@ class IngestService:
 
     def __init__(
         self,
-        data_dir: Path,
         staging_dir: Path,
         repository: IngestCatalog,
         inspector: ArchiveValidator,
         max_upload_bytes: int,
+        paths: StoragePathResolver,
     ) -> None:
-        self._data_dir = data_dir
+        self._paths = paths
         self._staging_dir = staging_dir
         self._repository = repository
         self._inspector = inspector
@@ -618,9 +619,12 @@ class IngestService:
         series, library = self._target(token, record.series_id)
         cleaned = validate_filename(filename or record.suggested_filename)
         relative = self._relative(library, series, cleaned)
-        target = self._data_dir.joinpath(
-            library.relative_path, series.category, series.name, cleaned
-        )
+        try:
+            target = self._paths.ingest_path(
+                library, series.category, series.name, cleaned
+            )
+        except StorageError as error:
+            raise LibrarianConflict(str(error)) from error
         staged_file = self._staging_dir / f"{ingest_id}.cbz"
         if not staged_file.is_file():
             raise LibrarianNotFound("Staged upload not found or expired")
@@ -725,7 +729,10 @@ class IngestService:
         for sibling in siblings:
             if sibling.size != size:
                 continue
-            path = self._data_dir / sibling.relative_path
+            try:
+                path = self._paths.publication_path(sibling)
+            except StorageError:  # a disconnected sibling cannot be compared
+                continue
             try:
                 if _file_digest(path) == digest:
                     return sibling.id, sibling.filename

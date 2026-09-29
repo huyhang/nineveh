@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from conftest import image_bytes, write_cbz
+from conftest import image_bytes, storage, write_cbz
 from PIL import Image
 
 from nineveh.archives import (
@@ -20,6 +20,10 @@ from nineveh.archives import (
     ThumbnailService,
 )
 from nineveh.catalog import ArchiveInspector
+
+
+def _archives(settings) -> ArchiveService:
+    return storage(settings, initialize=False).archives(settings)
 
 
 def _scan(settings, archive: Path):
@@ -128,7 +132,7 @@ def test_page_cache_materialises_and_reuses_a_page(library):
     settings, archive = library
     publication, pages = _scan(settings, archive)
     settings.page_cache_dir.mkdir(parents=True, exist_ok=True)
-    cache = PageCacheService(settings, ArchiveService(settings))
+    cache = PageCacheService(settings, _archives(settings))
 
     first = cache.page(publication, pages[0])
     assert first is not None and first.is_file()
@@ -155,7 +159,7 @@ def test_a_single_extract_worker_still_caches(library):
     settings = replace(settings, extract_workers=1)
     publication, pages = _scan(settings, archive)
     settings.page_cache_dir.mkdir(parents=True, exist_ok=True)
-    cache = PageCacheService(settings, ArchiveService(settings))
+    cache = PageCacheService(settings, _archives(settings))
     assert cache.page(publication, pages[0]) is not None
 
 
@@ -163,7 +167,7 @@ def test_page_cache_is_bypassed_when_disabled(library):
     settings, archive = library
     settings = replace(settings, page_cache_mb=0)
     publication, pages = _scan(settings, archive)
-    cache = PageCacheService(settings, ArchiveService(settings))
+    cache = PageCacheService(settings, _archives(settings))
     assert cache.page(publication, pages[0]) is None
 
 
@@ -172,7 +176,7 @@ def test_page_cache_skips_pages_larger_than_the_whole_budget(library):
     publication, pages = _scan(settings, archive)
     tiny = replace(settings, page_cache_mb=1)
     huge = replace(pages[0], uncompressed_size=2 << 20)
-    assert PageCacheService(tiny, ArchiveService(tiny)).page(publication, huge) is None
+    assert PageCacheService(tiny, _archives(tiny)).page(publication, huge) is None
 
 
 # --- ArchiveService --------------------------------------------------------
@@ -183,7 +187,7 @@ def test_archive_path_rejects_a_changed_archive(library):
     publication, _ = _scan(settings, archive)
     archive.write_bytes(archive.read_bytes() + b"tail")
     with pytest.raises(ArchiveChanged):
-        ArchiveService(settings).archive_path(publication)
+        _archives(settings).archive_path(publication)
 
 
 def test_archive_path_rejects_a_missing_archive(library):
@@ -191,7 +195,7 @@ def test_archive_path_rejects_a_missing_archive(library):
     publication, _ = _scan(settings, archive)
     archive.unlink()
     with pytest.raises(ArchiveUnavailable):
-        ArchiveService(settings).archive_path(publication)
+        _archives(settings).archive_path(publication)
 
 
 def test_write_range_copies_only_the_requested_pages(library, tmp_path: Path):
@@ -199,7 +203,7 @@ def test_write_range_copies_only_the_requested_pages(library, tmp_path: Path):
     publication, pages = _scan(settings, archive)
     destination = tmp_path / "range.cbz"
 
-    ArchiveService(settings).write_range(publication, pages[1:], destination)
+    _archives(settings).write_range(publication, pages[1:], destination)
 
     with zipfile.ZipFile(destination) as produced:
         assert produced.namelist() == ["pages/2.png", "pages/10.png"]
@@ -209,7 +213,7 @@ def test_write_range_copies_only_the_requested_pages(library, tmp_path: Path):
 def test_page_dimensions_are_measured_from_the_image(library):
     settings, archive = library
     publication, pages = _scan(settings, archive)
-    measured = ArchiveService(settings).page_dimensions_many(publication, pages)
+    measured = _archives(settings).page_dimensions_many(publication, pages)
     assert measured == {1: (40, 60), 2: (40, 60), 3: (40, 60)}
 
 
@@ -220,7 +224,7 @@ def test_thumbnail_rejects_an_unsupported_width(library):
     settings, archive = library
     publication, pages = _scan(settings, archive)
     service = ThumbnailService(
-        settings, ArchiveService(settings), PillowThumbnailRenderer(10_000_000)
+        settings, _archives(settings), PillowThumbnailRenderer(10_000_000)
     )
     with pytest.raises(ValueError):
         service.cover(publication, pages[0], width=999)
@@ -231,7 +235,7 @@ def test_thumbnail_is_rendered_once_and_then_reused(library):
     publication, pages = _scan(settings, archive)
     settings.thumbnail_dir.mkdir(parents=True, exist_ok=True)
     service = ThumbnailService(
-        settings, ArchiveService(settings), PillowThumbnailRenderer(10_000_000)
+        settings, _archives(settings), PillowThumbnailRenderer(10_000_000)
     )
     first = service.cover(publication, pages[0], width=160)
     assert first.is_file()
@@ -261,7 +265,7 @@ def _wide_library(tmp_path: Path, settings):
 
 def _renditions(settings):
     return PageRenditionService(
-        settings, ArchiveService(settings), PillowThumbnailRenderer(100_000_000)
+        settings, _archives(settings), PillowThumbnailRenderer(100_000_000)
     )
 
 

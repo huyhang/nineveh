@@ -412,6 +412,26 @@
       },
       "LibraryCreate": {
         "properties": {
+          "mount_id": {
+            "default": "default",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Mount Id",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
           "relative_path": {
             "maxLength": 255,
             "minLength": 1,
@@ -786,6 +806,70 @@
           "total_chapters"
         ],
         "title": "MetadataValues",
+        "type": "object"
+      },
+      "MountCreate": {
+        "properties": {
+          "allow_ingest": {
+            "default": false,
+            "title": "Allow Ingest",
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "scan_enabled": {
+            "default": true,
+            "title": "Scan Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "path"
+        ],
+        "title": "MountCreate",
+        "type": "object"
+      },
+      "MountUpdate": {
+        "properties": {
+          "allow_ingest": {
+            "default": false,
+            "title": "Allow Ingest",
+            "type": "boolean"
+          },
+          "name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "scan_enabled": {
+            "default": true,
+            "title": "Scan Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "path"
+        ],
+        "title": "MountUpdate",
         "type": "object"
       },
       "NamedEntry": {
@@ -1376,6 +1460,260 @@
           "updatedAt"
         ],
         "title": "ReadingPosition",
+        "type": "object"
+      },
+      "SearchFacetEntry": {
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "label",
+          "count"
+        ],
+        "title": "SearchFacetEntry",
+        "type": "object"
+      },
+      "SearchFacetGroups": {
+        "properties": {
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Categories",
+            "type": "array"
+          },
+          "collections": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Collections",
+            "type": "array"
+          },
+          "creators": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Creators",
+            "type": "array"
+          },
+          "libraries": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Libraries",
+            "type": "array"
+          },
+          "publishers": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Publishers",
+            "type": "array"
+          },
+          "statuses": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Statuses",
+            "type": "array"
+          },
+          "tags": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "years": {
+            "items": {
+              "$ref": "#/components/schemas/SearchFacetEntry"
+            },
+            "title": "Years",
+            "type": "array"
+          }
+        },
+        "required": [
+          "libraries",
+          "categories",
+          "collections",
+          "creators",
+          "publishers",
+          "tags",
+          "statuses",
+          "years"
+        ],
+        "title": "SearchFacetGroups",
+        "type": "object"
+      },
+      "SearchResultEntry": {
+        "properties": {
+          "matchReasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Matchreasons",
+            "type": "array"
+          },
+          "readState": {
+            "enum": [
+              "unread",
+              "in-progress",
+              "completed"
+            ],
+            "title": "Readstate",
+            "type": "string"
+          },
+          "score": {
+            "title": "Score",
+            "type": "number"
+          },
+          "series": {
+            "$ref": "#/components/schemas/SearchSeries"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "volumes": {
+            "items": {
+              "$ref": "#/components/schemas/SearchVolumeHit"
+            },
+            "title": "Volumes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "series",
+          "title",
+          "score",
+          "readState",
+          "matchReasons",
+          "volumes"
+        ],
+        "title": "SearchResultEntry",
+        "type": "object"
+      },
+      "SearchResults": {
+        "properties": {
+          "facets": {
+            "$ref": "#/components/schemas/SearchFacetGroups"
+          },
+          "page": {
+            "title": "Page",
+            "type": "integer"
+          },
+          "pageCount": {
+            "title": "Pagecount",
+            "type": "integer"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/SearchResultEntry"
+            },
+            "title": "Results",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "page",
+          "pageCount",
+          "results",
+          "facets"
+        ],
+        "title": "SearchResults",
+        "type": "object"
+      },
+      "SearchSeries": {
+        "description": "A series as a search result names it, without the metadata payload.",
+        "properties": {
+          "category": {
+            "enum": [
+              "comics",
+              "manga"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "cover": {
+            "title": "Cover",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "isPrivate": {
+            "title": "Isprivate",
+            "type": "boolean"
+          },
+          "library": {
+            "title": "Library",
+            "type": "string"
+          },
+          "libraryId": {
+            "title": "Libraryid",
+            "type": "string"
+          },
+          "localName": {
+            "title": "Localname",
+            "type": "string"
+          },
+          "publicationCount": {
+            "title": "Publicationcount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "libraryId",
+          "library",
+          "category",
+          "localName",
+          "isPrivate",
+          "publicationCount",
+          "cover"
+        ],
+        "title": "SearchSeries",
+        "type": "object"
+      },
+      "SearchVolumeHit": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "reason"
+        ],
+        "title": "SearchVolumeHit",
         "type": "object"
       },
       "SeriesCandidates": {
@@ -2966,6 +3304,405 @@
           }
         ],
         "summary": "Admin Metadata Batch Lookup",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/mounts": {
+      "post": {
+        "operationId": "add_mount_api_v1_admin_mounts_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MountCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Add Mount Api V1 Admin Mounts Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Add Mount",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/mounts/{mount_id}": {
+      "delete": {
+        "operationId": "forget_mount_api_v1_admin_mounts__mount_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mount_id",
+            "required": true,
+            "schema": {
+              "title": "Mount Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Forget Mount Api V1 Admin Mounts  Mount Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Forget Mount",
+        "tags": [
+          "administration"
+        ]
+      },
+      "put": {
+        "operationId": "update_mount_api_v1_admin_mounts__mount_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mount_id",
+            "required": true,
+            "schema": {
+              "title": "Mount Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MountUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Mount Api V1 Admin Mounts  Mount Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Update Mount",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/mounts/{mount_id}/disconnect": {
+      "post": {
+        "operationId": "disconnect_mount_api_v1_admin_mounts__mount_id__disconnect_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mount_id",
+            "required": true,
+            "schema": {
+              "title": "Mount Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Disconnect Mount Api V1 Admin Mounts  Mount Id  Disconnect Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Disconnect Mount",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/mounts/{mount_id}/reconnect": {
+      "post": {
+        "operationId": "reconnect_mount_api_v1_admin_mounts__mount_id__reconnect_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mount_id",
+            "required": true,
+            "schema": {
+              "title": "Mount Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reconnect Mount Api V1 Admin Mounts  Mount Id  Reconnect Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Reconnect Mount",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
+    "/api/v1/admin/mounts/{mount_id}/scan": {
+      "post": {
+        "operationId": "scan_mount_api_v1_admin_mounts__mount_id__scan_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mount_id",
+            "required": true,
+            "schema": {
+              "title": "Mount Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Scan Mount Api V1 Admin Mounts  Mount Id  Scan Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Scan Mount",
         "tags": [
           "administration"
         ]
@@ -5413,6 +6150,118 @@
         "summary": "Publication Range",
         "tags": [
           "pages"
+        ]
+      }
+    },
+    "/api/v1/search": {
+      "get": {
+        "description": "Ranked series search, scoped to what the caller may read.",
+        "operationId": "search_catalog_api_v1_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 200,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "default": 1,
+              "minimum": 1,
+              "title": "Page",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResults"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Search Catalog",
+        "tags": [
+          "search"
+        ]
+      }
+    },
+    "/api/v1/search/suggestions": {
+      "get": {
+        "operationId": "search_suggestions_api_v1_search_suggestions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 2,
+              "title": "Q",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Search Suggestions Api V1 Search Suggestions Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Search Suggestions",
+        "tags": [
+          "catalog"
         ]
       }
     },

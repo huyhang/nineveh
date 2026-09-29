@@ -5,15 +5,22 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from .domain import (
+    DEFAULT_MOUNT_ID,
+    READ_COMPLETED,
+    READ_IN_PROGRESS,
+    READ_UNREAD,
     SEVERITY_ORDER,
     AccessGrant,
     CatalogSeries,
     CatalogVisibility,
     CategoryUsage,
+    DataMount,
     LibrarianEvent,
     LibrarianToken,
     LibraryUsage,
@@ -27,6 +34,12 @@ from .domain import (
     ReadingProgress,
     ReadScope,
     ScannedPublication,
+    SearchDocument,
+    SearchFacet,
+    SearchFacets,
+    SearchFilters,
+    SearchSuggestion,
+    SearchVolume,
     SeriesMetadata,
     SeriesMetadataState,
     SeriesMetadataSummary,
@@ -35,7 +48,7 @@ from .domain import (
     User,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 # The release that began recording `ComicInfo.xml` spread markers. Databases
 # older than this need one reinspection pass to pick them up.
 SPREAD_MARKER_VERSION = 4
@@ -48,6 +61,8 @@ SEAM_DETECTION_VERSION = 6
 # wide page may have stored whatever the gutter read first, so every anchor but
 # a wide page's own has to be recomputed.
 WIDE_PAGE_FIRST_VERSION = 9
+# The release that introduced data mounts and the search index.
+MULTI_MOUNT_VERSION = 10
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -72,12 +87,28 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS data_mounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    path TEXT NOT NULL UNIQUE,
+    allow_ingest INTEGER NOT NULL DEFAULT 0,
+    scan_enabled INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- A library's directory name is unique per mount, but its display name is
+-- unique everywhere: it is what OPDS feeds, grants and the reader show, so two
+-- libraries called "Manga" would be indistinguishable to a reader.
 CREATE TABLE IF NOT EXISTS managed_libraries (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-    relative_path TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    relative_path TEXT NOT NULL COLLATE NOCASE,
+    mount_id TEXT NOT NULL DEFAULT 'default' REFERENCES data_mounts(id),
     enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    UNIQUE(mount_id, relative_path)
 );
 
 CREATE TABLE IF NOT EXISTS catalog_series (
@@ -89,9 +120,11 @@ CREATE TABLE IF NOT EXISTS catalog_series (
     UNIQUE(library_id, category, name)
 );
 
+-- Two mounts may each hold a "Manga/comics/Akira" path, so a stored path is
+-- only unique within the library it was found in.
 CREATE TABLE IF NOT EXISTS publications (
     id TEXT PRIMARY KEY,
-    relative_path TEXT NOT NULL UNIQUE,
+    relative_path TEXT NOT NULL,
     library TEXT NOT NULL,
     category TEXT NOT NULL,
     series TEXT NOT NULL,
@@ -106,10 +139,46 @@ CREATE TABLE IF NOT EXISTS publications (
     page_count INTEGER NOT NULL,
     cover_page INTEGER NOT NULL DEFAULT 1,
     library_id TEXT REFERENCES managed_libraries(id),
-    series_id TEXT REFERENCES catalog_series(id)
+    series_id TEXT REFERENCES catalog_series(id),
+    UNIQUE(library_id, relative_path)
 );
 CREATE INDEX IF NOT EXISTS publications_hierarchy
     ON publications(library, category, series, title);
+
+-- One row per series, rebuilt whenever its publications or metadata change.
+-- Retrieval only: the index narrows the catalog to a candidate set, and
+-- `search.py` scores and explains those candidates.
+CREATE VIRTUAL TABLE IF NOT EXISTS catalog_search USING fts5(
+    series_id UNINDEXED,
+    local_title,
+    canonical_title,
+    alternate_titles,
+    creators,
+    publishers,
+    tags,
+    description,
+    volume_titles,
+    filenames,
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+-- The index's own term list, used to correct a misspelled query. Reading it
+-- cannot leak anything: the corrected query still runs under the reader's
+-- grants, so a term nobody may see simply returns nothing.
+CREATE VIRTUAL TABLE IF NOT EXISTS catalog_search_terms
+    USING fts5vocab(catalog_search, 'row');
+
+-- Facet values are stored beside the index rather than parsed out of JSON on
+-- every query, so counting them is a plain indexed join.
+CREATE TABLE IF NOT EXISTS catalog_search_facets (
+    series_id TEXT NOT NULL REFERENCES catalog_series(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    normalized TEXT NOT NULL,
+    PRIMARY KEY(series_id, kind, normalized)
+);
+CREATE INDEX IF NOT EXISTS catalog_search_facets_lookup
+    ON catalog_search_facets(kind, normalized, series_id);
 
 CREATE TABLE IF NOT EXISTS pages (
     publication_id TEXT NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
@@ -282,6 +351,11 @@ CREATE INDEX IF NOT EXISTS librarian_events_token
 SCOPE_INDEX = """
 CREATE INDEX IF NOT EXISTS publications_scope
     ON publications(library_id, category, series_id);
+-- Search asks "does this series have a reachable volume?" once per candidate
+-- row, and the composite index above cannot answer it without a library to
+-- lead with.
+CREATE INDEX IF NOT EXISTS publications_series
+    ON publications(series_id);
 """
 
 
@@ -320,7 +394,13 @@ class SQLiteRepository:
             # to survive being run again on the next start rather than wedging
             # the database on "table already exists".
             connection.executescript(SCHEMA)
+            # Order matters on an old database: the identity columns have to
+            # exist before the table that carries them is rebuilt, and the
+            # default mount has to exist before a library can reference it.
             self._ensure_scope_columns(connection)
+            self._ensure_default_mount_row(connection)
+            self._ensure_library_mount_column(connection)
+            self._ensure_publication_path_scope(connection)
             self._ensure_series_private_column(connection)
             self._ensure_progress_mode_column(connection)
             self._ensure_session_flash_columns(connection)
@@ -344,7 +424,113 @@ class SQLiteRepository:
                 )
             if 0 < version < SCHEMA_VERSION:
                 self._backfill_scope(connection)
+            if version < MULTI_MOUNT_VERSION:
+                # The search index is derived, so it is always safe to build
+                # from scratch; a fresh database starts empty either way.
+                self._rebuild_search_index(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    @staticmethod
+    def _ensure_default_mount_row(connection: sqlite3.Connection) -> None:
+        """Every library belongs to a mount, so one always exists.
+
+        The path here is only a placeholder; `ensure_default_mount` replaces it
+        with the directory this deployment is actually configured with.
+        """
+        now = _now_iso()
+        connection.execute(
+            """
+            INSERT INTO data_mounts(
+                id, name, path, allow_ingest, scan_enabled, enabled,
+                created_at, updated_at
+            ) VALUES (?, 'Primary', '/data', 1, 1, 1, ?, ?)
+            ON CONFLICT(id) DO NOTHING
+            """,
+            (DEFAULT_MOUNT_ID, now, now),
+        )
+
+    @staticmethod
+    def _ensure_library_mount_column(connection: sqlite3.Connection) -> None:
+        """Pre-mount libraries all lived under the single configured root.
+
+        They move to the default mount, and uniqueness moves from the bare
+        directory name to the mount it was found on: two disks may each hold a
+        directory called "Manga".
+        """
+        present = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(managed_libraries)"
+            ).fetchall()
+        }
+        has_mount = "mount_id" in present
+        if has_mount and not _unique_index_on(
+            connection, "managed_libraries", ["relative_path"]
+        ):
+            return
+        # The column and the constraint move together, in one rebuild: SQLite
+        # will not `ALTER TABLE ADD COLUMN` a REFERENCES column that has a
+        # non-NULL default, and it cannot drop the old UNIQUE either.
+        mount = "mount_id" if has_mount else f"'{DEFAULT_MOUNT_ID}'"
+        _rebuild_table(
+            connection,
+            "managed_libraries",
+            f"""
+            CREATE TABLE managed_libraries_rebuilt (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                relative_path TEXT NOT NULL COLLATE NOCASE,
+                mount_id TEXT NOT NULL DEFAULT '{DEFAULT_MOUNT_ID}'
+                    REFERENCES data_mounts(id),
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(mount_id, relative_path)
+            );
+            INSERT INTO managed_libraries_rebuilt
+                SELECT id, name, relative_path, {mount}, enabled, created_at
+                FROM managed_libraries;
+            """,
+        )
+
+    @staticmethod
+    def _ensure_publication_path_scope(connection: sqlite3.Connection) -> None:
+        """A stored path is unique within its library, not across the catalog."""
+        if not _unique_index_on(connection, "publications", ["relative_path"]):
+            return
+        _rebuild_table(
+            connection,
+            "publications",
+            """
+            CREATE TABLE publications_rebuilt (
+                id TEXT PRIMARY KEY,
+                relative_path TEXT NOT NULL,
+                library TEXT NOT NULL,
+                category TEXT NOT NULL,
+                series TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                title TEXT NOT NULL,
+                number TEXT,
+                description TEXT,
+                authors_json TEXT NOT NULL DEFAULT '[]',
+                modified_ns INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                revision TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                cover_page INTEGER NOT NULL DEFAULT 1,
+                library_id TEXT REFERENCES managed_libraries(id),
+                series_id TEXT REFERENCES catalog_series(id),
+                UNIQUE(library_id, relative_path)
+            );
+            INSERT INTO publications_rebuilt
+                SELECT id, relative_path, library, category, series, filename,
+                       title, number, description, authors_json, modified_ns,
+                       size, revision, page_count, cover_page, library_id,
+                       series_id
+                FROM publications;
+            CREATE INDEX IF NOT EXISTS publications_hierarchy
+                ON publications(library, category, series, title);
+            """,
+        )
 
     @staticmethod
     def _ensure_scope_columns(connection: sqlite3.Connection) -> None:
@@ -506,36 +692,254 @@ class SQLiteRepository:
         with self._connect() as connection:
             return connection.execute("SELECT 1").fetchone()[0] == 1
 
-    def initialize_libraries(self, relative_paths: list[str]) -> None:
-        """Register the initial data-root children once, preserving later removals."""
+    def initialize_libraries(
+        self, relative_paths: list[str], mount_id: str = DEFAULT_MOUNT_ID
+    ) -> None:
+        """Register a mount's children once, preserving later removals.
+
+        A mount is only auto-populated the first time it is seen. After that
+        an administrator's decision to remove a library has to stick, even
+        across a rescan.
+        """
+        marker = f"libraries_initialized:{mount_id}"
         with self._connect() as connection:
-            initialized = connection.execute(
-                "SELECT 1 FROM application_metadata WHERE key = 'libraries_initialized'"
-            ).fetchone()
-            if initialized:
+            if self._already_initialized(connection, mount_id, marker):
                 return
             now = _now_iso()
+            # Two mounts can hold the same directory name, and display names
+            # are unique, so the second one waits for an administrator to name
+            # it rather than failing the whole registration.
             connection.executemany(
                 """
-                INSERT INTO managed_libraries(id, name, relative_path, enabled, created_at)
-                VALUES (?, ?, ?, 1, ?)
+                INSERT OR IGNORE INTO managed_libraries(
+                    id, name, relative_path, mount_id, enabled, created_at
+                ) VALUES (?, ?, ?, ?, 1, ?)
                 """,
-                [(str(uuid.uuid4()), path, path, now) for path in relative_paths],
+                [
+                    (str(uuid.uuid4()), path, path, mount_id, now)
+                    for path in relative_paths
+                ],
             )
             connection.execute(
-                """
-                INSERT INTO application_metadata(key, value)
-                VALUES ('libraries_initialized', '1')
-                """
+                "INSERT OR IGNORE INTO application_metadata(key, value) VALUES (?, '1')",
+                (marker,),
             )
 
-    def managed_libraries(
-        self, *, include_disabled: bool = False
-    ) -> list[ManagedLibrary]:
+    @staticmethod
+    def _already_initialized(
+        connection: sqlite3.Connection, mount_id: str, marker: str
+    ) -> bool:
+        keys = [marker]
+        if mount_id == DEFAULT_MOUNT_ID:
+            # Databases from before mounts recorded the unqualified marker.
+            keys.append("libraries_initialized")
+        placeholders = ", ".join("?" for _ in keys)
+        return bool(
+            connection.execute(
+                f"SELECT 1 FROM application_metadata WHERE key IN ({placeholders})",
+                keys,
+            ).fetchone()
+        )
+
+    def ensure_default_mount(self, path: str) -> DataMount:
+        """Point the original mount at the configured data directory."""
+        with self._connect() as connection:
+            self._ensure_default_mount_row(connection)
+            connection.execute(
+                "UPDATE data_mounts SET path = ?, updated_at = ? "
+                "WHERE id = ? AND path <> ?",
+                (path, _now_iso(), DEFAULT_MOUNT_ID, path),
+            )
+        mount = self.data_mount(DEFAULT_MOUNT_ID)
+        if mount is None:  # pragma: no cover - guaranteed by the insert above
+            raise RuntimeError("The default data mount disappeared")
+        return mount
+
+    def data_mounts(self, *, include_disabled: bool = True) -> list[DataMount]:
         where = "" if include_disabled else " WHERE enabled = 1"
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM managed_libraries{where} ORDER BY name COLLATE NOCASE"
+                f"SELECT * FROM data_mounts{where} "
+                "ORDER BY id <> 'default', name COLLATE NOCASE"
+            ).fetchall()
+        return [self._data_mount(row) for row in rows]
+
+    def data_mount(self, mount_id: str) -> DataMount | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM data_mounts WHERE id = ?", (mount_id,)
+            ).fetchone()
+        return self._data_mount(row) if row else None
+
+    def add_data_mount(
+        self,
+        name: str,
+        path: str,
+        *,
+        allow_ingest: bool = False,
+        scan_enabled: bool = True,
+    ) -> DataMount:
+        mount_id = str(uuid.uuid4())
+        now = _now_iso()
+        with self._connect() as connection:
+            self._insert_data_mount(
+                connection, mount_id, name, path, allow_ingest, scan_enabled, now
+            )
+        mount = self.data_mount(mount_id)
+        if mount is None:  # pragma: no cover - guaranteed by the insert above
+            raise RuntimeError("The new data mount disappeared")
+        return mount
+
+    @staticmethod
+    def _insert_data_mount(
+        connection: sqlite3.Connection,
+        mount_id: str,
+        name: str,
+        path: str,
+        allow_ingest: bool,
+        scan_enabled: bool,
+        now: str,
+    ) -> None:
+        try:
+            connection.execute(
+                """
+                INSERT INTO data_mounts(
+                    id, name, path, allow_ingest, scan_enabled, enabled,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (mount_id, name, path, int(allow_ingest), int(scan_enabled), now, now),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(_mount_conflict(connection, name, path)) from error
+
+    def update_data_mount(
+        self,
+        mount_id: str,
+        *,
+        name: str,
+        path: str,
+        allow_ingest: bool,
+        scan_enabled: bool,
+    ) -> DataMount | None:
+        with self._connect() as connection:
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE data_mounts SET name = ?, path = ?, allow_ingest = ?,
+                        scan_enabled = ?, updated_at = ? WHERE id = ?
+                    """,
+                    (
+                        name,
+                        path,
+                        int(allow_ingest),
+                        int(scan_enabled),
+                        _now_iso(),
+                        mount_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(
+                    _mount_conflict(connection, name, path, exclude_id=mount_id)
+                ) from error
+            changed = bool(cursor.rowcount)
+        return self.data_mount(mount_id) if changed else None
+
+    def set_data_mount_enabled(self, mount_id: str, enabled: bool) -> DataMount | None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE data_mounts SET enabled = ?, updated_at = ? WHERE id = ?",
+                (int(enabled), _now_iso(), mount_id),
+            )
+            changed = bool(cursor.rowcount)
+        return self.data_mount(mount_id) if changed else None
+
+    def forget_data_mount(self, mount_id: str) -> DataMount | None:
+        """Drop the mount and everything the catalog recorded about it.
+
+        Media files are never touched: only index rows, grants and the derived
+        search entries go, which is exactly what re-adding the mount rebuilds.
+        """
+        mount = self.data_mount(mount_id)
+        if mount is None:
+            return None
+        with self._connect() as connection:
+            library_ids = [
+                row["id"]
+                for row in connection.execute(
+                    "SELECT id FROM managed_libraries WHERE mount_id = ?", (mount_id,)
+                ).fetchall()
+            ]
+            for library_id in library_ids:
+                self._forget_library_rows(connection, library_id)
+            connection.execute(
+                "DELETE FROM managed_libraries WHERE mount_id = ?", (mount_id,)
+            )
+            connection.execute("DELETE FROM data_mounts WHERE id = ?", (mount_id,))
+        return mount
+
+    @staticmethod
+    def _forget_library_rows(connection: sqlite3.Connection, library_id: str) -> None:
+        series_ids = [
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM catalog_series WHERE library_id = ?", (library_id,)
+            ).fetchall()
+        ]
+        connection.executemany(
+            "DELETE FROM catalog_search WHERE series_id = ?",
+            ((series_id,) for series_id in series_ids),
+        )
+        connection.execute(
+            "DELETE FROM publications WHERE library_id = ?", (library_id,)
+        )
+        connection.execute(
+            "DELETE FROM access_grants WHERE library_id = ?", (library_id,)
+        )
+        connection.execute(
+            "DELETE FROM catalog_series WHERE library_id = ?", (library_id,)
+        )
+
+    def mount_usage(self) -> dict[str, tuple[int, int, int]]:
+        """Library count, publication count and indexed bytes per mount."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT managed_libraries.mount_id AS mount_id,
+                       COUNT(DISTINCT managed_libraries.id) AS libraries,
+                       COUNT(publications.id) AS publications,
+                       COALESCE(SUM(publications.size), 0) AS size
+                FROM managed_libraries
+                LEFT JOIN publications
+                  ON publications.library_id = managed_libraries.id
+                WHERE managed_libraries.enabled = 1
+                GROUP BY managed_libraries.mount_id
+                """
+            ).fetchall()
+        return {
+            row["mount_id"]: (row["libraries"], row["publications"], row["size"])
+            for row in rows
+        }
+
+    def managed_libraries(
+        self, *, include_disabled: bool = False, mount_id: str | None = None
+    ) -> list[ManagedLibrary]:
+        clauses = []
+        parameters: list[object] = []
+        if not include_disabled:
+            # A disconnected mount hides its libraries from every reader-facing
+            # query without touching a single stored row.
+            clauses.append("managed_libraries.enabled = 1 AND data_mounts.enabled = 1")
+        if mount_id is not None:
+            clauses.append("managed_libraries.mount_id = ?")
+            parameters.append(mount_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT managed_libraries.* FROM managed_libraries "
+                "JOIN data_mounts ON data_mounts.id = managed_libraries.mount_id"
+                f"{where} ORDER BY managed_libraries.name COLLATE NOCASE",
+                parameters,
             ).fetchall()
         return [self._library(row) for row in rows]
 
@@ -546,35 +950,60 @@ class SQLiteRepository:
             ).fetchone()
         return self._library(row) if row else None
 
-    def add_library(self, relative_path: str) -> ManagedLibrary:
+    def add_library(
+        self,
+        relative_path: str,
+        mount_id: str = DEFAULT_MOUNT_ID,
+        name: str | None = None,
+    ) -> ManagedLibrary:
+        display_name = name or relative_path
         with self._connect() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM managed_libraries
-                WHERE relative_path = ? COLLATE NOCASE
+                WHERE mount_id = ? AND relative_path = ? COLLATE NOCASE
                 """,
-                (relative_path,),
+                (mount_id, relative_path),
             ).fetchone()
-            if row:
-                connection.execute(
-                    "UPDATE managed_libraries SET enabled = 1 WHERE id = ?",
-                    (row["id"],),
+            try:
+                library_id = self._upsert_library(
+                    connection, row, relative_path, mount_id, display_name
                 )
-                library_id = row["id"]
-            else:
-                library_id = str(uuid.uuid4())
-                connection.execute(
-                    """
-                    INSERT INTO managed_libraries(
-                        id, name, relative_path, enabled, created_at
-                    ) VALUES (?, ?, ?, 1, ?)
-                    """,
-                    (library_id, relative_path, relative_path, _now_iso()),
-                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(
+                    f"Another library is already called “{display_name}”. "
+                    "Give this one a different display name."
+                ) from error
         library = self.managed_library(library_id)
-        if library is None:
+        if library is None:  # pragma: no cover - guaranteed by the upsert above
             raise RuntimeError(f"Managed library disappeared during add: {library_id}")
         return library
+
+    @staticmethod
+    def _upsert_library(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row | None,
+        relative_path: str,
+        mount_id: str,
+        display_name: str,
+    ) -> str:
+        """Re-adding a removed library keeps its identity, grants and history."""
+        if row:
+            connection.execute(
+                "UPDATE managed_libraries SET enabled = 1, name = ? WHERE id = ?",
+                (display_name, row["id"]),
+            )
+            return str(row["id"])
+        library_id = str(uuid.uuid4())
+        connection.execute(
+            """
+            INSERT INTO managed_libraries(
+                id, name, relative_path, mount_id, enabled, created_at
+            ) VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (library_id, display_name, relative_path, mount_id, _now_iso()),
+        )
+        return library_id
 
     def remove_library(self, library_id: str) -> ManagedLibrary | None:
         library = self.managed_library(library_id)
@@ -862,6 +1291,7 @@ class SQLiteRepository:
                     provider_updated_at,
                 ),
             )
+            self._reindex_series(connection, series_id)
         metadata = self.series_metadata(series_id)
         if metadata is None:  # pragma: no cover - guarded by the transaction
             raise RuntimeError("Series metadata disappeared after save")
@@ -877,6 +1307,7 @@ class SQLiteRepository:
             )
             if cursor.rowcount == 0:
                 raise ValueError("Series metadata not found")
+            self._reindex_series(connection, series_id)
         metadata = self.series_metadata(series_id)
         if metadata is None:  # pragma: no cover - guarded by rowcount
             raise RuntimeError("Series metadata disappeared after update")
@@ -887,6 +1318,7 @@ class SQLiteRepository:
             connection.execute(
                 "DELETE FROM series_metadata WHERE series_id = ?", (series_id,)
             )
+            self._reindex_series(connection, series_id)
 
     def metadata_lookup(self, series_id: str) -> MetadataLookup:
         with self._connect() as connection:
@@ -1321,6 +1753,19 @@ class SQLiteRepository:
             relative_path=row["relative_path"],
             enabled=bool(row["enabled"]),
             created_at=datetime.fromisoformat(row["created_at"]),
+            mount_id=row["mount_id"],
+        )
+
+    @staticmethod
+    def _data_mount(row: sqlite3.Row) -> DataMount:
+        return DataMount(
+            id=row["id"],
+            name=row["name"],
+            path=row["path"],
+            allow_ingest=bool(row["allow_ingest"]),
+            scan_enabled=bool(row["scan_enabled"]),
+            enabled=bool(row["enabled"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
         )
 
     def user_count(self) -> int:
@@ -1467,10 +1912,15 @@ class SQLiteRepository:
             ).fetchone()
         return self._publication(row) if row else None
 
-    def publication_by_path(self, relative_path: str) -> Publication | None:
+    def publication_by_path(
+        self, relative_path: str, library_id: str | None = None
+    ) -> Publication | None:
+        clause = " AND library_id = ?" if library_id else ""
+        parameters = (relative_path, library_id) if library_id else (relative_path,)
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT * FROM publications WHERE relative_path = ?", (relative_path,)
+                f"SELECT * FROM publications WHERE relative_path = ?{clause}",
+                parameters,
             ).fetchone()
         return self._publication(row) if row else None
 
@@ -1620,6 +2070,12 @@ class SQLiteRepository:
         with self._connect() as connection:
             self._write_publication(connection, scanned.publication)
             self._replace_pages(connection, scanned.publication.id, scanned.pages)
+            series_id = connection.execute(
+                "SELECT series_id FROM publications WHERE id = ?",
+                (scanned.publication.id,),
+            ).fetchone()
+            if series_id and series_id["series_id"]:
+                self._reindex_series(connection, series_id["series_id"])
 
     @staticmethod
     def _write_publication(connection: sqlite3.Connection, item: Publication) -> None:
@@ -1633,7 +2089,7 @@ class SQLiteRepository:
                     description, authors_json, modified_ns, size, revision, page_count,
                     cover_page, library_id, series_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(relative_path) DO UPDATE SET
+                ON CONFLICT(library_id, relative_path) DO UPDATE SET
                     library=excluded.library, category=excluded.category, series=excluded.series,
                     filename=excluded.filename, title=excluded.title, number=excluded.number,
                     description=excluded.description, authors_json=excluded.authors_json,
@@ -1678,10 +2134,17 @@ class SQLiteRepository:
                 library_id = str(uuid.uuid4())
                 connection.execute(
                     """
-                    INSERT INTO managed_libraries(id, name, relative_path, enabled, created_at)
-                    VALUES (?, ?, ?, 1, ?)
+                    INSERT INTO managed_libraries(
+                        id, name, relative_path, mount_id, enabled, created_at
+                    ) VALUES (?, ?, ?, ?, 1, ?)
                     """,
-                    (library_id, item.library, item.library, _now_iso()),
+                    (
+                        library_id,
+                        item.library,
+                        item.library,
+                        DEFAULT_MOUNT_ID,
+                        _now_iso(),
+                    ),
                 )
         series_id = item.series_id
         if not series_id:
@@ -1748,29 +2211,379 @@ class SQLiteRepository:
                 "INSERT INTO seen_paths(path) VALUES (?)",
                 ((path,) for path in relative_paths),
             )
-            # `cursor.rowcount` counts only rows this statement deleted; using the
-            # connection's `total_changes` would also count the cascaded page rows.
             library_clause = " AND library_id = ?" if library_id else ""
             parameters = (library_id,) if library_id else ()
+            touched = [
+                row["series_id"]
+                for row in connection.execute(
+                    "SELECT DISTINCT series_id FROM publications "
+                    "WHERE relative_path NOT IN (SELECT path FROM seen_paths)"
+                    f"{library_clause} AND series_id IS NOT NULL",
+                    parameters,
+                ).fetchall()
+            ]
+            # `cursor.rowcount` counts only rows this statement deleted; using the
+            # connection's `total_changes` would also count the cascaded page rows.
             cursor = connection.execute(
                 "DELETE FROM publications "
                 "WHERE relative_path NOT IN (SELECT path FROM seen_paths)"
                 f"{library_clause}",
                 parameters,
             )
+            for series_id in touched:
+                self._reindex_series(connection, series_id)
             return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # Search index
+    #
+    # The index is derived from publications and stored metadata, and is
+    # rebuilt for one series whenever either changes. It answers "which
+    # series could match?" only; `search.py` decides how well they match.
+    # ------------------------------------------------------------------
+
+    def rebuild_search_index(self) -> None:
+        with self._connect() as connection:
+            self._rebuild_search_index(connection)
+
+    @staticmethod
+    def _rebuild_search_index(connection: sqlite3.Connection) -> None:
+        connection.execute("DELETE FROM catalog_search")
+        connection.execute("DELETE FROM catalog_search_facets")
+        rows = connection.execute(_SEARCH_SOURCE.format(where="")).fetchall()
+        SQLiteRepository._write_index_rows(connection, rows)
+
+    @staticmethod
+    def _reindex_series(connection: sqlite3.Connection, series_id: str) -> None:
+        connection.execute(
+            "DELETE FROM catalog_search WHERE series_id = ?", (series_id,)
+        )
+        connection.execute(
+            "DELETE FROM catalog_search_facets WHERE series_id = ?", (series_id,)
+        )
+        rows = connection.execute(
+            _SEARCH_SOURCE.format(where="WHERE catalog_series.id = ?"), (series_id,)
+        ).fetchall()
+        SQLiteRepository._write_index_rows(connection, rows)
+
+    @staticmethod
+    def _write_index_rows(
+        connection: sqlite3.Connection, rows: list[sqlite3.Row]
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO catalog_search(
+                series_id, local_title, canonical_title, alternate_titles,
+                creators, publishers, tags, description, volume_titles, filenames
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_index_row(row) for row in rows],
+        )
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO
+                catalog_search_facets(series_id, kind, value, normalized)
+            VALUES (?, ?, ?, ?)
+            """,
+            [facet for row in rows for facet in _facet_rows(row)],
+        )
+
+    def search_vocabulary(self) -> list[str]:
+        with self._connect() as connection:
+            return [
+                row["term"]
+                for row in connection.execute(
+                    "SELECT term FROM catalog_search_terms WHERE length(term) >= 4"
+                ).fetchall()
+            ]
+
+    def search_candidates(
+        self,
+        terms: tuple[str, ...],
+        *,
+        filters: SearchFilters,
+        scope: ReadScope,
+        user_id: str,
+        limit: int,
+    ) -> tuple[list[SearchDocument], int]:
+        source, parameters = self._search_source(terms, filters, scope, user_id)
+        with self._connect() as connection:
+            total = int(
+                connection.execute(f"SELECT COUNT(*) {source}", parameters).fetchone()[
+                    0
+                ]
+            )
+            if not total:
+                return [], 0
+            rows = connection.execute(
+                f"""
+                SELECT catalog_series.id AS series_id
+                {source}
+                ORDER BY {_candidate_order(terms)}
+                LIMIT ?
+                """,
+                (*parameters, limit),
+            ).fetchall()
+            documents = self._documents(
+                connection, [row["series_id"] for row in rows], scope, user_id
+            )
+        return documents, total
+
+    def search_facets(
+        self,
+        terms: tuple[str, ...],
+        *,
+        filters: SearchFilters,
+        scope: ReadScope,
+        user_id: str,
+    ) -> SearchFacets:
+        """Count each family against every *other* active filter.
+
+        Leaving a family's own selection out is what makes the counts usable:
+        they always say how many results choosing that value would give, so a
+        count is never an invitation to an empty page.
+        """
+        with self._connect() as connection:
+
+            def count(family: str, sql: str, label_sql: str | None = None) -> tuple:
+                source, parameters = self._search_source(
+                    terms, filters, scope, user_id, without=family
+                )
+                return tuple(
+                    SearchFacet(row["value"], row["label"], row["total"])
+                    for row in connection.execute(
+                        f"SELECT {sql} AS value, {label_sql or sql} AS label, "
+                        f"COUNT(DISTINCT catalog_series.id) AS total "
+                        f"{source} "
+                        f"GROUP BY value HAVING value IS NOT NULL AND value <> '' "
+                        f"ORDER BY total DESC, label COLLATE NOCASE",
+                        parameters,
+                    ).fetchall()
+                )
+
+            return SearchFacets(
+                libraries=count(
+                    "library",
+                    "catalog_series.library_id",
+                    "(SELECT name FROM managed_libraries "
+                    " WHERE id = catalog_series.library_id)",
+                ),
+                categories=count("category", "catalog_series.category"),
+                collections=count(
+                    "collection",
+                    "(CASE WHEN catalog_series.is_private THEN 'private' "
+                    " ELSE 'public' END)",
+                ),
+                **{
+                    family: self._metadata_facets(
+                        connection, terms, filters, scope, user_id, kind
+                    )
+                    for kind, family in _METADATA_FACETS
+                },
+            )
+
+    def _metadata_facets(
+        self,
+        connection: sqlite3.Connection,
+        terms: tuple[str, ...],
+        filters: SearchFilters,
+        scope: ReadScope,
+        user_id: str,
+        kind: str,
+    ) -> tuple[SearchFacet, ...]:
+        source, parameters = self._search_source(
+            terms,
+            filters,
+            scope,
+            user_id,
+            without=kind,
+            join="JOIN catalog_search_facets AS facet"
+            " ON facet.series_id = catalog_series.id AND facet.kind = ?",
+            join_parameters=(kind,),
+        )
+        rows = connection.execute(
+            f"""
+            SELECT facet.normalized AS value, MIN(facet.value) AS label,
+                   COUNT(DISTINCT catalog_series.id) AS total
+            {source}
+            GROUP BY facet.normalized
+            ORDER BY total DESC, label COLLATE NOCASE
+            LIMIT {_FACET_LIMIT}
+            """,
+            parameters,
+        ).fetchall()
+        return tuple(
+            SearchFacet(row["value"], row["label"], row["total"]) for row in rows
+        )
+
+    def search_suggestions(
+        self, terms: tuple[str, ...], *, scope: ReadScope, limit: int = 8
+    ) -> list[SearchSuggestion]:
+        source, parameters = self._search_source(
+            terms, SearchFilters(), scope, user_id="", without="reading"
+        )
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT catalog_series.id AS id, catalog_series.category AS category,
+                       catalog_series.is_private AS is_private,
+                       (SELECT name FROM managed_libraries
+                        WHERE id = catalog_series.library_id) AS library,
+                       (SELECT {_METADATA_TITLE} FROM series_metadata
+                        WHERE series_metadata.series_id = catalog_series.id) AS matched,
+                       catalog_series.name AS local_title
+                {source}
+                ORDER BY {_candidate_order(terms)}
+                LIMIT ?
+                """,
+                (*parameters, limit),
+            ).fetchall()
+        return [
+            SearchSuggestion(
+                kind="series",
+                title=row["matched"] or row["local_title"],
+                subtitle=f"{row['library']} · {row['category']}"
+                + (" · Private" if row["is_private"] else ""),
+                url=f"/series/{row['id']}",
+            )
+            for row in rows
+        ]
+
+    def _search_source(
+        self,
+        terms: tuple[str, ...],
+        filters: SearchFilters,
+        scope: ReadScope,
+        user_id: str,
+        *,
+        without: str | None = None,
+        join: str = "",
+        join_parameters: tuple[object, ...] = (),
+    ) -> tuple[str, list[object]]:
+        """The `FROM … WHERE …` every search query shares.
+
+        A query with terms is *driven* by the full-text index: it runs once and
+        hands back the matching series, instead of being asked again for each
+        row of the catalog. `without` drops a single filter family so a facet
+        can count what choosing one of its values would actually return.
+        """
+        clauses = [_SERIES_REACHABLE, _SERIES_HAS_VOLUMES]
+        # Bound values are positional, and the joins are written before the
+        # WHERE, so theirs have to come first.
+        parameters: list[object] = list(join_parameters)
+        if terms:
+            source = (
+                "FROM catalog_search JOIN catalog_series"
+                " ON catalog_series.id = catalog_search.series_id"
+            )
+            clauses.insert(0, "catalog_search MATCH ?")
+            parameters.append(_match_expression(terms))
+        else:
+            source = "FROM catalog_series"
+        source = f"{source} {join}" if join else source
+        for family, column, values in (
+            ("library", "catalog_series.library_id", filters.library_ids),
+            ("category", "catalog_series.category", filters.categories),
+        ):
+            if family == without or not values:
+                continue
+            clauses.append(f"{column} IN ({_placeholders(values)})")
+            parameters.extend(values)
+        if without != "collection" and filters.collections:
+            wanted = {1 if item == "private" else 0 for item in filters.collections}
+            clauses.append(f"catalog_series.is_private IN ({_placeholders(wanted)})")
+            parameters.extend(sorted(wanted))
+        for kind, values in (
+            ("creator", filters.creators),
+            ("publisher", filters.publishers),
+            ("tag", filters.tags),
+            ("status", filters.statuses),
+            ("year", filters.years),
+        ):
+            if kind == without or not values:
+                continue
+            normalized = tuple(item.casefold() for item in values)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM catalog_search_facets AS chosen"
+                " WHERE chosen.series_id = catalog_series.id AND chosen.kind = ?"
+                f"   AND chosen.normalized IN ({_placeholders(normalized)}))"
+            )
+            parameters.extend((kind, *normalized))
+        if without != "reading" and filters.reading_state:
+            reading, reading_parameters = _reading_predicate(
+                filters.reading_state, user_id
+            )
+            clauses.append(reading)
+            parameters.extend(reading_parameters)
+        scope_clause, scope_parameters = _scope_predicate(scope)
+        clauses.append(
+            "EXISTS (SELECT 1 FROM publications"
+            f" WHERE publications.series_id = catalog_series.id AND ({scope_clause}))"
+        )
+        parameters.extend(scope_parameters)
+        where = " AND ".join(f"({item})" for item in clauses)
+        return f"{source} WHERE {where}", parameters
+
+    def _documents(
+        self,
+        connection: sqlite3.Connection,
+        series_ids: list[str],
+        scope: ReadScope,
+        user_id: str,
+    ) -> list[SearchDocument]:
+        """Load the candidate series and everything ranking needs, in two reads."""
+        if not series_ids:
+            return []
+        series = {
+            item.id: item
+            for item in self.catalog_series(
+                series_ids=tuple(series_ids),
+                scope=scope,
+                visibility=CatalogVisibility.ALL,
+            )
+        }
+        placeholders = _placeholders(tuple(series_ids))
+        rows = connection.execute(
+            f"""
+            SELECT catalog_series.id AS series_id,
+                   {_METADATA_TITLE} AS metadata_title,
+                   series_metadata.values_json AS values_json,
+                   series_metadata.overrides_json AS overrides_json,
+                   publications.id AS publication_id,
+                   publications.title AS volume_title,
+                   publications.filename AS filename,
+                   publications.modified_ns AS modified_ns,
+                   reading_progress.completed AS completed
+            FROM catalog_series
+            LEFT JOIN series_metadata
+              ON series_metadata.series_id = catalog_series.id
+            LEFT JOIN publications
+              ON publications.series_id = catalog_series.id
+            LEFT JOIN reading_progress
+              ON reading_progress.publication_id = publications.id
+             AND reading_progress.user_id = ?
+            WHERE catalog_series.id IN ({placeholders})
+            ORDER BY publications.number COLLATE NOCASE,
+                     publications.title COLLATE NOCASE
+            """,
+            (user_id, *series_ids),
+        ).fetchall()
+        return _assemble_documents(rows, series, series_ids)
 
     def catalog_series(
         self,
         *,
         series_id: str | None = None,
+        series_ids: tuple[str, ...] | None = None,
         library_id: str | None = None,
         category: str | None = None,
         query: str | None = None,
         scope: ReadScope | None = None,
         visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
     ) -> list[CatalogSeries]:
-        clauses = ["managed_libraries.enabled = 1"]
+        # A disconnected mount hides its whole catalog from readers without
+        # any of it being deleted.
+        clauses = ["managed_libraries.enabled = 1", "data_mounts.enabled = 1"]
         parameters: list[object] = []
         visibility_clause = _visibility_predicate(visibility, "catalog_series")
         if visibility_clause:
@@ -1778,6 +2591,9 @@ class SQLiteRepository:
         if series_id:
             clauses.append("catalog_series.id = ?")
             parameters.append(series_id)
+        if series_ids is not None:
+            clauses.append(f"catalog_series.id IN ({_placeholders(series_ids)})")
+            parameters.extend(series_ids)
         if library_id:
             clauses.append("catalog_series.library_id = ?")
             parameters.append(library_id)
@@ -1830,6 +2646,8 @@ class SQLiteRepository:
                     FROM catalog_series
                     JOIN managed_libraries
                       ON managed_libraries.id = catalog_series.library_id
+                    JOIN data_mounts
+                      ON data_mounts.id = managed_libraries.mount_id
                     JOIN publications
                       ON publications.series_id = catalog_series.id
                     LEFT JOIN series_metadata
@@ -2292,7 +3110,9 @@ def _publication_filter(
     visibility: CatalogVisibility = CatalogVisibility.PUBLIC,
 ) -> tuple[str, list[object]]:
     """Build the WHERE fragment and bound parameters for a publication search."""
-    clauses: list[str] = []
+    # Removing a library deletes its rows, but disconnecting a mount keeps
+    # them, so reachability has to be asked rather than assumed.
+    clauses: list[str] = [_REACHABLE]
     parameters: list[object] = []
     for column, value in (
         ("library", library),
@@ -2316,6 +3136,322 @@ def _publication_filter(
     if visibility_clause:
         clauses.append(visibility_clause)
     return (f" WHERE {' AND '.join(clauses)}" if clauses else ""), parameters
+
+
+_FACET_LIMIT = 40
+# Facet kind as stored, and the field of `SearchFacets` it fills.
+_METADATA_FACETS = (
+    ("creator", "creators"),
+    ("publisher", "publishers"),
+    ("tag", "tags"),
+    ("status", "statuses"),
+    ("year", "years"),
+)
+# Fields are concatenated with the unit separator, which cannot appear in a
+# filename or a title, so splitting them apart again is unambiguous.
+_UNIT = "\x1f"
+
+# The administrator's edits win over the provider's values, field by field.
+_METADATA_TITLE = (
+    "COALESCE(json_extract(series_metadata.overrides_json, '$.title'),"
+    " json_extract(series_metadata.values_json, '$.title'))"
+)
+
+_SEARCH_SOURCE = """
+    SELECT catalog_series.id AS series_id,
+           catalog_series.name AS local_title,
+           series_metadata.values_json AS values_json,
+           series_metadata.overrides_json AS overrides_json,
+           GROUP_CONCAT(publications.title, char(31)) AS volume_titles,
+           GROUP_CONCAT(publications.filename, char(31)) AS filenames
+    FROM catalog_series
+    JOIN publications ON publications.series_id = catalog_series.id
+    LEFT JOIN series_metadata ON series_metadata.series_id = catalog_series.id
+    {where}
+    GROUP BY catalog_series.id
+"""
+
+
+# A publication a reader can actually reach: its library is managed and its
+# mount is connected. Written against `publications.library_id` so it can be
+# dropped into any query over that table.
+_REACHABLE = """
+    EXISTS (
+        SELECT 1 FROM managed_libraries
+        JOIN data_mounts ON data_mounts.id = managed_libraries.mount_id
+        WHERE managed_libraries.id = publications.library_id
+          AND managed_libraries.enabled = 1 AND data_mounts.enabled = 1
+    )
+"""
+
+
+# The same reachability rule as `_REACHABLE`, asked of a series instead.
+_SERIES_REACHABLE = """
+    EXISTS (
+        SELECT 1 FROM managed_libraries
+        JOIN data_mounts ON data_mounts.id = managed_libraries.mount_id
+        WHERE managed_libraries.id = catalog_series.library_id
+          AND managed_libraries.enabled = 1 AND data_mounts.enabled = 1
+    )
+"""
+# An emptied series keeps its row but has nothing to show.
+_SERIES_HAS_VOLUMES = """
+    EXISTS (SELECT 1 FROM publications WHERE publications.series_id = catalog_series.id)
+"""
+
+
+def _placeholders(values: tuple[object, ...] | set[object]) -> str:
+    return ", ".join("?" for _ in values)
+
+
+def _candidate_order(terms: tuple[str, ...]) -> str:
+    """Best-first, so a truncated candidate window still holds the best matches.
+
+    The weights follow the fields of `catalog_search`: a local title beats a
+    canonical one, both beat a creator, and a summary counts for least.
+    """
+    if not terms:
+        return "catalog_series.name COLLATE NOCASE"
+    return (
+        "bm25(catalog_search, 0, 12, 11, 9, 7, 5, 4, 2, 10, 6),"
+        " catalog_series.name COLLATE NOCASE"
+    )
+
+
+def _match_expression(terms: tuple[str, ...]) -> str:
+    """An FTS5 query that requires every term, matching on prefixes.
+
+    Terms arrive from `search.tokenize`, which keeps only word characters, so
+    nothing here can carry FTS operator syntax. The quoting is belt and braces.
+    """
+    return " AND ".join(f'"{term.replace(chr(34), chr(34) * 2)}"*' for term in terms)
+
+
+def _metadata_values(row: sqlite3.Row) -> dict[str, Any]:
+    values = json.loads(row["values_json"] or "{}")
+    overrides = json.loads(row["overrides_json"] or "{}")
+    return {**values, **overrides}
+
+
+def _strings(values: object) -> tuple[str, ...]:
+    if not isinstance(values, list | tuple):
+        return ()
+    return tuple(str(item).strip() for item in values if str(item).strip())
+
+
+def _text(value: object) -> str:
+    return str(value).strip() if value not in (None, "") else ""
+
+
+def _split(value: str | None) -> tuple[str, ...]:
+    return tuple(item for item in (value or "").split(_UNIT) if item)
+
+
+def _index_row(row: sqlite3.Row) -> tuple[str, ...]:
+    metadata = _metadata_values(row)
+    creators = _strings(metadata.get("authors")) + _strings(metadata.get("artists"))
+    return (
+        row["series_id"],
+        row["local_title"],
+        _text(metadata.get("title")),
+        " ".join(_strings(metadata.get("alternative_titles"))),
+        " ".join(creators),
+        " ".join(_strings(metadata.get("publishers"))),
+        " ".join(_strings(metadata.get("tags"))),
+        _text(metadata.get("description")),
+        " ".join(_split(row["volume_titles"])),
+        " ".join(_split(row["filenames"])),
+    )
+
+
+def _facet_rows(row: sqlite3.Row) -> list[tuple[str, str, str, str]]:
+    metadata = _metadata_values(row)
+    year = _text(metadata.get("published_start"))[:4]
+    families = (
+        (
+            "creator",
+            _strings(metadata.get("authors")) + _strings(metadata.get("artists")),
+        ),
+        ("publisher", _strings(metadata.get("publishers"))),
+        ("tag", _strings(metadata.get("tags"))),
+        ("status", (_text(metadata.get("status")),)),
+        ("year", (year,) if year.isdigit() else ()),
+    )
+    return [
+        (row["series_id"], kind, value, value.casefold())
+        for kind, values in families
+        for value in values
+        if value
+    ]
+
+
+def _reading_predicate(state: str, user_id: str) -> tuple[str, list[object]]:
+    """Whether a reader has finished, started, or not opened a series."""
+    started = (
+        "EXISTS (SELECT 1 FROM publications AS read_item"
+        " JOIN reading_progress ON reading_progress.publication_id = read_item.id"
+        " WHERE read_item.series_id = catalog_series.id"
+        "   AND reading_progress.user_id = ?)"
+    )
+    unfinished = (
+        "EXISTS (SELECT 1 FROM publications AS open_item"
+        " LEFT JOIN reading_progress"
+        "   ON reading_progress.publication_id = open_item.id"
+        "  AND reading_progress.user_id = ?"
+        " WHERE open_item.series_id = catalog_series.id"
+        "   AND COALESCE(reading_progress.completed, 0) = 0)"
+    )
+    if state == READ_UNREAD:
+        return f"NOT {started}", [user_id]
+    if state == READ_COMPLETED:
+        return f"{started} AND NOT {unfinished}", [user_id, user_id]
+    return f"{started} AND {unfinished}", [user_id, user_id]
+
+
+def _assemble_documents(
+    rows: list[sqlite3.Row],
+    series: dict[str, CatalogSeries],
+    order: list[str],
+) -> list[SearchDocument]:
+    """Fold the per-volume rows back into one document per series."""
+    drafts: dict[str, _DocumentDraft] = {}
+    for row in rows:
+        series_id = row["series_id"]
+        if series_id not in series:
+            continue
+        draft = drafts.get(series_id)
+        if draft is None:
+            draft = _DocumentDraft.begin(row)
+            drafts[series_id] = draft
+        draft.add_volume(row)
+    return [drafts[key].finish(series[key]) for key in order if key in drafts]
+
+
+@dataclass
+class _DocumentDraft:
+    metadata: dict[str, Any]
+    display_title: str | None
+    volumes: list[SearchVolume]
+    newest_modified_ns: int
+    progress: list[bool]
+    publications: int
+
+    @classmethod
+    def begin(cls, row: sqlite3.Row) -> _DocumentDraft:
+        return cls(
+            metadata=_metadata_values(row),
+            display_title=row["metadata_title"],
+            volumes=[],
+            newest_modified_ns=0,
+            progress=[],
+            publications=0,
+        )
+
+    def add_volume(self, row: sqlite3.Row) -> None:
+        if row["publication_id"] is None:
+            return
+        self.publications += 1
+        self.volumes.append(
+            SearchVolume(
+                id=row["publication_id"],
+                title=row["volume_title"],
+                filename=row["filename"],
+            )
+        )
+        self.newest_modified_ns = max(self.newest_modified_ns, row["modified_ns"] or 0)
+        if row["completed"] is not None:
+            self.progress.append(bool(row["completed"]))
+
+    def finish(self, series: CatalogSeries) -> SearchDocument:
+        titles = [series.name]
+        if self.display_title and self.display_title != series.name:
+            titles.insert(0, self.display_title)
+        titles.extend(_strings(self.metadata.get("alternative_titles")))
+        year = _text(self.metadata.get("published_start"))[:4]
+        return SearchDocument(
+            series=series,
+            titles=tuple(dict.fromkeys(titles)),
+            volumes=tuple(self.volumes),
+            creators=_strings(self.metadata.get("authors"))
+            + _strings(self.metadata.get("artists")),
+            publishers=_strings(self.metadata.get("publishers")),
+            tags=_strings(self.metadata.get("tags")),
+            description=_text(self.metadata.get("description")) or None,
+            status=_text(self.metadata.get("status")) or None,
+            year=year if year.isdigit() else None,
+            read_state=self._read_state(),
+            newest_modified_ns=self.newest_modified_ns,
+        )
+
+    def _read_state(self) -> str:
+        if not self.progress:
+            return READ_UNREAD
+        if len(self.progress) == self.publications and all(self.progress):
+            return READ_COMPLETED
+        return READ_IN_PROGRESS
+
+
+def _mount_conflict(
+    connection: sqlite3.Connection,
+    name: str,
+    path: str,
+    *,
+    exclude_id: str | None = None,
+) -> str:
+    """Say which of the two unique columns collided, not just that one did."""
+    clause = " AND id <> ?" if exclude_id else ""
+    parameters: list[object] = [name, path]
+    if exclude_id:
+        parameters.append(exclude_id)
+    row = connection.execute(
+        "SELECT name, path FROM data_mounts "
+        f"WHERE (name = ? COLLATE NOCASE OR path = ?){clause} LIMIT 1",
+        parameters,
+    ).fetchone()
+    if row and row["path"] == path:
+        return f"{row['name']} is already registered at that path"
+    return f"Another data mount is already called “{name}”"
+
+
+def _unique_index_on(
+    connection: sqlite3.Connection, table: str, columns: list[str]
+) -> bool:
+    """Whether exactly these columns still carry a UNIQUE constraint."""
+    for index in connection.execute(f"PRAGMA index_list({table})").fetchall():
+        if not index["unique"]:
+            continue
+        present = [
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (index["name"],),
+            ).fetchall()
+        ]
+        if present == columns:
+            return True
+    return False
+
+
+def _rebuild_table(connection: sqlite3.Connection, table: str, script: str) -> None:
+    """Swap a table for one the script builds as `<table>_rebuilt`.
+
+    SQLite cannot drop a UNIQUE constraint, so changing one means copying the
+    rows. Foreign keys are suspended for the swap because dependent tables
+    point at the name, not the underlying table.
+    """
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.executescript(
+            f"BEGIN IMMEDIATE;\n"
+            f"DROP TABLE IF EXISTS {table}_rebuilt;\n"
+            f"{script}\n"
+            f"DROP TABLE {table};\n"
+            f"ALTER TABLE {table}_rebuilt RENAME TO {table};\n"
+            f"COMMIT;"
+        )
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _visibility_predicate(

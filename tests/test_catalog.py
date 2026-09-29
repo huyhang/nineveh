@@ -4,19 +4,21 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from conftest import image_bytes, write_cbz
+from conftest import image_bytes, storage, write_cbz
 
-from nineveh.catalog import ArchiveInspector, CatalogScanner, UnsafeArchive
+from nineveh.catalog import (
+    ArchiveInspector,
+    CatalogScanner,
+    InvalidLibrary,
+    UnsafeArchive,
+)
 from nineveh.database import SQLiteRepository
 from nineveh.domain import CatalogVisibility
 
 
 def _scanner(settings) -> tuple[CatalogScanner, SQLiteRepository]:
-    repository = SQLiteRepository(settings.database_path)
-    repository.initialize()
-    return CatalogScanner(
-        settings.data_dir, repository, ArchiveInspector(settings)
-    ), repository
+    graph = storage(settings, initialize=False)
+    return graph.scanner(settings), graph.repository
 
 
 def test_scans_expected_hierarchy_and_metadata(library):
@@ -143,16 +145,29 @@ def test_a_removed_file_is_dropped_from_the_catalog(library):
     assert repository.publications(limit=10)[1] == 0
 
 
+def test_unavailable_storage_is_reported_without_losing_the_index(library):
+    """Unplugging a disk must not look like deleting a library."""
+    settings, _ = library
+    scanner, repository = _scanner(settings)
+    scanner.scan()
+    assert repository.publications(limit=10)[1] == 1
+    settings.data_dir.rename(settings.data_dir.with_name("gone"))
+
+    report = scanner.scan()
+
+    assert (report.discovered, report.removed, report.failed) == (0, 0, 1)
+    assert repository.publications(limit=10)[1] == 1
+    assert scanner.status.running is False
+    assert scanner.status.error is None
+
+
 def test_a_failed_scan_is_recorded_in_the_status(library):
     settings, _ = library
     scanner, _ = _scanner(settings)
-    for entry in settings.data_dir.iterdir():
-        for child in entry.rglob("*"):
-            pass
-    settings.data_dir.rename(settings.data_dir.with_name("gone"))
 
-    with pytest.raises(FileNotFoundError):
-        scanner.scan()
+    with pytest.raises(InvalidLibrary):
+        scanner.scan("not-a-library")
+
     assert scanner.status.running is False
     assert scanner.status.error is not None
 

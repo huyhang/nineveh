@@ -17,6 +17,7 @@ from PIL import Image, ImageOps
 from .config import Settings
 from .domain import Page, Publication
 from .ports import ThumbnailRenderer
+from .storage import StorageError, StoragePathResolver
 
 
 class ArchiveUnavailable(RuntimeError):
@@ -88,9 +89,9 @@ class ArchivePool:
 
 
 class ArchiveService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, paths: StoragePathResolver) -> None:
         self._settings = settings
-        self._data_root = settings.data_dir.resolve()
+        self._paths = paths
         self._pool = ArchivePool(settings.archive_cache_size)
         Image.MAX_IMAGE_PIXELS = settings.max_image_pixels
 
@@ -98,15 +99,19 @@ class ArchiveService:
         self._pool.close()
 
     def archive_path(self, publication: Publication) -> Path:
-        relative = PurePosixPath(publication.relative_path)
-        candidate = self._data_root
-        for part in relative.parts:
-            candidate = candidate / part
-            if candidate.is_symlink():
+        try:
+            root = self._paths.publication_root(publication).resolve()
+            candidate = self._paths.publication_path(publication)
+        except StorageError as error:
+            raise ArchiveUnavailable(str(error)) from error
+        walked = root
+        for part in PurePosixPath(publication.relative_path).parts:
+            walked = walked / part
+            if walked.is_symlink():
                 raise ArchiveUnavailable("symbolic links are not served")
         try:
             resolved = candidate.resolve(strict=True)
-            resolved.relative_to(self._data_root)
+            resolved.relative_to(root)
             stat = resolved.stat()
         except (OSError, ValueError) as error:
             raise ArchiveUnavailable("archive is no longer available") from error

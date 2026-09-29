@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import sqlite3
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlencode
@@ -23,10 +23,12 @@ from .auth import AuthenticationError, InvalidUserInput, LastAdministratorError
 from .catalog import InvalidLibrary
 from .deployment import memory_limit_text
 from .domain import (
+    DEFAULT_MOUNT_ID,
     SEVERITY_ORDER,
     AccessGrant,
     CatalogVisibility,
     Publication,
+    SearchFilters,
     Session,
 )
 from .http_api import SESSION_COOKIE, scan_active
@@ -40,6 +42,8 @@ from .metadata import (
     matches_state,
 )
 from .reader import FIRST_PAIRED_PAGE, clamp_anchor, reading_direction
+from .search import filters_from_params
+from .storage import MountInUse, MountNotFound, StorageError
 from .units import gibibytes, since, timestamp
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -187,28 +191,109 @@ async def _catalog_page(
     container = _container(request)
     scope = container.authorization.read_scope(session.user)
 
+    query = (q or "").strip()
+    if query:
+        # Searching has its own surface now. Old links keep working by
+        # arriving there rather than by keeping a second engine alive.
+        collection = "private" if visibility == CatalogVisibility.PRIVATE else "public"
+        return RedirectResponse(
+            f"/search?{urlencode({'q': query, 'collection': collection})}",
+            status_code=303,
+        )
+
     moved = await _legacy_filter_redirect(container, scope, library, category, series)
     if moved:
         return moved
 
-    query = (q or "").strip()
-    view = (
-        await _search_results(container, scope, query, page, visibility)
-        if query
-        else await _library_shelves(container, scope, visibility)
-    )
     return templates.TemplateResponse(
         request,
         "catalog.html",
         {
             "service_title": container.settings.service_title,
             "session": session,
-            "mode": "search" if query else "libraries",
-            "query": query,
+            "mode": "libraries",
+            "query": "",
             **_collection_context(visibility),
-            **view,
+            **await _library_shelves(container, scope, visibility),
         },
     )
+
+
+@router.get("/search", response_class=HTMLResponse)
+async def search_page(
+    request: Request,
+    q: str = Query(default="", max_length=200),
+    page: int = Query(default=1, ge=1),
+):
+    session = await _browser_session(request)
+    if not session:
+        return RedirectResponse("/login", status_code=303)
+    container = _container(request)
+    filters = filters_from_params(_multi_params(request))
+    result = await run_in_threadpool(
+        partial(
+            container.search.search,
+            q,
+            scope=container.authorization.read_scope(session.user),
+            user_id=session.user.id,
+            filters=filters,
+            page=page,
+        )
+    )
+    query = " ".join(q.split())
+    return templates.TemplateResponse(
+        request,
+        "search.html",
+        {
+            "service_title": container.settings.service_title,
+            "session": session,
+            "query": query,
+            "results": result,
+            "filters": filters,
+            "selected": _selected_filters(filters),
+            "reset_url": f"/search?{urlencode({'q': query})}" if query else "/search",
+            "previous_url": _page_url(request, result.page - 1)
+            if result.page > 1
+            else None,
+            "next_url": _page_url(request, result.page + 1)
+            if result.page < result.page_count
+            else None,
+        },
+    )
+
+
+def _multi_params(request: Request) -> dict[str, list[str]]:
+    values: dict[str, list[str]] = {}
+    for key, value in request.query_params.multi_items():
+        values.setdefault(key, []).append(value)
+    return values
+
+
+def _selected_filters(filters: SearchFilters) -> dict[str, object]:
+    """Case-folded sets, so a template can ask "is this facet checked?"."""
+    return {
+        "libraries": frozenset(filters.library_ids),
+        "categories": frozenset(filters.categories),
+        "collections": frozenset(filters.collections),
+        "reading": filters.reading_state,
+        "creators": frozenset(item.casefold() for item in filters.creators),
+        "publishers": frozenset(item.casefold() for item in filters.publishers),
+        "tags": frozenset(item.casefold() for item in filters.tags),
+        "statuses": frozenset(item.casefold() for item in filters.statuses),
+        "years": frozenset(item.casefold() for item in filters.years),
+        "sort": filters.sort,
+    }
+
+
+def _page_url(request: Request, page: int) -> str:
+    """The current search, on another page, with every filter preserved."""
+    values = [
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key != "page"
+    ]
+    values.append(("page", str(page)))
+    return f"/search?{urlencode(values)}"
 
 
 async def _legacy_filter_redirect(container, scope, library, category, series):
@@ -244,36 +329,6 @@ async def _legacy_filter_redirect(container, scope, library, category, series):
     if category:
         return RedirectResponse(f"{prefix}/{managed.id}/{category}", status_code=303)
     return RedirectResponse(f"{prefix}/{managed.id}", status_code=303)
-
-
-async def _search_results(
-    container, scope, query: str, page: int, visibility: CatalogVisibility
-) -> dict[str, object]:
-    matches = await run_in_threadpool(
-        container.repository.catalog_series,
-        query=query,
-        scope=scope,
-        visibility=visibility,
-    )
-    summaries = await run_in_threadpool(container.repository.series_metadata_summaries)
-    page_size = container.settings.feed_page_size
-    page_count = max(1, math.ceil(len(matches) / page_size))
-    page = min(page, page_count)
-    start = (page - 1) * page_size
-    cards = _series_cards(matches[start : start + page_size], summaries)
-    return {
-        "page": page,
-        "page_count": page_count,
-        "libraries": [],
-        "series_cards": cards,
-        "metadata_attribution": any(card["metadata"] for card in cards),
-        "recent_publications": [],
-        "total": len(matches),
-        "previous_url": _search_url(query, page - 1, visibility) if page > 1 else None,
-        "next_url": _search_url(query, page + 1, visibility)
-        if page < page_count
-        else None,
-    }
 
 
 async def _library_shelves(
@@ -675,10 +730,22 @@ async def admin_libraries_page(request: Request):
         container.repository.library_usage
     )
     context["scan_status"] = container.scanner.status
-    context["available_libraries"] = await run_in_threadpool(
-        container.libraries.available
+    context["mount_statuses"] = await run_in_threadpool(container.mounts.statuses)
+    context["available_by_mount"] = await run_in_threadpool(
+        container.libraries.available_by_mount
+    )
+    context["libraries_by_mount"] = _group_by_mount(
+        context["mount_statuses"], context["library_usage"]
     )
     return templates.TemplateResponse(request, "admin_libraries.html", context)
+
+
+def _group_by_mount(statuses, usage) -> list[tuple[object, list[object]]]:
+    """Mount → its libraries, in the order the mounts are listed."""
+    by_mount: dict[str, list[object]] = {status.mount.id: [] for status in statuses}
+    for item in usage:
+        by_mount.setdefault(item.library.mount_id, []).append(item)
+    return [(status, by_mount.get(status.mount.id, [])) for status in statuses]
 
 
 @router.get("/libraries/{library_id}/{category}/metadata", response_class=HTMLResponse)
@@ -928,10 +995,129 @@ async def admin_update_access(
     return await _admin_redirect(request, "users", message="Reader access updated.")
 
 
+@router.post("/admin/mounts")
+async def admin_add_mount(
+    request: Request,
+    name: str = Form(..., max_length=80),
+    path: str = Form(..., max_length=1024),
+    allow_ingest: bool = Form(False),
+    scan_enabled: bool = Form(False),
+    csrf_token: str = Form(...),
+):
+    return await _mount_action(
+        request,
+        csrf_token,
+        lambda service: service.add(
+            name, path, allow_ingest=allow_ingest, scan_enabled=scan_enabled
+        ),
+        lambda mount: f"Added {mount.name}. Choose the libraries to index.",
+    )
+
+
+@router.post("/admin/mounts/{mount_id}")
+async def admin_update_mount(
+    request: Request,
+    mount_id: str,
+    name: str = Form(..., max_length=80),
+    path: str = Form(..., max_length=1024),
+    allow_ingest: bool = Form(False),
+    scan_enabled: bool = Form(False),
+    csrf_token: str = Form(...),
+):
+    return await _mount_action(
+        request,
+        csrf_token,
+        lambda service: service.update(
+            mount_id,
+            name=name,
+            path=path,
+            allow_ingest=allow_ingest,
+            scan_enabled=scan_enabled,
+        ),
+        lambda mount: f"Updated {mount.name}.",
+    )
+
+
+@router.post("/admin/mounts/{mount_id}/disconnect")
+async def admin_disconnect_mount(
+    request: Request, mount_id: str, csrf_token: str = Form(...)
+):
+    return await _mount_action(
+        request,
+        csrf_token,
+        lambda service: service.disconnect(mount_id),
+        lambda mount: f"Disconnected {mount.name}; its catalog history was kept.",
+    )
+
+
+@router.post("/admin/mounts/{mount_id}/reconnect")
+async def admin_reconnect_mount(
+    request: Request, mount_id: str, csrf_token: str = Form(...)
+):
+    return await _mount_action(
+        request,
+        csrf_token,
+        lambda service: service.reconnect(mount_id),
+        lambda mount: f"Reconnected {mount.name} and started a scan.",
+        after=lambda request, mount: request.app.state.start_mount_scan(mount.id),
+    )
+
+
+@router.post("/admin/mounts/{mount_id}/scan")
+async def admin_scan_mount(
+    request: Request, mount_id: str, csrf_token: str = Form(...)
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    mount = await run_in_threadpool(_container(request).repository.data_mount, mount_id)
+    if mount is None:
+        return await _admin_redirect(
+            request, "libraries", error="Data mount not found."
+        )
+    if not request.app.state.start_mount_scan(mount_id):
+        return await _admin_redirect(
+            request, "libraries", error="Wait for the catalog scan to finish."
+        )
+    return await _admin_redirect(
+        request, "libraries", message=f"Scanning {mount.name}."
+    )
+
+
+@router.post("/admin/mounts/{mount_id}/forget")
+async def admin_forget_mount(
+    request: Request, mount_id: str, csrf_token: str = Form(...)
+):
+    return await _mount_action(
+        request,
+        csrf_token,
+        lambda service: service.forget(mount_id),
+        lambda mount: f"Forgot {mount.name}; no media files were deleted.",
+    )
+
+
+async def _mount_action(request, csrf_token, work, message, after=None):
+    """Every mount form shares its guards, error reporting and redirect."""
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    if scan_active(request):
+        return await _admin_redirect(
+            request, "libraries", error="Wait for the catalog scan to finish."
+        )
+    try:
+        mount = await run_in_threadpool(work, _container(request).mounts)
+    except (MountNotFound, MountInUse, StorageError, ValueError) as error:
+        return await _admin_redirect(request, "libraries", error=str(error))
+    if after:
+        after(request, mount)
+    return await _admin_redirect(request, "libraries", message=message(mount))
+
+
 @router.post("/admin/libraries")
 async def admin_add_library(
     request: Request,
     relative_path: str = Form(..., max_length=255),
+    mount_id: str = Form(DEFAULT_MOUNT_ID, max_length=64),
+    name: str = Form("", max_length=80),
     csrf_token: str = Form(...),
 ):
     session = await _require_admin(request)
@@ -942,7 +1128,9 @@ async def admin_add_library(
         )
     service = _container(request).libraries
     try:
-        library = await run_in_threadpool(service.add, relative_path)
+        library = await run_in_threadpool(
+            service.add, relative_path, mount_id, name.strip() or None
+        )
     except InvalidLibrary as error:
         return await _admin_redirect(request, "libraries", error=str(error))
     request.app.state.start_scan(library.id)
@@ -1497,13 +1685,6 @@ def _series_cards(series_items, metadata_by_series) -> list[dict[str, object]]:
         }
         for item in series_items
     ]
-
-
-def _search_url(
-    query: str, page: int, visibility: CatalogVisibility = CatalogVisibility.PUBLIC
-) -> str:
-    root = "/private" if visibility == CatalogVisibility.PRIVATE else "/"
-    return f"{root}?{urlencode({'q': query, 'page': page})}"
 
 
 def _collection_context(visibility: CatalogVisibility) -> dict[str, object]:

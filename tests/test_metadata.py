@@ -14,13 +14,13 @@ from conftest import (
     ADMIN_PASSWORD,
     authorization,
     image_bytes,
+    storage,
     wait_for_scan,
     write_cbz,
 )
 from fastapi.testclient import TestClient
 
 from nineveh.app import build_container, create_app
-from nineveh.catalog import ArchiveInspector, CatalogScanner
 from nineveh.config import Settings
 from nineveh.database import SQLiteRepository
 from nineveh.domain import MetadataCandidate, SeriesMetadataState
@@ -111,7 +111,7 @@ def _manga_repository(settings: Settings) -> tuple[SQLiteRepository, object]:
     repository = SQLiteRepository(settings.database_path)
     repository.initialize()
     repository.initialize_libraries(["Main Library"])
-    CatalogScanner(settings.data_dir, repository, ArchiveInspector(settings)).scan()
+    storage(settings, initialize=False).scanner(settings).scan()
     return repository, repository.catalog_series(category="manga")[0]
 
 

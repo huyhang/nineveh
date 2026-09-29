@@ -9,6 +9,7 @@ from .domain import (
     AccessGrant,
     CatalogSeries,
     CatalogVisibility,
+    DataMount,
     LibrarianEvent,
     LibrarianToken,
     LibraryUsage,
@@ -24,6 +25,10 @@ from .domain import (
     ScannedPublication,
     ScanReport,
     ScanStatus,
+    SearchDocument,
+    SearchFacets,
+    SearchFilters,
+    SearchSuggestion,
     SeriesMetadata,
     SeriesMetadataState,
     SeriesMetadataSummary,
@@ -37,7 +42,9 @@ class CatalogRepository(Protocol):
         self, publication_id: str, scope: ReadScope | None = None
     ) -> Publication | None: ...
 
-    def publication_by_path(self, relative_path: str) -> Publication | None: ...
+    def publication_by_path(
+        self, relative_path: str, library_id: str | None = None
+    ) -> Publication | None: ...
 
     def page(
         self, publication_id: str, number: int, scope: ReadScope | None = None
@@ -93,6 +100,7 @@ class CatalogRepository(Protocol):
         self,
         *,
         series_id: str | None = None,
+        series_ids: tuple[str, ...] | None = None,
         library_id: str | None = None,
         category: str | None = None,
         query: str | None = None,
@@ -137,19 +145,87 @@ class ReadingRepository(Protocol):
 
 
 class LibraryRepository(Protocol):
-    def initialize_libraries(self, relative_paths: list[str]) -> None: ...
+    def initialize_libraries(
+        self, relative_paths: list[str], mount_id: str = "default"
+    ) -> None: ...
 
     def managed_libraries(
-        self, *, include_disabled: bool = False
+        self, *, include_disabled: bool = False, mount_id: str | None = None
     ) -> list[ManagedLibrary]: ...
 
     def managed_library(self, library_id: str) -> ManagedLibrary | None: ...
 
-    def add_library(self, relative_path: str) -> ManagedLibrary: ...
+    def add_library(
+        self, relative_path: str, mount_id: str = "default", name: str | None = None
+    ) -> ManagedLibrary: ...
 
     def remove_library(self, library_id: str) -> ManagedLibrary | None: ...
 
     def library_usage(self) -> list[LibraryUsage]: ...
+
+
+class MountRepository(Protocol):
+    def ensure_default_mount(self, path: str) -> DataMount: ...
+
+    def data_mounts(self, *, include_disabled: bool = True) -> list[DataMount]: ...
+
+    def data_mount(self, mount_id: str) -> DataMount | None: ...
+
+    def add_data_mount(
+        self,
+        name: str,
+        path: str,
+        *,
+        allow_ingest: bool = False,
+        scan_enabled: bool = True,
+    ) -> DataMount: ...
+
+    def update_data_mount(
+        self,
+        mount_id: str,
+        *,
+        name: str,
+        path: str,
+        allow_ingest: bool,
+        scan_enabled: bool,
+    ) -> DataMount | None: ...
+
+    def set_data_mount_enabled(
+        self, mount_id: str, enabled: bool
+    ) -> DataMount | None: ...
+
+    def forget_data_mount(self, mount_id: str) -> DataMount | None: ...
+
+    def mount_usage(self) -> dict[str, tuple[int, int, int]]: ...
+
+
+class SearchRepository(Protocol):
+    def rebuild_search_index(self) -> None: ...
+
+    def search_candidates(
+        self,
+        terms: tuple[str, ...],
+        *,
+        filters: SearchFilters,
+        scope: ReadScope,
+        user_id: str,
+        limit: int,
+    ) -> tuple[list[SearchDocument], int]: ...
+
+    def search_facets(
+        self,
+        terms: tuple[str, ...],
+        *,
+        filters: SearchFilters,
+        scope: ReadScope,
+        user_id: str,
+    ) -> SearchFacets: ...
+
+    def search_vocabulary(self) -> list[str]: ...
+
+    def search_suggestions(
+        self, terms: tuple[str, ...], *, scope: ReadScope, limit: int = 8
+    ) -> list[SearchSuggestion]: ...
 
 
 class AccessRepository(Protocol):
@@ -344,6 +420,8 @@ class Repository(
     ReadingRepository,
     SpreadRepository,
     LibrarianRepository,
+    MountRepository,
+    SearchRepository,
     Protocol,
 ):
     """The single persistence seam the application composes against."""
@@ -400,6 +478,8 @@ class CatalogScan(Protocol):
     def status(self) -> ScanStatus: ...
 
     def scan(self, library_id: str | None = None) -> ScanReport: ...
+
+    def scan_mount(self, mount_id: str) -> ScanReport: ...
 
 
 class RestartController(Protocol):

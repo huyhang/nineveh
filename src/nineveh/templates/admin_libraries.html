@@ -1,41 +1,117 @@
 {% extends "admin_base.html" %}
+
+{% macro csrf() %}<input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">{% endmacro %}
+
+{% macro mount_fields(mount) %}
+  <label>Label<input name="name" value="{{ mount.name if mount else '' }}" placeholder="Archive drive" required maxlength="80"></label>
+  <label class="mount-path-field">Container path<input name="path" value="{{ mount.path if mount else '' }}" placeholder="/media/archive" required maxlength="1024"></label>
+  <label class="checkbox"><input type="checkbox" name="allow_ingest" value="true" {% if mount and mount.allow_ingest %}checked{% endif %}> Allow librarian ingest</label>
+  <label class="checkbox"><input type="checkbox" name="scan_enabled" value="true" {% if mount is none or mount.scan_enabled %}checked{% endif %}> Include in scheduled scans</label>
+{% endmacro %}
+
 {% block admin_content %}
+  <section class="admin-section mount-admin">
+    <div class="section-heading">
+      <div>
+        <p class="eyebrow">Storage</p><h2>Data mounts</h2>
+        <p class="muted">A mount is a directory that is already visible inside the container. Expose the host directory with a Docker bind mount first; Nineveh cannot create one.</p>
+      </div>
+    </div>
+
+    <div class="mount-grid">
+      {% for status in mount_statuses %}
+        {% set mount = status.mount %}
+        <details class="mount-card" {% if status.available %}open{% endif %}>
+          <summary>
+            <span class="pill {{ status.health.value }}">{{ {'healthy': 'Healthy', 'disconnected': 'Disconnected', 'missing': 'Missing'}[status.health.value] }}</span>
+            <span><strong>{{ mount.name }}</strong><small>{{ mount.path }}</small></span>
+            <span class="mount-figures">
+              <span>{{ status.library_count }} librar{% if status.library_count == 1 %}y{% else %}ies{% endif %} · {{ status.publication_count }} publications</span>
+              <span class="size-value" title="{{ status.size }} bytes">{{ status.size|gib }}</span>
+            </span>
+          </summary>
+          <div class="mount-body">
+            {% if status.detail %}<p class="notice-inline">{{ status.detail }}</p>{% endif %}
+            <p class="muted">{{ 'Librarian ingest is enabled.' if mount.allow_ingest else 'Read only: the librarian agent cannot write here.' }}</p>
+
+            <form method="post" action="/admin/mounts/{{ mount.id }}" class="mount-settings-form">
+              {{ csrf() }}
+              {{ mount_fields(mount) }}
+              <button class="secondary" type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Save mount</button>
+            </form>
+
+            {% set available = available_by_mount.get(mount.id, []) %}
+            {% if mount.enabled and available %}
+              <form method="post" action="/admin/libraries" class="mount-library-form">
+                {{ csrf() }}
+                <input type="hidden" name="mount_id" value="{{ mount.id }}">
+                <label>Directory<select name="relative_path" required><option value="">Choose a directory…</option>{% for folder in available %}<option value="{{ folder }}">{{ folder }}</option>{% endfor %}</select></label>
+                <label>Display name<input name="name" placeholder="Defaults to the folder name" maxlength="80"></label>
+                <button type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Add library</button>
+              </form>
+            {% elif mount.enabled %}
+              <p class="muted add-library-hint">Every directory on this mount is already managed. Create another folder there to add one.</p>
+            {% endif %}
+
+            <div class="card-actions mount-actions">
+              {% if mount.enabled %}
+                <form method="post" action="/admin/mounts/{{ mount.id }}/scan">{{ csrf() }}<button class="secondary" type="submit" data-scan-lock data-scan-label="Scan mount" data-scan-busy-label="Scanning…" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan mount" }}</button></form>
+                <form method="post" action="/admin/mounts/{{ mount.id }}/disconnect" data-confirm="Disconnect {{ mount.name }}? Readers stop seeing its libraries. The index, grants, reading progress and media files are all kept.">{{ csrf() }}<button class="danger ghost" type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Disconnect</button></form>
+              {% else %}
+                <form method="post" action="/admin/mounts/{{ mount.id }}/reconnect">{{ csrf() }}<button type="submit">Reconnect</button></form>
+                {% if not mount.is_default %}
+                  <form method="post" action="/admin/mounts/{{ mount.id }}/forget" data-confirm="Permanently forget {{ mount.name }}? Its index rows, grants and metadata are removed. Media files are never deleted.">{{ csrf() }}<button class="danger ghost" type="submit">Forget permanently</button></form>
+                {% endif %}
+              {% endif %}
+            </div>
+          </div>
+        </details>
+      {% endfor %}
+    </div>
+
+    <details class="add-mount-panel">
+      <summary class="button secondary">Add data mount</summary>
+      <form method="post" action="/admin/mounts" class="mount-settings-form">
+        {{ csrf() }}
+        {{ mount_fields(none) }}
+        <button type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Validate and add</button>
+      </form>
+    </details>
+  </section>
+
   <section class="admin-section">
     <div class="section-heading">
       <div><p class="eyebrow">Catalog sources</p><h2>Libraries</h2></div>
-      {% if available_libraries %}
-        <form method="post" action="/admin/libraries" class="inline-form add-library-form">
-          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-          <label><span class="sr-only">Available directory</span><select name="relative_path" required><option value="">Choose a directory…</option>{% for name in available_libraries %}<option value="{{ name }}">{{ name }}</option>{% endfor %}</select></label>
-          <button type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Add library</button>
-        </form>
-      {% else %}
-        <p class="muted add-library-hint">Every directory under the media root is already managed. Create another folder there to add one.</p>
-      {% endif %}
     </div>
-    {% if library_usage %}
-      <div class="library-list">
-        {% for usage in library_usage %}
-          <details class="library-card" open>
-            <summary><span><strong>{{ usage.library.name }}</strong><small>{{ usage.publication_count }} publications</small></span><span class="size-value" title="{{ usage.size }} bytes">{{ usage.size|gib }}</span></summary>
-            <div class="library-body">
-              {% if usage.categories %}
-                {% for category in usage.categories %}
-                  <div class="category-row"><div><strong>{{ category.name|title }}</strong><small>{{ category.publication_count }} publications</small></div><span title="{{ category.size }} bytes">{{ category.size|gib }}</span></div>
-                  <div class="series-list">
-                    {% for item in category.series %}<div><span>{{ item.name }}</span><small>{{ item.publication_count }} · {{ item.size|gib }}</small></div>{% endfor %}
-                  </div>
-                {% endfor %}
-              {% else %}<p class="muted">No indexed publications yet.</p>{% endif %}
-              <div class="card-actions">
-                {% if usage.categories|selectattr('name', 'equalto', 'manga')|list %}<form method="post" action="/admin/libraries/{{ usage.library.id }}/metadata/auto-match" data-confirm="Auto-match every unmatched manga series in {{ usage.library.name }}? Existing links and local edits will be preserved."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit">Auto-match MangaBaka</button></form>{% endif %}
-                <form method="post" action="/admin/libraries/{{ usage.library.id }}/scan"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="secondary" type="submit" data-scan-lock data-scan-label="Scan library" data-scan-busy-label="Scanning…" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan library" }}</button></form>
-                <form method="post" action="/admin/libraries/{{ usage.library.id }}/remove" data-confirm="Remove {{ usage.library.name }} from Nineveh? Media files will not be deleted."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Remove</button></form>
+    {% set ns = namespace(found=false) %}
+    {% for status, items in libraries_by_mount %}
+      {% if items %}
+        {% set ns.found = true %}
+        <h3 class="mount-heading">{{ status.mount.name }}</h3>
+        <div class="library-list">
+          {% for usage in items %}
+            <details class="library-card" open>
+              <summary><span><strong>{{ usage.library.name }}</strong><small>{% if usage.library.relative_path != usage.library.name %}{{ usage.library.relative_path }}/ · {% endif %}{{ usage.publication_count }} publications</small></span><span class="size-value" title="{{ usage.size }} bytes">{{ usage.size|gib }}</span></summary>
+              <div class="library-body">
+                {% if usage.categories %}
+                  {% for category in usage.categories %}
+                    <div class="category-row"><div><strong>{{ category.name|title }}</strong><small>{{ category.publication_count }} publications</small></div><span title="{{ category.size }} bytes">{{ category.size|gib }}</span></div>
+                    <div class="series-list">
+                      {% for item in category.series %}<div><span>{{ item.name }}</span><small>{{ item.publication_count }} · {{ item.size|gib }}</small></div>{% endfor %}
+                    </div>
+                  {% endfor %}
+                {% else %}<p class="muted">No indexed publications yet.</p>{% endif %}
+                <div class="card-actions">
+                  {% if usage.categories|selectattr('name', 'equalto', 'manga')|list %}<form method="post" action="/admin/libraries/{{ usage.library.id }}/metadata/auto-match" data-confirm="Auto-match every unmatched manga series in {{ usage.library.name }}? Existing links and local edits will be preserved.">{{ csrf() }}<button class="secondary" type="submit">Auto-match MangaBaka</button></form>{% endif %}
+                  <form method="post" action="/admin/libraries/{{ usage.library.id }}/scan">{{ csrf() }}<button class="secondary" type="submit" data-scan-lock data-scan-label="Scan library" data-scan-busy-label="Scanning…" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan library" }}</button></form>
+                  <form method="post" action="/admin/libraries/{{ usage.library.id }}/remove" data-confirm="Remove {{ usage.library.name }} from Nineveh? Media files will not be deleted.">{{ csrf() }}<button class="danger ghost" type="submit" data-scan-lock {% if scan_status.running %}disabled{% endif %}>Remove</button></form>
+                </div>
               </div>
-            </div>
-          </details>
-        {% endfor %}
-      </div>
-    {% else %}<div class="empty-state"><h3>No managed libraries</h3><p>Add an available directory to begin indexing it.</p></div>{% endif %}
+            </details>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endfor %}
+    {% if not ns.found %}<div class="empty-state"><h3>No managed libraries</h3><p>Add a directory from a connected data mount to begin indexing it.</p></div>{% endif %}
   </section>
 {% endblock %}

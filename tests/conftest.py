@@ -5,7 +5,7 @@ import io
 import time
 import zipfile
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -23,9 +23,15 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from nineveh.app import Container, create_app
+from nineveh.archives import ArchiveService
 from nineveh.auth import AuthService
 from nineveh.authorization import AccessService, ReadAllPolicy
-from nineveh.catalog import ArchiveInspector, LibraryService, SeriesService
+from nineveh.catalog import (
+    ArchiveInspector,
+    CatalogScanner,
+    LibraryService,
+    SeriesService,
+)
 from nineveh.config import Settings, SettingsService
 from nineveh.database import SQLiteRepository
 from nineveh.domain import ScannedPublication
@@ -37,6 +43,8 @@ from nineveh.librarian import (
 )
 from nineveh.opds import OpdsBuilder
 from nineveh.reader import ReaderService
+from nineveh.search import CatalogSearchService
+from nineveh.storage import MountService, StoragePathResolver
 
 ADMIN_PASSWORD = "correct horse battery staple"
 READER_PASSWORD = "a sufficiently long password"
@@ -71,6 +79,36 @@ def write_cbz(path: Path) -> None:
         archive.writestr("pages/2.png", image_bytes((0, 255, 0)))
         archive.writestr("pages/1.png", image_bytes((255, 0, 0)))
         archive.writestr("ComicInfo.xml", COMIC_INFO)
+
+
+@dataclass(frozen=True, slots=True)
+class Storage:
+    """The mount graph a test needs, wired the way `build_container` wires it."""
+
+    repository: SQLiteRepository
+    paths: StoragePathResolver
+    mounts: MountService
+    libraries: LibraryService
+
+    def scanner(self, settings: Settings) -> CatalogScanner:
+        return CatalogScanner(
+            self.repository, ArchiveInspector(settings), self.paths, self.libraries
+        )
+
+    def archives(self, settings: Settings) -> ArchiveService:
+        return ArchiveService(settings, self.paths)
+
+
+def storage(settings: Settings, *, initialize: bool = True) -> Storage:
+    repository = SQLiteRepository(settings.database_path)
+    repository.initialize()
+    mounts = MountService(repository, settings.state_dir, settings.data_dir)
+    mounts.initialize()
+    paths = StoragePathResolver(repository, settings.data_dir)
+    libraries = LibraryService(repository, paths)
+    if initialize:
+        libraries.initialize()
+    return Storage(repository, paths, mounts, libraries)
 
 
 @pytest.fixture
@@ -149,7 +187,8 @@ def fake_container(tmp_path: Path) -> Container:
         scan_interval_seconds=0,
         bootstrap_admin_password=ADMIN_PASSWORD,
     )
-    repository = SQLiteRepository(settings.database_path)
+    graph = storage(settings, initialize=False)
+    repository = graph.repository
     cover = tmp_path / "cover.webp"
     cover.write_bytes(b"fake-cover")
     audit = AuditTrail(repository)
@@ -165,7 +204,7 @@ def fake_container(tmp_path: Path) -> Container:
         page_cache=FakePageStore(),
         opds=OpdsBuilder("Nineveh"),
         access=AccessService(repository),
-        libraries=LibraryService(settings.data_dir, repository),
+        libraries=graph.libraries,
         series=SeriesService(repository),
         configuration=SettingsService(settings, repository),
         restarter=FakeRestartController(enabled=False),
@@ -174,12 +213,14 @@ def fake_container(tmp_path: Path) -> Container:
         librarian_auth=LibrarianAuth(repository, audit),
         librarian=LibrarianService(repository),
         ingest=IngestService(
-            settings.data_dir,
             settings.ingest_staging_dir,
             repository,
             ArchiveInspector(settings),
             settings.max_upload_bytes,
+            graph.paths,
         ),
+        mounts=graph.mounts,
+        search=CatalogSearchService(repository, settings.feed_page_size),
     )
 
 

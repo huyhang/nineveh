@@ -7,6 +7,7 @@ import re
 import threading
 import uuid
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -15,6 +16,7 @@ from xml.etree import ElementTree
 
 from .config import Settings
 from .domain import (
+    DEFAULT_MOUNT_ID,
     CatalogSeries,
     ManagedLibrary,
     Page,
@@ -23,10 +25,17 @@ from .domain import (
     ScanReport,
     ScanStatus,
 )
-from .ports import CatalogRepository, LibraryRepository
+from .ports import CatalogRepository, LibraryRepository, MountRepository
+from .storage import StorageError, StoragePathResolver
 
 
-class CatalogManagementRepository(CatalogRepository, LibraryRepository, Protocol):
+class LibraryManagementRepository(LibraryRepository, MountRepository, Protocol):
+    pass
+
+
+class CatalogManagementRepository(
+    CatalogRepository, LibraryManagementRepository, Protocol
+):
     pass
 
 
@@ -67,6 +76,7 @@ IMAGE_TYPES = {
     ".webp": "image/webp",
 }
 NATURAL_PARTS = re.compile(r"(\d+)")
+LIBRARY_NAME_LIMIT = 80
 
 
 class UnsafeArchive(ValueError):
@@ -78,40 +88,68 @@ class InvalidLibrary(ValueError):
 
 
 class LibraryService:
-    """Manages safe, direct children of the configured read-only data root."""
+    """Manages safe, direct children of each registered data mount."""
 
-    def __init__(self, data_dir: Path, repository: LibraryRepository) -> None:
-        self._data_dir = data_dir
+    def __init__(
+        self,
+        repository: LibraryManagementRepository,
+        paths: StoragePathResolver,
+    ) -> None:
         self._repository = repository
+        self._paths = paths
 
     def initialize(self) -> None:
+        """Adopt the configured root's directories, once, on a fresh install.
+
+        Only the original mount: a mount an administrator registers later has
+        its libraries chosen by hand, and silently adopting everything on it
+        would undo a deliberate omission at the next restart.
+        """
+        mount = self._repository.data_mount(DEFAULT_MOUNT_ID)
+        if mount is None:  # pragma: no cover - ensured before the app starts
+            return
         self._repository.initialize_libraries(
-            [entry.name for entry in _directories(self._data_dir)]
+            [entry.name for entry in _directories(Path(mount.path))], mount.id
         )
 
-    def available(self) -> list[str]:
-        enabled = {
+    def available(self, mount_id: str = DEFAULT_MOUNT_ID) -> list[str]:
+        mount = self._repository.data_mount(mount_id)
+        if mount is None:
+            return []
+        managed = {
             item.relative_path.casefold()
-            for item in self._repository.managed_libraries()
+            for item in self._repository.managed_libraries(mount_id=mount_id)
         }
         return [
             entry.name
-            for entry in _directories(self._data_dir)
-            if entry.name.casefold() not in enabled
+            for entry in _directories(Path(mount.path))
+            if entry.name.casefold() not in managed
         ]
 
-    def add(self, relative_path: str) -> ManagedLibrary:
-        candidate = relative_path.strip()
-        if (
-            not candidate
-            or Path(candidate).name != candidate
-            or candidate in {".", ".."}
-        ):
-            raise InvalidLibrary("Select a top-level directory under the data root")
-        present = {entry.name for entry in _directories(self._data_dir)}
-        if candidate not in present:
-            raise InvalidLibrary(f"No directory named {candidate} under the data root")
-        return self._repository.add_library(candidate)
+    def available_by_mount(self) -> dict[str, list[str]]:
+        return {
+            mount.id: self.available(mount.id)
+            for mount in self._repository.data_mounts(include_disabled=False)
+        }
+
+    def add(
+        self,
+        relative_path: str,
+        mount_id: str = DEFAULT_MOUNT_ID,
+        name: str | None = None,
+    ) -> ManagedLibrary:
+        candidate = _direct_child(relative_path)
+        mount = self._repository.data_mount(mount_id)
+        if mount is None or not mount.enabled:
+            raise InvalidLibrary("Select a connected data mount")
+        if candidate not in {entry.name for entry in _directories(Path(mount.path))}:
+            raise InvalidLibrary(f"No directory named {candidate} on {mount.name}")
+        try:
+            return self._repository.add_library(
+                candidate, mount_id, _display_name(name or candidate)
+            )
+        except ValueError as error:
+            raise InvalidLibrary(str(error)) from error
 
     def remove(self, library_id: str) -> ManagedLibrary:
         library = self._repository.remove_library(library_id)
@@ -120,12 +158,32 @@ class LibraryService:
         return library
 
 
+def _direct_child(relative_path: str) -> str:
+    candidate = relative_path.strip()
+    if not candidate or Path(candidate).name != candidate or candidate in {".", ".."}:
+        raise InvalidLibrary("Select a top-level directory on a data mount")
+    return candidate
+
+
+def _display_name(value: str) -> str:
+    cleaned = " ".join(value.split())
+    if not 1 <= len(cleaned) <= LIBRARY_NAME_LIMIT:
+        raise InvalidLibrary(f"Library name must be 1-{LIBRARY_NAME_LIMIT} characters")
+    return cleaned
+
+
 class ArchiveInspector:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
     def inspect(
-        self, path: Path, relative_path: str, publication_id: str
+        self,
+        path: Path,
+        relative_path: str,
+        publication_id: str,
+        *,
+        library_name: str | None = None,
+        library_id: str | None = None,
     ) -> ScannedPublication:
         before = path.stat()
         with zipfile.ZipFile(path) as archive:
@@ -140,7 +198,15 @@ class ArchiveInspector:
             raise UnsafeArchive("archive changed while it was being indexed")
 
         publication = self._publication(
-            path, relative_path, publication_id, after, revision, image_infos, metadata
+            path,
+            relative_path,
+            publication_id,
+            after,
+            revision,
+            image_infos,
+            metadata,
+            library_name=library_name,
+            library_id=library_id,
         )
         return ScannedPublication(
             publication,
@@ -169,15 +235,20 @@ class ArchiveInspector:
         revision: str,
         image_infos: list[zipfile.ZipInfo],
         metadata: dict[str, object],
+        *,
+        library_name: str | None = None,
+        library_id: str | None = None,
     ) -> Publication:
-        library, category, series, _ = PurePosixPath(relative_path).parts
+        # The folder name only names the library when the scanner did not say
+        # which one it was reading: a library may be displayed under an alias.
+        folder, category, series, _ = PurePosixPath(relative_path).parts
         cover_page = metadata.get("cover_page", 1)
         if not isinstance(cover_page, int) or not 1 <= cover_page <= len(image_infos):
             cover_page = 1
         return Publication(
             id=publication_id,
             relative_path=relative_path,
-            library=library,
+            library=library_name or folder,
             category=category,
             series=series,
             filename=path.name,
@@ -190,6 +261,7 @@ class ArchiveInspector:
             revision=revision,
             page_count=len(image_infos),
             cover_page=cover_page,
+            library_id=library_id,
         )
 
     def _pages(
@@ -310,13 +382,15 @@ class ArchiveInspector:
 class CatalogScanner:
     def __init__(
         self,
-        data_dir: Path,
         repository: CatalogManagementRepository,
         inspector: ArchiveInspector,
+        paths: StoragePathResolver,
+        libraries: LibraryService,
     ) -> None:
-        self._data_dir = data_dir
         self._repository = repository
         self._inspector = inspector
+        self._paths = paths
+        self._libraries = libraries
         self._run_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._status = ScanStatus()
@@ -327,6 +401,20 @@ class CatalogScanner:
             return self._status
 
     def scan(self, library_id: str | None = None) -> ScanReport:
+        return self._run(library_id, lambda: self._scan_once(library_id))
+
+    def scan_mount(self, mount_id: str) -> ScanReport:
+        """Scan one mount's libraries, leaving every other mount untouched."""
+        if self._repository.data_mount(mount_id) is None:
+            raise InvalidLibrary("Data mount not found")
+        return self._run(None, lambda: self._scan_libraries(self._on_mount(mount_id)))
+
+    def _on_mount(self, mount_id: str) -> list[ManagedLibrary]:
+        return self._repository.managed_libraries(mount_id=mount_id)
+
+    def _run(
+        self, library_id: str | None, work: Callable[[], ScanReport]
+    ) -> ScanReport:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("A catalog scan is already running")
         started = _now_iso()
@@ -341,7 +429,7 @@ class CatalogScanner:
             )
         )
         try:
-            report = self._scan_once(library_id)
+            report = work()
         except Exception as error:
             LOGGER.exception("Catalog scan failed")
             self._set_status(
@@ -362,22 +450,41 @@ class CatalogScanner:
             self._run_lock.release()
 
     def _scan_once(self, library_id: str | None) -> ScanReport:
-        if not self._data_dir.is_dir():
-            raise FileNotFoundError(f"Data directory does not exist: {self._data_dir}")
         if not self._repository.managed_libraries(include_disabled=True):
-            self._repository.initialize_libraries(
-                [entry.name for entry in _directories(self._data_dir)]
-            )
-        libraries = self._libraries_for_scan(library_id)
-        paths = [path for library in libraries for path in self._discover(library)]
+            self._libraries.initialize()
+        return self._scan_libraries(self._libraries_for_scan(library_id))
+
+    def _scan_libraries(self, libraries: list[ManagedLibrary]) -> ScanReport:
+        """Scan each library on its own mount, and report what was skipped.
+
+        A library whose storage is unavailable is left exactly as it was
+        indexed: unplugging a disk must never look like deleting a library.
+        """
+        totals = ScanReport(0, 0, 0, 0, 0)
+        for library in libraries:
+            try:
+                report = self._scan_library(library)
+            except (OSError, StorageError) as error:
+                LOGGER.warning("Leaving %s indexed: %s", library.name, error)
+                totals = _add_reports(totals, ScanReport(0, 0, 0, 0, 1))
+                continue
+            totals = _add_reports(totals, report)
+        return totals
+
+    def _scan_library(self, library: ManagedLibrary) -> ScanReport:
+        root = self._library_root(library)
+        paths = list(self._discover(library, root))
+        mount_root = Path(self._paths.mount_for_library(library).path)
         seen: set[str] = set()
         indexed = unchanged = failed = 0
         for path in paths:
-            relative_path = path.relative_to(self._data_dir).as_posix()
+            relative_path = path.relative_to(mount_root).as_posix()
             seen.add(relative_path)
             try:
                 stat = path.stat()
-                existing = self._repository.publication_by_path(relative_path)
+                existing = self._repository.publication_by_path(
+                    relative_path, library.id
+                )
                 if (
                     existing
                     and existing.modified_ns == stat.st_mtime_ns
@@ -386,14 +493,31 @@ class CatalogScanner:
                     unchanged += 1
                     continue
                 publication_id = existing.id if existing else str(uuid.uuid4())
-                scanned = self._inspector.inspect(path, relative_path, publication_id)
+                scanned = self._inspector.inspect(
+                    path,
+                    relative_path,
+                    publication_id,
+                    library_name=library.name,
+                    library_id=library.id,
+                )
                 self._repository.upsert_publication(scanned)
                 indexed += 1
             except (OSError, UnsafeArchive, zipfile.BadZipFile) as error:
                 failed += 1
                 LOGGER.warning("Skipping %s: %s", relative_path, error)
-        removed = self._repository.remove_publications_except(seen, library_id)
+        removed = self._repository.remove_publications_except(seen, library.id)
         return ScanReport(len(paths), indexed, unchanged, removed, failed)
+
+    def _library_root(self, library: ManagedLibrary) -> Path:
+        mount = self._paths.mount_for_library(library)
+        if not mount.enabled:
+            raise StorageError(f"{mount.name} is disconnected")
+        if not mount.scan_enabled:
+            raise StorageError(f"{mount.name} is excluded from scans")
+        root = self._paths.library_root(library)
+        if not root.is_dir() or root.is_symlink():
+            raise FileNotFoundError(f"library directory is unavailable: {root}")
+        return root
 
     def _libraries_for_scan(self, library_id: str | None) -> list[ManagedLibrary]:
         if library_id is None:
@@ -403,11 +527,7 @@ class CatalogScanner:
             raise InvalidLibrary("Managed library not found")
         return [library]
 
-    def _discover(self, library: ManagedLibrary):
-        root = self._data_dir / library.relative_path
-        if not root.is_dir() or root.is_symlink():
-            LOGGER.warning("Managed library directory is unavailable: %s", root)
-            return
+    def _discover(self, library: ManagedLibrary, root: Path):
         for category_name in ("comics", "manga"):
             category = root / category_name
             if not category.is_dir() or category.is_symlink():
@@ -429,6 +549,16 @@ class CatalogScanner:
     def _set_status(self, status: ScanStatus) -> None:
         with self._status_lock:
             self._status = status
+
+
+def _add_reports(left: ScanReport, right: ScanReport) -> ScanReport:
+    return ScanReport(
+        left.discovered + right.discovered,
+        left.indexed + right.indexed,
+        left.unchanged + right.unchanged,
+        left.removed + right.removed,
+        left.failed + right.failed,
+    )
 
 
 def _completed_status(

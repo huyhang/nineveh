@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Search · {{ service_title }}{% endblock %}
+{% block main_class %}search-page{% endblock %}
+
+{% macro facet_group(legend, field, facets, chosen, control="checkbox") %}
+  {% if facets %}
+    <fieldset><legend>{{ legend }}</legend>
+      {% for facet in facets %}
+        <label>
+          <input type="{{ control }}" name="{{ field }}" value="{{ facet.value }}" {% if facet.value in chosen %}checked{% endif %}>
+          <span>{{ facet.label }}</span><small>{{ facet.count }}</small>
+        </label>
+      {% endfor %}
+    </fieldset>
+  {% endif %}
+{% endmacro %}
+
+{% block content %}
+  <header class="search-hero">
+    <p class="eyebrow">Find your next read</p>
+    <h1>Search your collection</h1>
+    <form method="get" action="/search" class="search-command" role="search" data-search-form>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>
+      <label class="sr-only" for="search-query">Search titles, volumes, or creators</label>
+      <input id="search-query" name="q" value="{{ query }}" placeholder="Title, volume, creator, publisher, or tag"
+             autocomplete="off" autofocus data-search-input role="combobox"
+             aria-autocomplete="list" aria-expanded="false" aria-controls="search-suggestions">
+      <kbd>/</kbd>
+      <button type="submit">Search</button>
+      <div id="search-suggestions" class="search-suggestions" role="listbox" aria-label="Suggestions" hidden data-search-suggestions></div>
+    </form>
+    {% if query or filters.active %}
+      <p class="search-summary">
+        {{ results.total }} series{% if query %} for “{{ query }}”{% endif %}
+      </p>
+    {% else %}
+      <p class="search-summary">Search every library and the Private titles you can reach, at once.</p>
+    {% endif %}
+  </header>
+
+  {% if query or filters.active %}
+    <div class="search-layout">
+      <aside class="search-filters" aria-label="Search filters">
+        <details open data-search-filter-panel>
+          <summary>Filters and sorting</summary>
+          <form method="get" action="/search">
+            <input type="hidden" name="q" value="{{ query }}">
+            <div class="filter-heading">
+              <strong>Refine</strong>
+              {% if filters.active %}<a href="{{ reset_url }}">Clear all</a>{% endif %}
+            </div>
+            <label class="sort-field">Sort
+              <select name="sort">
+                <option value="relevance" {% if selected.sort == 'relevance' %}selected{% endif %}>Best match</option>
+                <option value="title" {% if selected.sort == 'title' %}selected{% endif %}>Title A–Z</option>
+                <option value="recent" {% if selected.sort == 'recent' %}selected{% endif %}>Recently added</option>
+              </select>
+            </label>
+            {{ facet_group("Collection", "collection", results.facets.collections, selected.collections) }}
+            {{ facet_group("Library", "library", results.facets.libraries, selected.libraries) }}
+            {{ facet_group("Format", "category", results.facets.categories, selected.categories) }}
+            {{ facet_group("Creator", "creator", results.facets.creators, selected.creators) }}
+            {{ facet_group("Publisher", "publisher", results.facets.publishers, selected.publishers) }}
+            {{ facet_group("Status", "status", results.facets.statuses, selected.statuses) }}
+            {{ facet_group("Year", "year", results.facets.years, selected.years) }}
+            {% if results.facets.tags %}
+              <details class="tag-filters"><summary>Tags</summary>
+                {{ facet_group("Tags", "tag", results.facets.tags, selected.tags) }}
+              </details>
+            {% endif %}
+            <fieldset><legend>Reading state</legend>
+              {% for value, label in [('unread', 'Unread'), ('in-progress', 'In progress'), ('completed', 'Completed')] %}
+                <label>
+                  <input type="radio" name="reading" value="{{ value }}" {% if selected.reading == value %}checked{% endif %}>
+                  <span>{{ label }}</span>
+                </label>
+              {% endfor %}
+            </fieldset>
+            <button type="submit">Apply filters</button>
+          </form>
+        </details>
+      </aside>
+
+      <section class="search-results" aria-label="Search results">
+        {% if results.results %}
+          {% for hit in results.results %}
+            <article class="search-result">
+              <a class="search-result-cover" href="/series/{{ hit.series.id }}">
+                <img src="/api/v1/series/{{ hit.series.id }}/cover?revision={{ hit.series.first_publication_revision }}"
+                     alt="Cover for {{ hit.title }}" width="112" loading="lazy">
+              </a>
+              <div class="search-result-main">
+                <div class="search-result-kicker">
+                  <span>{{ hit.series.library }} · {{ hit.series.category|title }}</span>
+                  <span class="result-badges">
+                    <span class="read-badge {{ hit.document.read_state }}">{{ {'unread': 'Unread', 'in-progress': 'Reading', 'completed': 'Finished'}[hit.document.read_state] }}</span>
+                    {% if hit.series.is_private %}<span class="private-result-badge">Private</span>{% endif %}
+                  </span>
+                </div>
+                <h2><a href="/series/{{ hit.series.id }}">{{ hit.title }}</a></h2>
+                {% if hit.title != hit.series.name %}<p class="local-title">{{ hit.series.name }}</p>{% endif %}
+                <p class="match-reason">
+                  {% if hit.reasons %}Matched {{ hit.reasons|join(' · ') }} · {% endif %}
+                  {{ hit.series.publication_count }} volume{% if hit.series.publication_count != 1 %}s{% endif %}
+                </p>
+                {% if hit.volumes %}
+                  <div class="matching-volumes">
+                    {% for match in hit.volumes %}
+                      <a href="/read/{{ match.volume.id }}">
+                        <span><strong>{{ match.volume.title }}</strong><small>{{ match.reason }}</small></span>
+                        <span>Read →</span>
+                      </a>
+                    {% endfor %}
+                  </div>
+                {% endif %}
+              </div>
+            </article>
+          {% endfor %}
+          {% if previous_url or next_url %}
+            <nav class="pagination" aria-label="Search pages">
+              {% if previous_url %}<a class="button secondary" href="{{ previous_url }}">Previous</a>{% endif %}
+              <span>Page {{ results.page }} of {{ results.page_count }}</span>
+              {% if next_url %}<a class="button secondary" href="{{ next_url }}">Next</a>{% endif %}
+            </nav>
+          {% endif %}
+        {% else %}
+          <div class="empty-state search-empty">
+            <h2>No matches</h2>
+            <p>Try fewer words, check the spelling, or <a href="{{ reset_url }}">clear the filters</a>.</p>
+          </div>
+        {% endif %}
+      </section>
+    </div>
+  {% else %}
+    <section class="search-start">
+      <div><span aria-hidden="true">/</span><strong>Search from anywhere</strong><p>Press <kbd>/</kbd> on any page to jump here and start typing.</p></div>
+      <div><span aria-hidden="true">◎</span><strong>One result list</strong><p>Private titles you can reach are included, and clearly marked.</p></div>
+      <div><span aria-hidden="true">↗</span><strong>Straight to reading</strong><p>Matching volumes open directly from each series.</p></div>
+    </section>
+  {% endif %}
+{% endblock %}

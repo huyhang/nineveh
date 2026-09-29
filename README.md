@@ -11,6 +11,10 @@ The service is designed for a small Docker host such as a Synology NAS. Media is
 - Secure browser sessions and a responsive catalog
 - Local users and hierarchical read access managed through an administrator page or JSON API
 - Explicitly managed libraries with per-library scans and indexed-size reporting
+- Several data mounts, added and configured from the administrator page, with
+  per-mount scans, health, and a reversible disconnect
+- A dedicated ranked search page with typo tolerance, faceted filters, match
+  explanations, and direct links to the matching volume
 - Series-first browser navigation through libraries and comics/manga categories
 - Default, dense, and list layouts remembered by each browser
 - A grant-aware Private Collection with matching browser and OPDS navigation
@@ -32,7 +36,8 @@ PDF files are not supported in this initial release.
 
 ## Library layout
 
-Mount a directory with this exact structure at `/data`:
+Every data mount uses this structure. `/data` is the first one; an
+administrator may register more from **Admin → Libraries**:
 
 ```text
 data root/
@@ -49,6 +54,11 @@ data root/
         └── Series Name/
             └── Collection.cbz
 ```
+
+A library's directory name only has to be unique on its own mount. Its
+*display* name is unique everywhere, because that is what readers, grants and
+OPDS feeds see: adding a second "Manga" folder from another disk asks for a
+display name to tell them apart.
 
 Symlinks and files outside this hierarchy are ignored. Pages are naturally sorted by archive member name. When present, Nineveh uses title, series, number, summary, creators, and cover information from `ComicInfo.xml`.
 
@@ -92,7 +102,10 @@ All catalog and content endpoints require authentication.
 | `/api/v1/publications/{id}/pages/{number}` | Original page image, or a screen-sized copy with `?width=` (640, 960, or 1280) |
 | `/api/v1/publications/{id}/range?start=1&end=20` | That page range as a standalone CBZ |
 | `/api/v1/publications/{id}/progress` | Per-reader position and completion (`PUT` to save, `DELETE` to clear); `mode` is deprecated, see below |
-| `/api/v1/admin/libraries` | Managed libraries, indexed capacity, and available `/data` directories |
+| `/api/v1/search` | Ranked series search with facet counts; the same engine the search page uses |
+| `/api/v1/search/suggestions` | Type-ahead series suggestions for the browser search box |
+| `/api/v1/admin/libraries` | Managed libraries, indexed capacity, data mounts, and their unmanaged directories |
+| `/api/v1/admin/mounts` | Register a data mount; `PUT`, `DELETE`, `/disconnect`, `/reconnect`, and `/scan` manage one |
 | `/api/v1/admin/users/{id}/access` | Library, content-type, and series read grants |
 | `/api/v1/admin/settings`, `/api/v1/admin/restart` | Persisted application settings and restart control |
 | `/api/v1/admin/librarian-tokens` | Issue, re-scope, list, and revoke librarian credentials |
@@ -123,7 +136,7 @@ Reading position is API state rather than a private detail of the browser reader
 
 | Variable | Default | Description |
 |---|---:|---|
-| `NINEVEH_DATA_DIR` | `/data` | Library root; the librarian's ingest path needs create access |
+| `NINEVEH_DATA_DIR` | `/data` | The first data mount; more are registered in Admin. The librarian's ingest path needs create access |
 | `NINEVEH_STATE_DIR` | `/state` | Writable database and cache directory |
 | `NINEVEH_ADMIN_USERNAME` | `admin` | First administrator username |
 | `NINEVEH_ADMIN_PASSWORD_FILE` | — | File containing the first administrator password |
@@ -164,9 +177,65 @@ The bootstrap password is used only when `/state` contains no users. Afterwards,
 
 On first startup, Nineveh registers each top-level directory under `/data`. Later directories must be added explicitly from the admin UI. Removing a library clears its index and grants but never deletes anything from the media directory. Reported capacity is the sum of indexed CBZ file sizes.
 
+### Data mounts
+
+A *data mount* is a directory Nineveh indexes libraries from. `/data` is the
+first, and an administrator registers the rest under **Admin → Libraries** by
+entering a path. That path is a location **inside the container**: Nineveh can
+register a directory the deployment has already exposed, but it cannot create a
+Docker bind mount, so add the volume first and recreate the service. Paths are
+validated for existence, permissions, symlinks, overlap with another mount or
+with `/state`, and against the system directories a library never lives in.
+
+New mounts are read-only to the librarian agent until an administrator enables
+ingest and the underlying volume is writable. Each mount can also be left out
+of scheduled scans and scanned on demand instead.
+
+Mounts have three states an administrator can see on the card:
+
+| State | What it means |
+|---|---|
+| Healthy | Readable, scanned, and serving |
+| Disconnected | Hidden from readers and skipped by scans, on purpose. The index, grants, reading progress and media are all kept, and reconnecting restores them |
+| Missing | Nothing is mounted at that path. Libraries stay indexed and are never pruned; a rescan picks them up when the storage returns |
+
+Unplugging a disk is therefore never mistaken for deleting a library. A
+disconnected mount can be permanently forgotten, which clears its catalog rows,
+grants and metadata — and still never touches a media file. The original `/data`
+mount cannot be forgotten, because it is the directory Nineveh was configured
+with.
+
+### Search
+
+**Search** is its own page. It ranks series rather than listing them: an exact
+title beats a prefix, a creator beats a tag, and a title containing the whole
+query beats one that merely contains each word. A query that matches nothing is
+retried once against the index's own vocabulary, so `ninevh` still finds Nineveh.
+Each result says which field matched and links directly to the matching volumes,
+and the filter rail counts each value against every *other* active filter, so a
+count always says how many results choosing it will give.
+
+Search covers everything the reader may already reach, Private Collection
+included, and marks those results. It runs entirely server-rendered; the `/`
+shortcut and the type-ahead suggestions are enhancements that need JavaScript.
+
 Docker-level options such as `NINEVEH_MEMORY_LIMIT` remain deployment-managed. Compose enables the UI restart action; it gracefully exits the application and the `unless-stopped` policy restarts the same container with saved application settings. A Docker restart does not apply edits to Compose-level resource limits; recreate the service after changing those values. The settings page reports the ceiling it reads from the container's own cgroup, so it shows what is actually enforced rather than what was declared.
 
-Upgrades run in place and are replayable: a v1 database gains the managed-library, series, grant, and settings tables on first start, and an upgrade interrupted partway through resumes on the next start rather than leaving the database unopenable.
+Upgrades run in place and are replayable: a v1 database gains the managed-library, series, grant, and settings tables on first start, and an upgrade interrupted partway through resumes on the next start rather than leaving the database unopenable. There is no migration command to run — pull the image and restart.
+
+Arriving at data mounts and search (schema v10) does three things to an existing
+database, all on the first start: the configured `NINEVEH_DATA_DIR` becomes the
+default mount and every library is attached to it; uniqueness moves from the bare
+directory name to the mount it sits on, and from the bare stored path to the
+library it belongs to, so two disks may repeat both; and the search index is built
+from the rows already there, so search works without a rescan. Nothing is
+re-indexed and nothing is pruned — the first scan after the upgrade reports every
+publication unchanged.
+
+A database is only ever read by the release that understands it: an older image
+refuses a newer schema with a clear message rather than reading it half-right. The
+upgrade is therefore one-way, so keep the usual copy of the state directory before
+pulling a new image.
 
 ## Local development
 
@@ -228,6 +297,11 @@ For a token with ingest scopes, issue one under **Admin → Librarian** instead.
 |---|---|---|
 | `NINEVEH_DEV_PORT` | `8081` | Port to serve on |
 | `NINEVEH_DEV_DATA` | `.dev/data` | Library to serve, e.g. `"$PWD/example-data"`. State stays in `.dev/` |
+
+To exercise several mounts locally, start the server, create another source
+root anywhere the process can read, and register its absolute path under
+**Admin → Libraries**. A local process sees the path directly; a container
+needs the bind mount first.
 
 Any other [configuration](#configuration) variable you export, such as `NINEVEH_SCAN_INTERVAL_SECONDS`, is passed through to Nineveh.
 

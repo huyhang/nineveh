@@ -4,8 +4,10 @@ import os
 import sqlite3
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
@@ -48,16 +50,21 @@ from .auth import (
 from .catalog import IMAGE_TYPES, InvalidLibrary
 from .deployment import memory_limit_text
 from .domain import (
+    DEFAULT_MOUNT_ID,
     AccessGrant,
     CatalogSeries,
     CatalogVisibility,
+    DataMount,
     LibrarianEvent,
     LibrarianToken,
     LibraryUsage,
     ManagedLibrary,
+    MountStatus,
     Page,
     Publication,
     ReadingProgress,
+    SearchHit,
+    SearchPage,
     Session,
     User,
 )
@@ -75,6 +82,8 @@ from .opds import (
     PUBLICATIONS_PATH,
 )
 from .opds import url as opds_url
+from .search import filters_from_params
+from .storage import MountInUse, MountNotFound, MountService, StorageError
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
     from .app import Container
@@ -120,6 +129,21 @@ class AccessUpdate(BaseModel):
 
 class LibraryCreate(BaseModel):
     relative_path: str = Field(min_length=1, max_length=255)
+    mount_id: str = Field(default=DEFAULT_MOUNT_ID, min_length=1, max_length=64)
+    # An alias, when the folder name is already taken by another mount's
+    # library. Display names are unique; directory names need not be.
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class MountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    path: str = Field(min_length=1, max_length=1024)
+    allow_ingest: bool = False
+    scan_enabled: bool = True
+
+
+class MountUpdate(MountCreate):
+    pass
 
 
 class SettingsUpdate(BaseModel):
@@ -319,6 +343,62 @@ class SeriesDetail(ResponseBody):
     publication_count: int
     cover: str
     metadata: SeriesMetadataRecord | None
+
+
+class SearchSeries(ResponseBody):
+    """A series as a search result names it, without the metadata payload."""
+
+    id: str
+    library_id: str
+    library: str
+    category: Literal["comics", "manga"]
+    local_name: str
+    is_private: bool
+    publication_count: int
+    cover: str
+
+
+class SearchVolumeHit(ResponseBody):
+    id: str
+    title: str
+    # Which field matched, e.g. `Volume “The Lion's Road”`.
+    reason: str
+
+
+class SearchResultEntry(ResponseBody):
+    series: SearchSeries
+    title: str
+    score: float
+    read_state: Literal["unread", "in-progress", "completed"]
+    match_reasons: list[str]
+    volumes: list[SearchVolumeHit]
+
+
+class SearchFacetEntry(ResponseBody):
+    value: str
+    label: str
+    count: int
+
+
+class SearchFacetGroups(ResponseBody):
+    libraries: list[SearchFacetEntry]
+    categories: list[SearchFacetEntry]
+    collections: list[SearchFacetEntry]
+    creators: list[SearchFacetEntry]
+    publishers: list[SearchFacetEntry]
+    tags: list[SearchFacetEntry]
+    statuses: list[SearchFacetEntry]
+    years: list[SearchFacetEntry]
+
+
+class SearchResults(ResponseBody):
+    total: int
+    page: int
+    page_count: int
+    results: list[SearchResultEntry]
+    # Counts for each filter family, narrowed by every *other* active filter,
+    # so choosing a value always returns the number shown beside it.
+    facets: SearchFacetGroups
 
 
 class NamedEntry(ResponseBody):
@@ -565,6 +645,54 @@ async def ready(request: Request) -> dict[str, object]:
     return {
         "status": "ok" if database_ready else "unavailable",
         "catalog": asdict(scan),
+    }
+
+
+@router.get("/api/v1/search", response_model=SearchResults, tags=["search"])
+async def search_catalog(
+    request: Request,
+    identity: Annotated[Identity, Depends(authenticated)],
+    q: str = Query(default="", max_length=200),
+    page: int = Query(default=1, ge=1),
+) -> dict[str, object]:
+    """Ranked series search, scoped to what the caller may read."""
+    container = _container(request)
+    scope = container.authorization.read_scope(identity.user)
+    filters = filters_from_params(_multi_params(request))
+    result = await run_in_threadpool(
+        partial(
+            container.search.search,
+            q,
+            scope=scope,
+            user_id=identity.user.id,
+            filters=filters,
+            page=page,
+        )
+    )
+    return _public_search(result)
+
+
+@router.get("/api/v1/search/suggestions", tags=["catalog"])
+async def search_suggestions(
+    request: Request,
+    identity: Annotated[Identity, Depends(authenticated)],
+    q: str = Query(min_length=2, max_length=200),
+) -> dict[str, object]:
+    container = _container(request)
+    scope = container.authorization.read_scope(identity.user)
+    found = await run_in_threadpool(
+        partial(container.search.suggestions, q, scope=scope)
+    )
+    return {
+        "suggestions": [
+            {
+                "kind": item.kind,
+                "title": item.title,
+                "subtitle": item.subtitle,
+                "url": item.url,
+            }
+            for item in found
+        ]
     }
 
 
@@ -1461,11 +1589,116 @@ async def admin_libraries(
 ) -> dict[str, object]:
     container = _container(request)
     usage = await run_in_threadpool(container.repository.library_usage)
-    available = await run_in_threadpool(container.libraries.available)
+    statuses = await run_in_threadpool(container.mounts.statuses)
+    available = await run_in_threadpool(container.libraries.available_by_mount)
     return {
         "libraries": [_public_usage(item) for item in usage],
-        "available": available,
+        "available": available.get(DEFAULT_MOUNT_ID, []),
+        "mounts": [
+            {
+                **_public_mount(status),
+                "availableDirectories": available.get(status.mount.id, []),
+            }
+            for status in statuses
+        ],
     }
+
+
+@router.post("/api/v1/admin/mounts", status_code=201, tags=["administration"])
+async def add_mount(
+    request: Request,
+    body: MountCreate,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    service = _mount_service(request, identity, csrf_token)
+    mount = await _mount_call(
+        service.add,
+        body.name,
+        body.path,
+        allow_ingest=body.allow_ingest,
+        scan_enabled=body.scan_enabled,
+    )
+    return _public_mount(await run_in_threadpool(service.status, mount))
+
+
+@router.put("/api/v1/admin/mounts/{mount_id}", tags=["administration"])
+async def update_mount(
+    request: Request,
+    mount_id: str,
+    body: MountUpdate,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    service = _mount_service(request, identity, csrf_token)
+    mount = await _mount_call(
+        service.update,
+        mount_id,
+        name=body.name,
+        path=body.path,
+        allow_ingest=body.allow_ingest,
+        scan_enabled=body.scan_enabled,
+    )
+    return _public_mount(await run_in_threadpool(service.status, mount))
+
+
+@router.post("/api/v1/admin/mounts/{mount_id}/disconnect", tags=["administration"])
+async def disconnect_mount(
+    request: Request,
+    mount_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    service = _mount_service(request, identity, csrf_token)
+    mount = await _mount_call(service.disconnect, mount_id)
+    return _public_mount(await run_in_threadpool(service.status, mount))
+
+
+@router.post("/api/v1/admin/mounts/{mount_id}/reconnect", tags=["administration"])
+async def reconnect_mount(
+    request: Request,
+    mount_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    service = _mount_service(request, identity, csrf_token)
+    mount = await _mount_call(service.reconnect, mount_id)
+    return {
+        **_public_mount(await run_in_threadpool(service.status, mount)),
+        "scanStarted": request.app.state.start_mount_scan(mount.id),
+    }
+
+
+@router.post(
+    "/api/v1/admin/mounts/{mount_id}/scan", status_code=202, tags=["administration"]
+)
+async def scan_mount(
+    request: Request,
+    mount_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    require_api_csrf(request, identity, csrf_token)
+    container = _container(request)
+    if await run_in_threadpool(container.repository.data_mount, mount_id) is None:
+        raise HTTPException(status_code=404, detail="Data mount not found")
+    if not request.app.state.start_mount_scan(mount_id):
+        raise HTTPException(
+            status_code=409, detail="Wait for the catalog scan to finish"
+        )
+    return {"status": "accepted", "mountId": mount_id}
+
+
+@router.delete("/api/v1/admin/mounts/{mount_id}", tags=["administration"])
+async def forget_mount(
+    request: Request,
+    mount_id: str,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    service = _mount_service(request, identity, csrf_token)
+    mount = await _mount_call(service.forget, mount_id)
+    return _public_mount_row(mount)
 
 
 @router.post("/api/v1/admin/libraries", status_code=201, tags=["administration"])
@@ -1482,7 +1715,9 @@ async def add_library(
         )
     service = _container(request).libraries
     try:
-        library = await run_in_threadpool(service.add, body.relative_path)
+        library = await run_in_threadpool(
+            service.add, body.relative_path, body.mount_id, body.name
+        )
     except InvalidLibrary as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return {
@@ -2031,11 +2266,123 @@ def _public_grant(grant: AccessGrant) -> dict[str, str | None]:
     }
 
 
+def _multi_params(request: Request) -> dict[str, list[str]]:
+    """Query parameters as repeatable lists, which is how facets arrive."""
+    values: dict[str, list[str]] = {}
+    for key, value in request.query_params.multi_items():
+        values.setdefault(key, []).append(value)
+    return values
+
+
+def _public_search(page: SearchPage) -> dict[str, object]:
+    return {
+        "total": page.total,
+        "page": page.page,
+        "pageCount": page.page_count,
+        "results": [_public_hit(hit) for hit in page.results],
+        "facets": {
+            name: [
+                {"value": facet.value, "label": facet.label, "count": facet.count}
+                for facet in getattr(page.facets, name)
+            ]
+            for name in (
+                "libraries",
+                "categories",
+                "collections",
+                "creators",
+                "publishers",
+                "tags",
+                "statuses",
+                "years",
+            )
+        },
+    }
+
+
+def _public_hit(hit: SearchHit) -> dict[str, object]:
+    series = hit.series
+    return {
+        "series": {
+            "id": series.id,
+            "libraryId": series.library_id,
+            "library": series.library,
+            "category": series.category,
+            "localName": series.name,
+            "isPrivate": series.is_private,
+            "publicationCount": series.publication_count,
+            "cover": f"/api/v1/series/{series.id}/cover",
+        },
+        "title": hit.title,
+        "score": hit.score,
+        "readState": hit.document.read_state,
+        "matchReasons": list(hit.reasons),
+        "volumes": [
+            {
+                "id": match.volume.id,
+                "title": match.volume.title,
+                "reason": match.reason,
+            }
+            for match in hit.volumes
+        ],
+    }
+
+
+def _mount_service(
+    request: Request, identity: Identity, csrf_token: str | None
+) -> MountService:
+    """Every mount change shares the same guards."""
+    require_api_csrf(request, identity, csrf_token)
+    if scan_active(request):
+        raise HTTPException(
+            status_code=409, detail="Wait for the catalog scan to finish"
+        )
+    return _container(request).mounts
+
+
+async def _mount_call(
+    operation: Callable[..., DataMount], *args, **kwargs
+) -> DataMount:
+    """Run a mount change, mapping its refusal onto the right status code."""
+    try:
+        return await run_in_threadpool(partial(operation, *args, **kwargs))
+    except MountNotFound as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except MountInUse as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (StorageError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+def _public_mount_row(mount: DataMount) -> dict[str, object]:
+    return {
+        "id": mount.id,
+        "name": mount.name,
+        "path": mount.path,
+        "allowIngest": mount.allow_ingest,
+        "scanEnabled": mount.scan_enabled,
+        "enabled": mount.enabled,
+        "createdAt": mount.created_at.isoformat(),
+    }
+
+
+def _public_mount(status: MountStatus) -> dict[str, object]:
+    return {
+        **_public_mount_row(status.mount),
+        "health": status.health.value,
+        "writable": status.writable,
+        "detail": status.detail,
+        "libraryCount": status.library_count,
+        "publicationCount": status.publication_count,
+        "size": status.size,
+    }
+
+
 def _public_library(library: ManagedLibrary) -> dict[str, object]:
     return {
         "id": library.id,
         "name": library.name,
         "relativePath": library.relative_path,
+        "mountId": library.mount_id,
         "enabled": library.enabled,
         "createdAt": library.created_at.isoformat(),
     }

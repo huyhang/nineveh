@@ -38,6 +38,10 @@ services:
       # the only write the agent can cause, and it never replaces a file: the
       # final step is a hard link, which fails outright if the name is taken.
       - "${NINEVEH_DATA_PATH:?Set NINEVEH_DATA_PATH in .env}:/data"
+      # More media roots mount at any stable container path and are then
+      # registered by that path in Admin > Libraries. Prefer :ro unless
+      # librarian ingest is meant to be enabled for that mount.
+      #- "${NINEVEH_ARCHIVE_PATH}:/media/archive:ro"
       - "${NINEVEH_STATE_PATH:?Set NINEVEH_STATE_PATH in .env}:/state"
       - "${NINEVEH_SECRETS_PATH:-./secrets}:/run/secrets:ro"
     # A ceiling, not a target: Nineveh idles around 80-120 MB. The limit exists so
