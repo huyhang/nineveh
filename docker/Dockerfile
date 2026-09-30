@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.12.11-slim-bookworm AS build
+FROM python:3.14.7-slim-bookworm AS build
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -15,7 +15,7 @@ COPY src ./src
 RUN python -m pip wheel --no-cache-dir --no-build-isolation --no-deps \
     --wheel-dir /wheels .
 
-FROM python:3.12.11-slim-bookworm AS runtime
+FROM python:3.14.7-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
