@@ -21,11 +21,15 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
 import zipfile
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
@@ -109,6 +113,10 @@ class LibrarianTooLarge(LibrarianError):
     """The upload exceeds the configured ceiling."""
 
 
+class LibrarianCapacity(LibrarianError):
+    """Staging is full: this token's quota, or the state volume's reserve."""
+
+
 class LibrarianCatalog(
     CatalogRepository, LibraryRepository, MetadataRepository, Protocol
 ):
@@ -187,6 +195,9 @@ class StagedUpload:
     sha256: str
     duplicate_of: tuple[str, str] | None
     created_at: datetime
+    # The token that proposed it. Uploads staged before attribution existed
+    # carry None and count against every token's quota, conservatively.
+    token_id: str | None = None
 
     @property
     def state(self) -> str:
@@ -293,9 +304,20 @@ class LibrarianAuth:
 
     PREFIX = "nvh_"
 
-    def __init__(self, repository: LibrarianRepository, audit: AuditTrail) -> None:
+    TOUCH_INTERVAL_SECONDS = 60
+
+    def __init__(
+        self,
+        repository: LibrarianRepository,
+        audit: AuditTrail,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._repository = repository
         self._audit = audit
+        self._clock = clock
+        self._touched: dict[str, float] = {}
+        self._touch_lock = threading.Lock()
 
     def issue(
         self,
@@ -328,9 +350,19 @@ class LibrarianAuth:
         if not secret or not secret.startswith(self.PREFIX):
             return None
         token = self._repository.librarian_token_by_hash(self._hash(secret))
-        if token:
+        if token and self._touch_due(token.id):
             self._repository.touch_librarian_token(token.id)
         return token
+
+    def _touch_due(self, token_id: str) -> bool:
+        """Record use at most once a minute, not as one write per request."""
+        now = self._clock()
+        with self._touch_lock:
+            last = self._touched.get(token_id)
+            if last is not None and now - last < self.TOUCH_INTERVAL_SECONDS:
+                return False
+            self._touched[token_id] = now
+            return True
 
     def tokens(self, *, include_revoked: bool = False) -> list[LibrarianToken]:
         return self._repository.librarian_tokens(include_revoked=include_revoked)
@@ -530,6 +562,79 @@ class LibrarianService:
         return found[:limit]
 
 
+def _free_bytes(directory: Path) -> int:
+    return shutil.disk_usage(directory).free
+
+
+@dataclass(slots=True)
+class _Upload:
+    written: int = 0
+
+
+class StagingQuota:
+    """Per-token staging allowance, enforced before and while bytes arrive.
+
+    Counts what a token already has staged plus what it is uploading right now,
+    so two concurrent uploads cannot both slip under the ceiling, and keeps the
+    state volume's free-space reserve intact as the bytes land.
+    """
+
+    def __init__(
+        self,
+        max_files: int = sys.maxsize,
+        max_bytes: int = sys.maxsize,
+        free_reserve: int = 0,
+        free_bytes: Callable[[Path], int] = _free_bytes,
+    ) -> None:
+        self._max_files = max_files
+        self._max_bytes = max_bytes
+        self._free_reserve = free_reserve
+        self._free_bytes = free_bytes
+        self._active: dict[str, list[_Upload]] = {}
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def admit(
+        self, token_id: str, held: Sequence[StagedUpload], directory: Path
+    ) -> Iterator[Callable[[int], None]]:
+        """Reserve one upload slot; yields a check to call with bytes written."""
+        held_bytes = sum(record.size for record in held)
+        upload = _Upload()
+        with self._lock:
+            active = self._active.setdefault(token_id, [])
+            if len(held) + len(active) >= self._max_files:
+                self._drop_if_idle(token_id)
+                raise LibrarianCapacity(
+                    f"This token already has {self._max_files} uploads staged. "
+                    "Commit or discard one first."
+                )
+            active.append(upload)
+
+        def accept(written: int) -> None:
+            with self._lock:
+                upload.written = written
+                total = held_bytes + sum(item.written for item in active)
+            if total > self._max_bytes:
+                raise LibrarianCapacity(
+                    "Staged uploads would exceed this token's quota"
+                )
+            if self._free_bytes(directory) < self._free_reserve:
+                raise LibrarianCapacity(
+                    "The state volume's free-space reserve is reached"
+                )
+
+        try:
+            yield accept
+        finally:
+            with self._lock:
+                active.remove(upload)
+                self._drop_if_idle(token_id)
+
+    def _drop_if_idle(self, token_id: str) -> None:
+        if not self._active.get(token_id):
+            self._active.pop(token_id, None)
+
+
 class IngestService:
     """Stages a proposed volume under `/state`, then places it on `/data`.
 
@@ -547,12 +652,14 @@ class IngestService:
         inspector: ArchiveValidator,
         max_upload_bytes: int,
         paths: StoragePathResolver,
+        quota: StagingQuota | None = None,
     ) -> None:
         self._paths = paths
         self._staging_dir = staging_dir
         self._repository = repository
         self._inspector = inspector
         self._max_upload_bytes = max_upload_bytes
+        self._quota = quota or StagingQuota()
 
     def stage(
         self, token: LibrarianToken, series_id: str, filename: str, source: BinaryIO
@@ -562,7 +669,14 @@ class IngestService:
         self._sweep_expired()
         ingest_id = secrets.token_hex(16)
         archive_path = self._staging_dir / f"{ingest_id}.cbz"
-        size, digest = self._store(source, archive_path)
+        held = [
+            record
+            for record in self.pending(token)
+            if record.token_id is None or record.token_id == token.id
+        ]
+        self._staging_dir.mkdir(parents=True, exist_ok=True)
+        with self._quota.admit(token.id, held, self._staging_dir) as accept:
+            size, digest = self._store(source, archive_path, accept)
         siblings = self._repository.publications_in_series(series_id)
         suggested, pattern = suggest_filename(cleaned, [s.filename for s in siblings])
         try:
@@ -586,6 +700,7 @@ class IngestService:
             sha256=digest,
             duplicate_of=self._duplicate(siblings, size, digest),
             created_at=datetime.now(UTC),
+            token_id=token.id,
         )
         self._write_sidecar(staged)
         return staged
@@ -632,8 +747,13 @@ class IngestService:
         # copied; `os.link` below is what actually enforces it.
         if target.exists() or target.is_symlink():
             raise LibrarianConflict(f"Already exists: {relative}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        self._place(staged_file, target, relative)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._place(staged_file, target, relative)
+        except LibrarianConflict:
+            raise
+        except OSError as error:  # e.g. the media mount is read-only
+            raise LibrarianConflict("Ingest destination is not writable") from error
         self._sidecar_path(ingest_id).unlink(missing_ok=True)
         return PlacedUpload(
             ingest_id=ingest_id,
@@ -698,19 +818,25 @@ class IngestService:
     def _relative(library: ManagedLibrary, series: CatalogSeries, filename: str) -> str:
         return f"{library.relative_path}/{series.category}/{series.name}/{filename}"
 
-    def _store(self, source: BinaryIO, destination: Path) -> tuple[int, str]:
-        self._staging_dir.mkdir(parents=True, exist_ok=True)
+    def _store(
+        self, source: BinaryIO, destination: Path, accept: Callable[[int], None]
+    ) -> tuple[int, str]:
         digest = hashlib.sha256()
         size = 0
-        with destination.open("wb") as output:
-            while chunk := source.read(self._CHUNK):
-                size += len(chunk)
-                if size > self._max_upload_bytes:
-                    output.close()
-                    destination.unlink(missing_ok=True)
-                    raise LibrarianTooLarge("Upload exceeds the configured size limit")
-                digest.update(chunk)
-                output.write(chunk)
+        try:
+            with destination.open("wb") as output:
+                while chunk := source.read(self._CHUNK):
+                    size += len(chunk)
+                    if size > self._max_upload_bytes:
+                        raise LibrarianTooLarge(
+                            "Upload exceeds the configured size limit"
+                        )
+                    accept(size)
+                    digest.update(chunk)
+                    output.write(chunk)
+        except LibrarianError:
+            destination.unlink(missing_ok=True)
+            raise
         return size, digest.hexdigest()
 
     def _duplicate(
@@ -761,6 +887,7 @@ class IngestService:
             "sha256": staged.sha256,
             "duplicate_of": list(staged.duplicate_of) if staged.duplicate_of else None,
             "created_at": staged.created_at.isoformat(),
+            "token_id": staged.token_id,
         }
         self._sidecar_path(staged.id).write_text(json.dumps(payload), encoding="utf-8")
 
@@ -789,6 +916,7 @@ class IngestService:
                 sha256=str(record["sha256"]),
                 duplicate_of=(duplicate[0], duplicate[1]) if duplicate else None,
                 created_at=datetime.fromisoformat(str(record["created_at"])),
+                token_id=_optional_text(record.get("token_id")),
             )
         except (KeyError, TypeError, ValueError, IndexError):
             return None
@@ -818,6 +946,10 @@ class IngestService:
                     archive.unlink(missing_ok=True)
             except OSError:  # pragma: no cover - same
                 continue
+
+
+def _optional_text(value: object) -> str | None:
+    return None if value is None else str(value)
 
 
 def normalize_title(value: str) -> str:

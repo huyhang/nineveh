@@ -6,8 +6,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar, Protocol
+from urllib.parse import urlsplit
 
 LOGGER = logging.getLogger(__name__)
+
+# Tailscale's IPv4 CGNAT range and IPv6 prefix. LAN ranges are deliberately not
+# defaults: a Docker bridge gateway sits inside 172.16.0.0/12, so trusting
+# every private range would make an unconfigured proxy look like a LAN client.
+TAILSCALE_NETWORKS = "100.64.0.0/10,fd7a:115c:a1e0::/48"
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -22,6 +28,12 @@ def _int_env(name: str, default: int, minimum: int = 0) -> int:
     if value < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return value
+
+
+def _list_env(name: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip() for item in os.getenv(name, "").split(",") if item.strip()
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +64,11 @@ class Settings:
     state_dir: Path = Path("/state")
     service_title: str = "Nineveh"
     public_base_url: str | None = None
+    # Naming any private origin turns on split access: readers use
+    # `public_base_url`, while administrators and the librarian agent use one
+    # of these (a Tailscale Serve name, a LAN address) from `private_allow_ips`.
+    private_base_urls: tuple[str, ...] = ()
+    private_allow_ips: str = TAILSCALE_NETWORKS
     secure_cookies: bool = True
     session_hours: int = 168
     scan_interval_seconds: int = 900
@@ -67,8 +84,24 @@ class Settings:
     # Conflating them advertises an 8 GiB limit on a transfer path that cannot
     # honour it.
     max_upload_bytes: int = 4 * 1024 * 1024 * 1024
+    # Every other request body: forms, JSON, and a series cover upload's
+    # neighbours. Enforced before parsing, for chunked bodies too.
+    max_request_body_bytes: int = 1024 * 1024
+    max_range_uncompressed_bytes: int = 512 * 1024 * 1024
+    # Disk that uploads, spooled bodies and generated ranges may never use.
+    state_free_reserve_bytes: int = 512 * 1024 * 1024
+    staging_max_per_token: int = 10
+    staging_max_bytes_per_token: int = 20 * 1024 * 1024 * 1024
     max_compression_ratio: int = 200
-    max_image_pixels: int = 200_000_000
+    # 80 megapixels still admits any real scan, and bounds one decode to
+    # roughly 230 MB instead of the 575 MB that 200 megapixels allowed.
+    max_image_pixels: int = 80_000_000
+    # Library pages are decoded in-process by default; a worker process per
+    # image costs several times the latency of a cold render. Downloaded
+    # metadata covers are always decoded in a worker.
+    isolate_media_processing: bool = False
+    image_worker_memory_bytes: int = 768 * 1024 * 1024
+    image_worker_timeout_seconds: int = 30
     thumbnail_cache_mb: int = 512
     page_cache_mb: int = 1024
     # Screen-sized copies of pages for continuous scroll. Zero turns them
@@ -79,6 +112,12 @@ class Settings:
     # extraction slot streams one page into the cache.
     hash_workers: int = 2
     extract_workers: int = 2
+    # Fair-use ceilings. Work past a ceiling waits its turn; only a backlog far
+    # beyond anything a reader app produces is refused.
+    range_workers: int = 1
+    download_streams: int = 16
+    download_streams_per_account: int = 4
+    account_requests_per_minute: int = 6000
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_password: str | None = None
     bootstrap_admin_password_file: Path | None = None
@@ -92,6 +131,33 @@ class Settings:
             raise ValueError(
                 "NINEVEH_MANGABAKA_REQUESTS_PER_MINUTE must be between 1 and 30"
             )
+        if self.download_streams_per_account > self.download_streams:
+            raise ValueError(
+                "NINEVEH_DOWNLOAD_STREAMS_PER_ACCOUNT cannot exceed "
+                "NINEVEH_DOWNLOAD_STREAMS"
+            )
+        if self.private_base_urls:
+            self._validate_split_access()
+
+    @property
+    def split_access(self) -> bool:
+        return bool(self.private_base_urls)
+
+    def _validate_split_access(self) -> None:
+        """Refuse a split-access configuration that would quietly fail open."""
+        if not self.public_base_url:
+            raise ValueError(
+                "NINEVEH_PUBLIC_BASE_URL is required with NINEVEH_PRIVATE_BASE_URLS"
+            )
+        for origin in (self.public_base_url, *self.private_base_urls):
+            if urlsplit(origin).scheme != "https":
+                raise ValueError(f"{origin} must use https in split access")
+        if not self.secure_cookies:
+            raise ValueError("Split access requires NINEVEH_SECURE_COOKIES=true")
+        if self.forwarded_allow_ips.strip() == "*":
+            raise ValueError(
+                "Split access requires an explicit NINEVEH_FORWARDED_ALLOW_IPS"
+            )
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -101,6 +167,10 @@ class Settings:
             state_dir=Path(os.getenv("NINEVEH_STATE_DIR", "/state")),
             service_title=os.getenv("NINEVEH_TITLE", "Nineveh"),
             public_base_url=os.getenv("NINEVEH_PUBLIC_BASE_URL") or None,
+            private_base_urls=_list_env("NINEVEH_PRIVATE_BASE_URLS"),
+            private_allow_ips=os.getenv(
+                "NINEVEH_PRIVATE_ALLOW_IPS", TAILSCALE_NETWORKS
+            ),
             secure_cookies=_bool_env("NINEVEH_SECURE_COOKIES", True),
             session_hours=_int_env("NINEVEH_SESSION_HOURS", 168, 1),
             scan_interval_seconds=_int_env("NINEVEH_SCAN_INTERVAL_SECONDS", 900, 0),
@@ -117,13 +187,43 @@ class Settings:
             max_upload_bytes=_int_env(
                 "NINEVEH_MAX_UPLOAD_BYTES", 4 * 1024 * 1024 * 1024, 1
             ),
+            max_request_body_bytes=_int_env(
+                "NINEVEH_MAX_REQUEST_BODY_BYTES", 1024 * 1024, 1024
+            ),
+            max_range_uncompressed_bytes=_int_env(
+                "NINEVEH_MAX_RANGE_UNCOMPRESSED_BYTES", 512 * 1024 * 1024, 1
+            ),
+            state_free_reserve_bytes=_int_env(
+                "NINEVEH_STATE_FREE_RESERVE_BYTES", 512 * 1024 * 1024, 0
+            ),
+            staging_max_per_token=_int_env("NINEVEH_STAGING_MAX_PER_TOKEN", 10, 1),
+            staging_max_bytes_per_token=_int_env(
+                "NINEVEH_STAGING_MAX_BYTES_PER_TOKEN", 20 * 1024 * 1024 * 1024, 1
+            ),
             max_compression_ratio=_int_env("NINEVEH_MAX_COMPRESSION_RATIO", 200, 1),
-            max_image_pixels=_int_env("NINEVEH_MAX_IMAGE_PIXELS", 200_000_000, 1),
+            max_image_pixels=_int_env("NINEVEH_MAX_IMAGE_PIXELS", 80_000_000, 1),
+            isolate_media_processing=_bool_env(
+                "NINEVEH_ISOLATE_MEDIA_PROCESSING", False
+            ),
+            image_worker_memory_bytes=_int_env(
+                "NINEVEH_IMAGE_WORKER_MEMORY_BYTES", 768 * 1024 * 1024, 64 * 1024 * 1024
+            ),
+            image_worker_timeout_seconds=_int_env(
+                "NINEVEH_IMAGE_WORKER_TIMEOUT_SECONDS", 30, 1
+            ),
             thumbnail_cache_mb=_int_env("NINEVEH_THUMBNAIL_CACHE_MB", 512, 1),
             page_cache_mb=_int_env("NINEVEH_PAGE_CACHE_MB", 1024, 0),
             rendition_cache_mb=_int_env("NINEVEH_RENDITION_CACHE_MB", 512, 0),
             hash_workers=_int_env("NINEVEH_HASH_WORKERS", 2, 1),
             extract_workers=_int_env("NINEVEH_EXTRACT_WORKERS", 2, 1),
+            range_workers=_int_env("NINEVEH_RANGE_WORKERS", 1, 1),
+            download_streams=_int_env("NINEVEH_DOWNLOAD_STREAMS", 16, 1),
+            download_streams_per_account=_int_env(
+                "NINEVEH_DOWNLOAD_STREAMS_PER_ACCOUNT", 4, 1
+            ),
+            account_requests_per_minute=_int_env(
+                "NINEVEH_ACCOUNT_REQUESTS_PER_MINUTE", 6000, 60
+            ),
             bootstrap_admin_username=os.getenv("NINEVEH_ADMIN_USERNAME", "admin"),
             bootstrap_admin_password=os.getenv("NINEVEH_ADMIN_PASSWORD") or None,
             bootstrap_admin_password_file=Path(password_file)

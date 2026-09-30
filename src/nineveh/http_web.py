@@ -31,7 +31,12 @@ from .domain import (
     SearchFilters,
     Session,
 )
-from .http_api import SESSION_COOKIE, scan_active
+from .http_api import (
+    SESSION_COOKIE,
+    admit_account,
+    scan_active,
+    verify_password,
+)
 from .librarian import PURGE_OPTIONS, SCOPE_OPTIONS, LibrarianError
 from .metadata import (
     EDITABLE_FIELDS,
@@ -64,9 +69,16 @@ def _container(request: Request):
 
 
 async def _browser_session(request: Request) -> Session | None:
-    return await run_in_threadpool(
-        _container(request).auth.session, request.cookies.get(SESSION_COOKIE)
+    container = _container(request)
+    session = await run_in_threadpool(
+        container.auth.session, request.cookies.get(SESSION_COOKIE)
     )
+    if session is None or not request.app.state.protection.ingress.admits_account(
+        request, is_admin=session.user.is_admin
+    ):
+        return None
+    await admit_account(request, session.user)
+    return session
 
 
 async def _require_browser_session(request: Request) -> Session:
@@ -105,25 +117,21 @@ async def login(
     username: str = Form(..., max_length=64),
     password: str = Form(..., max_length=1024),
 ):
-    origin = request.headers.get("origin")
-    allowed_origin = _container(request).settings.public_base_url or str(
-        request.base_url
-    )
-    if origin and origin.rstrip("/") != allowed_origin.rstrip("/"):
-        raise HTTPException(status_code=403, detail="Invalid request origin")
     container = _container(request)
+    if not request.app.state.protection.ingress.valid_form_origin(request):
+        raise HTTPException(status_code=403, detail="Invalid request origin")
     try:
-        user = await run_in_threadpool(container.auth.authenticate, username, password)
+        user = await verify_password(request, username, password)
     except AuthenticationError:
-        return templates.TemplateResponse(
+        return _login_error(request, "Invalid username or password.", 401)
+    except HTTPException as error:
+        if error.status_code != 429:
+            raise
+        return _login_error(
             request,
-            "login.html",
-            {
-                "service_title": container.settings.service_title,
-                "session": None,
-                "error": "Invalid username or password.",
-            },
-            status_code=401,
+            "Too many sign-in attempts. Wait a moment and try again.",
+            429,
+            error.headers,
         )
     session = await run_in_threadpool(container.auth.new_session, user)
     response = RedirectResponse("/", status_code=303)
@@ -137,6 +145,25 @@ async def login(
         path="/",
     )
     return response
+
+
+def _login_error(
+    request: Request,
+    message: str,
+    status_code: int,
+    headers: dict[str, str] | None = None,
+) -> HTMLResponse:
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {
+            "service_title": _container(request).settings.service_title,
+            "session": None,
+            "error": message,
+        },
+        status_code=status_code,
+        headers=headers,
+    )
 
 
 @router.post("/logout")
@@ -717,6 +744,10 @@ async def admin_overview(request: Request):
             "publication_count": sum(item.publication_count for item in usage),
             "untrusted_proxy": request.app.state.untrusted_proxy,
             "trusted_proxies": container.settings.forwarded_allow_ips,
+            "split_access": request.app.state.protection.ingress.split,
+            "security_events": await run_in_threadpool(
+                partial(request.app.state.protection.events.recent, limit=10)
+            ),
         }
     )
     return templates.TemplateResponse(request, "admin.html", context)

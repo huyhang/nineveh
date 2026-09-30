@@ -57,8 +57,9 @@ volume only after disconnecting, or the mount simply reports itself as missing.
 
 Through SSH, run `id USERNAME` for the DSM account that should run Nineveh. Record its numeric UID and GID. That account needs:
 
-- Read, write and directory-traversal permission for the media tree (the librarian
-  places new volumes there; nothing else writes to it)
+- Read and directory-traversal permission for the media tree, plus write permission
+  where the librarian places new volumes (nothing else writes to it). With no
+  ingest, set `NINEVEH_DATA_MODE=ro` and grant read only.
 - Read/write permission for `/volume1/docker/nineveh/state`
 - Read permission for the initial password file
 
@@ -112,7 +113,8 @@ Browser sessions use secure cookies by default, so configure HTTPS before normal
 3. Set the destination to `http://127.0.0.1:8080`.
 4. Assign a trusted certificate to the hostname.
 5. Preserve the `Host`, `X-Forwarded-For`, and `X-Forwarded-Proto` headers.
-6. Restrict direct access to port 8080 with the DSM firewall when possible.
+6. Compose publishes port 8080 on loopback only, so nothing but the proxies on
+   the NAS itself can reach it.
 7. Set `NINEVEH_PUBLIC_BASE_URL=https://nineveh.example.com` in `docker/.env`.
 8. Set `NINEVEH_FORWARDED_ALLOW_IPS` to the address the proxy arrives from — see [Finding the address your proxy arrives from](#finding-the-address-your-proxy-arrives-from).
 
@@ -186,9 +188,66 @@ curl -sI -H 'X-Forwarded-Proto: https' \
 
 The header appears only when the request scheme reads `https`, which only happens once the peer is trusted. No output means the value is still wrong — widen it and recreate the container with `up -d`, since environment is fixed when a container is created.
 
-## 6. Sign in and connect clients
+## 6. Private administration over Tailscale or the LAN
 
-Open the public URL and sign in as the configured bootstrap administrator. Add reader accounts from **Admin**.
+The public hostname should serve readers only. Give administration its own
+front doors that the Internet cannot reach, and tell Nineveh about them. Use
+either or both.
+
+**Tailscale.** Install the Tailscale package on the NAS and publish the
+loopback listener to your tailnet with Serve — never Funnel, which is public:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:8080
+tailscale serve status   # shows https://nas.your-tailnet.ts.net
+```
+
+**LAN.** In **Control Panel → Login Portal → Advanced → Reverse Proxy**, add a
+second rule: HTTPS source on the NAS's LAN address and a free port (DSM itself
+uses 5000/5001), for example `192.168.1.10:5443`, destination
+`http://127.0.0.1:8080`, with the same headers preserved as the public rule.
+The certificate can be DSM's own; your browser will ask you to accept it once.
+Restrict that port to your LAN in the DSM firewall if you like — Nineveh checks
+the client address regardless.
+
+Then list both origins, and the networks their clients come from, in
+`docker/.env`:
+
+```dotenv
+NINEVEH_PRIVATE_BASE_URLS=https://nas.your-tailnet.ts.net,https://192.168.1.10:5443
+NINEVEH_PRIVATE_ALLOW_IPS=100.64.0.0/10,fd7a:115c:a1e0::/48,192.168.1.0/24
+```
+
+Both proxies run on the NAS, so both reach the container from the gateway
+address found in step 5, and the `NINEVEH_FORWARDED_ALLOW_IPS` value set there
+already covers them. Recreate the container with `up -d`.
+
+A request is private only when it names one of those origins *and* its client
+address falls in one of those networks. From then on:
+
+- administrator accounts cannot sign in through the public hostname — a
+  correct password there is refused exactly like a wrong one;
+- the admin pages and APIs, the API docs, and the librarian API return 403 on
+  the public hostname;
+- the librarian agent must use a private origin, over the tailnet.
+
+To confirm it, ask the readiness endpoint on each origin. Only a private one
+includes scan detail:
+
+```sh
+curl -s https://nas.your-tailnet.ts.net/api/v1/health/ready   # {"status":"ok","catalog":{...}}
+curl -s https://nineveh.example.com/api/v1/health/ready       # {"status":"ok"}
+```
+
+If a private origin answers with only a status, Nineveh does not see the
+client's real address: check that the proxy is trusted (step 5) and that the
+client's network is in `NINEVEH_PRIVATE_ALLOW_IPS`. A private origin that
+answers *Unrecognized request origin* is missing from
+`NINEVEH_PRIVATE_BASE_URLS`, or is spelled with a different port.
+
+## 7. Sign in and connect clients
+
+Open a private URL and sign in as the configured bootstrap administrator. Add reader accounts from **Admin**, and use one of those — not an administrator — to read through the public URL.
 
 Configure an OPDS 2.0 client with:
 
@@ -270,15 +329,22 @@ NINEVEH_HASH_WORKERS=6
 NINEVEH_EXTRACT_WORKERS=8
 NINEVEH_FEED_PAGE_SIZE=48
 NINEVEH_PAGE_RANGE_LIMIT=200
-NINEVEH_MAX_IMAGE_PIXELS=80000000
 NINEVEH_SCAN_INTERVAL_SECONDS=3600
 NINEVEH_MEMORY_LIMIT=2g
+NINEVEH_CPU_LIMIT=4.0
+NINEVEH_DOWNLOAD_STREAMS=32
+NINEVEH_RANGE_WORKERS=2
 ```
 
-`NINEVEH_MAX_IMAGE_PIXELS` deserves a note: the default of 200 megapixels permits
-a single cover to occupy roughly 575 MB while it is being resized. No real comic
-scan approaches that, so lowering it is a cheap safety margin rather than a
-restriction. Cover rendering is serialised, so only one such decode runs at a time.
+`NINEVEH_MAX_IMAGE_PIXELS` deserves a note: the default of 80 megapixels still
+admits any real comic scan while bounding one decode to roughly 230 MB. The
+earlier default of 200 megapixels allowed about 575 MB, enough for two
+concurrent renders to threaten a 1 GB container.
+
+The extract workers also set how many images are decoded at once for all
+readers together. Extra requests wait their turn without holding a thread, and
+the next free worker goes to whichever account is waiting with the fewest in
+progress, so raising the count buys throughput, not fairness.
 
 A longer `NINEVEH_SCAN_INTERVAL_SECONDS` also lets the drives hibernate: each pass
 stats every CBZ in the library. Set it to `0` and scan on demand from **Admin**

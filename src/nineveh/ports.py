@@ -29,6 +29,7 @@ from .domain import (
     SearchFacets,
     SearchFilters,
     SearchSuggestion,
+    SecurityEvent,
     SeriesMetadata,
     SeriesMetadataState,
     SeriesMetadataSummary,
@@ -411,6 +412,14 @@ class LibrarianRepository(Protocol):
     ) -> list[LibrarianEvent]: ...
 
 
+class SecurityRepository(Protocol):
+    def record_security_event(self, event: SecurityEvent) -> SecurityEvent: ...
+
+    def security_events(
+        self, *, kind: str | None = None, limit: int = 100
+    ) -> list[SecurityEvent]: ...
+
+
 class Repository(
     CatalogRepository,
     UserRepository,
@@ -422,6 +431,7 @@ class Repository(
     LibrarianRepository,
     MountRepository,
     SearchRepository,
+    SecurityRepository,
     Protocol,
 ):
     """The single persistence seam the application composes against."""
@@ -459,17 +469,29 @@ class ThumbnailRenderer(Protocol):
     def render(self, source: BinaryIO, destination: Path, width: int) -> None: ...
 
 
+# Each media source answers `cached` from disk alone, so a request for work
+# already done never queues behind requests that still need it.
 class CoverSource(Protocol):
+    def cached(
+        self, publication: Publication, page: Page, width: int
+    ) -> Path | None: ...
+
     def cover(self, publication: Publication, page: Page, width: int) -> Path: ...
 
 
 class RenditionSource(Protocol):
+    def cached(
+        self, publication: Publication, page: Page, width: int
+    ) -> Path | None: ...
+
     def rendition(
         self, publication: Publication, page: Page, width: int
     ) -> Path | None: ...
 
 
 class PageStore(Protocol):
+    def cached(self, publication: Publication, page: Page) -> Path | None: ...
+
     def page(self, publication: Publication, page: Page) -> Path | None: ...
 
 

@@ -159,3 +159,54 @@ def test_mangabaka_limit_is_editable_but_hard_capped():
     )
     with pytest.raises(ValueError, match="between 1 and 30"):
         Settings().with_overrides({"mangabaka_requests_per_minute": "31"})
+
+
+def test_split_access_settings_are_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("NINEVEH_PUBLIC_BASE_URL", "https://read.example")
+    monkeypatch.setenv(
+        "NINEVEH_PRIVATE_BASE_URLS",
+        " https://nas.tail.ts.net , https://192.168.1.10:5443,",
+    )
+    monkeypatch.setenv("NINEVEH_PRIVATE_ALLOW_IPS", "100.64.0.0/10,192.168.1.0/24")
+    monkeypatch.setenv("NINEVEH_DOWNLOAD_STREAMS_PER_ACCOUNT", "2")
+    settings = Settings.from_env()
+    assert settings.private_base_urls == (
+        "https://nas.tail.ts.net",
+        "https://192.168.1.10:5443",
+    )
+    assert settings.private_allow_ips == "100.64.0.0/10,192.168.1.0/24"
+    assert settings.split_access
+    assert settings.download_streams_per_account == 2
+
+
+def test_split_access_is_off_by_default():
+    settings = Settings.from_env()
+    assert settings.private_base_urls == ()
+    assert not settings.split_access
+    assert settings.private_allow_ips == "100.64.0.0/10,fd7a:115c:a1e0::/48"
+
+
+SAFE_SPLIT = {
+    "public_base_url": "https://read.example",
+    "private_base_urls": ("https://nas.tail.ts.net",),
+}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"public_base_url": None}, "NINEVEH_PUBLIC_BASE_URL is required"),
+        ({"public_base_url": "http://read.example"}, "must use https"),
+        ({"private_base_urls": ("http://192.168.1.10",)}, "must use https"),
+        ({"secure_cookies": False}, "SECURE_COOKIES"),
+        ({"forwarded_allow_ips": " * "}, "explicit NINEVEH_FORWARDED_ALLOW_IPS"),
+    ],
+)
+def test_split_access_refuses_settings_that_would_fail_open(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        Settings(**{**SAFE_SPLIT, **overrides})
+
+
+def test_an_account_cannot_have_more_downloads_than_everyone():
+    with pytest.raises(ValueError, match="cannot exceed"):
+        Settings(download_streams=2, download_streams_per_account=3)

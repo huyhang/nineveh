@@ -7,18 +7,21 @@ from collections.abc import Collection, Coroutine
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
+from .admission import Admission
 from .archives import (
     ArchiveService,
     PageCacheService,
     PageRenditionService,
     PillowThumbnailRenderer,
+    SubprocessThumbnailRenderer,
     ThumbnailService,
 )
 from .auth import AuthService
@@ -28,10 +31,21 @@ from .config import Settings, SettingsService
 from .database import SQLiteRepository
 from .deployment import discarded_forwarded_proto, proxy_trust_advice
 from .domain import MountHealth, ScanReport
+from .http_api import Identity, administrator
 from .http_api import router as api_router
 from .http_web import router as web_router
-from .librarian import AuditTrail, IngestService, LibrarianAuth, LibrarianService
+from .ingress import Ingress
+from .librarian import (
+    AuditTrail,
+    IngestService,
+    LibrarianAuth,
+    LibrarianService,
+    StagingQuota,
+)
+from .limits import BodyLimitMiddleware, BodyLimits
+from .logins import LoginGuard
 from .metadata import (
+    MAX_COVER_BYTES,
     MangaBakaProvider,
     MetadataCoverStore,
     MetadataError,
@@ -48,14 +62,41 @@ from .ports import (
     RenditionSource,
     Repository,
     RestartController,
+    SecurityRepository,
+    ThumbnailRenderer,
 )
 from .reader import ReaderService, SpreadDetectionService
 from .restart import DisabledRestartController, ProcessRestartController
 from .search import CatalogSearchService
+from .security import SecurityLog, SignInEvents
 from .spreads import spread_detector
 from .storage import MountService, StoragePathResolver
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class Protection:
+    """The abuse-resistance policies the HTTP layer consults."""
+
+    ingress: Ingress
+    admission: Admission
+    logins: LoginGuard
+    events: SecurityLog
+
+
+def build_protection(settings: Settings, repository: SecurityRepository) -> Protection:
+    events = SecurityLog(repository)
+    return Protection(
+        ingress=Ingress(
+            settings.public_base_url,
+            settings.private_base_urls,
+            settings.private_allow_ips,
+        ),
+        admission=Admission.from_settings(settings),
+        logins=LoginGuard(SignInEvents(events)),
+        events=events,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +127,22 @@ class Container:
     search: CatalogSearchService
     metadata: MetadataService | None = None
     spreads: SpreadDetectionService | None = None
+    # `create_app` builds one from `settings` when a hand-made container omits it.
+    protection: Protection | None = None
+
+
+def _isolated_renderer(settings: Settings) -> SubprocessThumbnailRenderer:
+    return SubprocessThumbnailRenderer(
+        settings.max_image_pixels,
+        settings.image_worker_memory_bytes,
+        settings.image_worker_timeout_seconds,
+    )
+
+
+def _page_renderer(settings: Settings) -> ThumbnailRenderer:
+    if settings.isolate_media_processing:
+        return _isolated_renderer(settings)
+    return PillowThumbnailRenderer(settings.max_image_pixels)
 
 
 def build_container(settings: Settings) -> Container:
@@ -110,6 +167,7 @@ def build_container(settings: Settings) -> Container:
         archives,
         spread_detector(archives, effective.max_image_pixels),
     )
+    renderer = _page_renderer(effective)
     return Container(
         settings=effective,
         repository=repository,
@@ -119,16 +177,8 @@ def build_container(settings: Settings) -> Container:
             repository, ArchiveInspector(effective), paths, libraries
         ),
         archives=archives,
-        thumbnails=ThumbnailService(
-            effective,
-            archives,
-            PillowThumbnailRenderer(effective.max_image_pixels),
-        ),
-        renditions=PageRenditionService(
-            effective,
-            archives,
-            PillowThumbnailRenderer(effective.max_image_pixels),
-        ),
+        thumbnails=ThumbnailService(effective, archives, renderer),
+        renditions=PageRenditionService(effective, archives, renderer),
         page_cache=PageCacheService(effective, archives),
         opds=OpdsBuilder(effective.service_title),
         access=AccessService(repository),
@@ -148,6 +198,11 @@ def build_container(settings: Settings) -> Container:
             ArchiveInspector(effective),
             effective.max_upload_bytes,
             paths,
+            StagingQuota(
+                effective.staging_max_per_token,
+                effective.staging_max_bytes_per_token,
+                effective.state_free_reserve_bytes,
+            ),
         ),
         mounts=mounts,
         search=CatalogSearchService(repository, effective.feed_page_size),
@@ -155,10 +210,13 @@ def build_container(settings: Settings) -> Container:
             repository,
             MangaBakaProvider(UrllibTransport(), limiter),
             MetadataCoverStore(
-                effective.metadata_cover_dir, effective.max_image_pixels
+                effective.metadata_cover_dir,
+                effective.max_image_pixels,
+                renderer=_isolated_renderer(effective),
             ),
         ),
         spreads=spreads,
+        protection=build_protection(effective, repository),
     )
 
 
@@ -169,6 +227,9 @@ def create_app(
     defaults = settings or (container.settings if container else Settings.from_env())
     container = container or build_container(defaults)
     configured = container.settings
+    protection = container.protection or build_protection(
+        configured, container.repository
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -194,6 +255,12 @@ def create_app(
         )
         if advice:
             LOGGER.warning("%s", advice)
+        if not protection.ingress.split:
+            LOGGER.warning(
+                "Split access is off: administrators can sign in from any address. "
+                "Set NINEVEH_PRIVATE_BASE_URLS to the tailnet or LAN origins that "
+                "administer this install."
+            )
         await asyncio.to_thread(container.repository.initialize)
         await asyncio.to_thread(container.mounts.initialize)
         for status in await asyncio.to_thread(container.mounts.statuses):
@@ -229,8 +296,13 @@ def create_app(
         version=__version__,
         description="An authenticated OPDS 2.0 service for CBZ libraries.",
         lifespan=lifespan,
+        # Served by `_docs_router`, to administrators on a private origin only.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     application.state.container = container
+    application.state.protection = protection
     application.state.scan_task = None
     application.state.metadata_task = None
     application.state.pending_metadata_job = None
@@ -319,49 +391,111 @@ def create_app(
 
     application.state.spread_detection_running = spread_detection_running
 
+    application.add_middleware(
+        BodyLimitMiddleware,
+        limits=BodyLimits(
+            configured.max_request_body_bytes,
+            configured.max_upload_bytes,
+            MAX_COVER_BYTES,
+        ),
+        # Starlette spools large multipart bodies here (TMPDIR=/state in Compose).
+        spool_dir=Path(tempfile.gettempdir()),
+        free_reserve=configured.state_free_reserve_bytes,
+    )
+
     @application.middleware("http")
-    async def security_headers(request: Request, call_next):
-        if discarded_forwarded_proto(
-            request.headers.get("x-forwarded-proto"), request.url.scheme
-        ):
-            _note_untrusted_proxy(application, request)
-        response: Response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "same-origin")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault(
-            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
-        )
-        if request.url.path in {"/docs", "/redoc"}:
-            response.headers.setdefault(
-                "Content-Security-Policy",
-                "default-src 'self'; img-src 'self' data: https://fastapi.tiangolo.com; "
-                "style-src 'self' https://cdn.jsdelivr.net; "
-                "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-                "frame-ancestors 'none'",
-            )
+    async def guard_and_harden(request: Request, call_next):
+        refusal = _ingress_refusal(protection.ingress, request)
+        if refusal is not None:
+            response = refusal
         else:
-            response.headers.setdefault(
-                "Content-Security-Policy",
-                "default-src 'self'; img-src 'self' data:; style-src 'self'; "
-                "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-            )
-        content_type = response.headers.get("content-type", "")
-        if content_type.startswith("text/html"):
-            response.headers.setdefault("Cache-Control", "private, no-store")
-        elif request.url.path.startswith("/opds/"):
-            response.headers.setdefault("Cache-Control", "private, no-cache")
-        if request.url.scheme == "https":
-            response.headers.setdefault(
-                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
-            )
+            if discarded_forwarded_proto(
+                request.headers.get("x-forwarded-proto"), request.url.scheme
+            ):
+                _note_untrusted_proxy(application, request)
+            response = await call_next(request)
+        _harden(request, response)
         return response
 
     static_path = Path(__file__).parent / "static"
     application.mount("/static", StaticFiles(directory=static_path), name="static")
     application.include_router(api_router)
     application.include_router(web_router)
+    application.include_router(_docs_router(configured.service_title))
     return application
+
+
+def _ingress_refusal(ingress: Ingress, request: Request) -> Response | None:
+    """Answer before routing when a request came through the wrong front door.
+
+    Refusing here, not in the route, means a private route's body -- an upload
+    to the librarian -- is never read from a public client at all.
+    """
+    if not ingress.accepts(request):
+        return Response("Unrecognized request origin", status_code=400)
+    if not ingress.admits_route(request):
+        return Response("Not available on this origin", status_code=403)
+    return None
+
+
+def _harden(request: Request, response: Response) -> None:
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault(
+        "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+    )
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    if request.url.path in {"/docs", "/redoc"}:
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data: https://fastapi.tiangolo.com; "
+            "style-src 'self' https://cdn.jsdelivr.net; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "frame-ancestors 'none'",
+        )
+    else:
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self'; "
+            "script-src 'self'; connect-src 'self'; object-src 'none'; "
+            "form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        )
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("text/html"):
+        response.headers.setdefault("Cache-Control", "private, no-store")
+    elif request.url.path.startswith("/opds/"):
+        response.headers.setdefault("Cache-Control", "private, no-cache")
+    if request.url.scheme == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+
+
+def _docs_router(title: str) -> APIRouter:
+    """Interactive docs for administrators; the ingress keeps them private.
+
+    Authentication is the same dependency every admin API uses, so guessing a
+    password here is throttled and recorded like guessing it anywhere else.
+    """
+    router = APIRouter(include_in_schema=False)
+
+    @router.get("/openapi.json")
+    async def openapi(
+        request: Request, _: Annotated[Identity, Depends(administrator)]
+    ) -> JSONResponse:
+        return JSONResponse(request.app.openapi())
+
+    @router.get("/docs")
+    async def docs(_: Annotated[Identity, Depends(administrator)]) -> HTMLResponse:
+        return get_swagger_ui_html(openapi_url="/openapi.json", title=f"{title} - Docs")
+
+    @router.get("/redoc")
+    async def redoc(_: Annotated[Identity, Depends(administrator)]) -> HTMLResponse:
+        return get_redoc_html(openapi_url="/openapi.json", title=f"{title} - ReDoc")
+
+    return router
 
 
 def _note_untrusted_proxy(application: FastAPI, request: Request) -> None:

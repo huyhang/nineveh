@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import zipfile
@@ -12,12 +15,16 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, ClassVar
 
-from PIL import Image, ImageOps
+from PIL import Image
 
 from .config import Settings
 from .domain import Page, Publication
+from .image_worker import EXIT_TOO_LARGE
+from .imaging import ImageTooLarge, render_webp
 from .ports import ThumbnailRenderer
 from .storage import StorageError, StoragePathResolver
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ArchiveUnavailable(RuntimeError):
@@ -246,30 +253,101 @@ def _modified_ns(path: Path) -> int:
 
 
 class PillowThumbnailRenderer:
+    """Decodes in this process: fast, and the default for library pages."""
+
     def __init__(self, max_image_pixels: int) -> None:
         self._max_image_pixels = max_image_pixels
 
     def render(self, source: BinaryIO, destination: Path, width: int) -> None:
+        try:
+            self.render_box(source, destination, (width, width * 3), 82)
+        except ImageTooLarge as error:
+            raise ArchiveUnavailable(str(error)) from error
+
+    def render_box(
+        self, source: BinaryIO, destination: Path, box: tuple[int, int], quality: int
+    ) -> None:
+        render_webp(
+            source,
+            destination,
+            box=box,
+            quality=quality,
+            max_pixels=self._max_image_pixels,
+        )
+
+
+class SubprocessThumbnailRenderer:
+    """Decodes each image in a short-lived worker under memory and CPU limits.
+
+    A malformed image can then crash or exhaust only the worker, never the
+    service. The price is a process start per image -- several times the
+    latency of an in-process render -- so it is reserved for input Nineveh does
+    not control unless an operator opts library pages in too.
+    """
+
+    def __init__(
+        self, max_image_pixels: int, memory_bytes: int, timeout_seconds: int
+    ) -> None:
+        self._max_image_pixels = max_image_pixels
+        self._memory_bytes = memory_bytes
+        self._timeout = timeout_seconds
+        self._warned = False
+
+    def render(self, source: BinaryIO, destination: Path, width: int) -> None:
+        try:
+            self.render_box(source, destination, (width, width * 3), 82)
+        except ImageTooLarge as error:
+            raise ArchiveUnavailable(str(error)) from error
+
+    def render_box(
+        self, source: BinaryIO, destination: Path, box: tuple[int, int], quality: int
+    ) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with Image.open(source) as opened:
-            if opened.width * opened.height > self._max_image_pixels:
-                raise ArchiveUnavailable("image dimensions exceed the configured limit")
-            image = ImageOps.exif_transpose(opened)
-            image.thumbnail((width, width * 3), Image.Resampling.LANCZOS)
-            if image.mode not in ("RGB", "RGBA"):
-                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
-            with tempfile.NamedTemporaryFile(
-                prefix="thumbnail-",
-                suffix=".webp",
-                dir=destination.parent,
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-            try:
-                image.save(temporary_path, format="WEBP", quality=82, method=4)
-                os.replace(temporary_path, destination)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix="image-source-", dir=destination.parent, delete=False
+        ) as spooled:
+            input_path = Path(spooled.name)
+            shutil.copyfileobj(source, spooled, 128 * 1024)
+        try:
+            self._run(input_path, destination, box, quality)
+        finally:
+            input_path.unlink(missing_ok=True)
+
+    def _run(
+        self, source: Path, destination: Path, box: tuple[int, int], quality: int
+    ) -> None:
+        command = [
+            sys.executable,
+            "-m",
+            "nineveh.image_worker",
+            str(source),
+            str(destination),
+            *(str(value) for value in (*box, quality, self._max_image_pixels)),
+            str(self._memory_bytes),
+            str(self._timeout),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=self._timeout + 2,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise OSError("image worker timed out") from error
+        self._note_limits(completed.stdout.decode(errors="replace"))
+        if completed.returncode == EXIT_TOO_LARGE:
+            raise ImageTooLarge("image dimensions exceed the configured limit")
+        if completed.returncode != 0 or not destination.is_file():
+            detail = completed.stderr.decode(errors="replace").strip()[-300:]
+            raise OSError(f"image worker exited {completed.returncode}: {detail}")
+
+    def _note_limits(self, stdout: str) -> None:
+        report = stdout.partition("\n")[0].removeprefix("limits: ")
+        if report != "applied" and not self._warned:
+            self._warned = True
+            LOGGER.warning("Image worker is running without some limits: %s", report)
 
 
 class DiskCacheBudget:
@@ -336,18 +414,21 @@ class ThumbnailService:
             settings.thumbnail_cache_mb * 1024 * 1024,
         )
 
+    def cached(self, publication: Publication, page: Page, width: int) -> Path | None:
+        if width not in self.ALLOWED_WIDTHS:
+            return None
+        destination = self._destination(publication, page, width)
+        if not destination.is_file():
+            return None
+        os.utime(destination, None)
+        return destination
+
     def cover(self, publication: Publication, page: Page, width: int) -> Path:
         if width not in self.ALLOWED_WIDTHS:
             raise ValueError("thumbnail width must be 160, 320, or 640")
-        destination = (
-            self._settings.thumbnail_dir
-            / publication.id
-            / f"{publication.revision}-{page.crc:08x}-{width}.webp"
-        )
-        if destination.is_file():
-            os.utime(destination, None)
-            return destination
-
+        if cached := self.cached(publication, page, width):
+            return cached
+        destination = self._destination(publication, page, width)
         with self._render_lock:
             if destination.is_file():
                 return destination
@@ -358,6 +439,13 @@ class ThumbnailService:
                 raise ArchiveUnavailable("cover could not be rendered") from error
             self._budget.added(destination, destination.stat().st_size)
         return destination
+
+    def _destination(self, publication: Publication, page: Page, width: int) -> Path:
+        return (
+            self._settings.thumbnail_dir
+            / publication.id
+            / f"{publication.revision}-{page.crc:08x}-{width}.webp"
+        )
 
 
 class PageRenditionService:
@@ -390,26 +478,26 @@ class PageRenditionService:
             settings.rendition_cache_mb * 1024 * 1024,
         )
 
+    def cached(self, publication: Publication, page: Page, width: int) -> Path | None:
+        if width not in self.ALLOWED_WIDTHS or not self._worth_it(page, width):
+            return None
+        destination = self._destination(publication, page, width)
+        if not destination.is_file():
+            return None
+        os.utime(destination, None)  # keep hot pages away from the budget
+        return destination
+
     def rendition(
         self, publication: Publication, page: Page, width: int
     ) -> Path | None:
         """A page no wider than `width`, or None to serve the original."""
         if width not in self.ALLOWED_WIDTHS:
             raise ValueError("rendition width must be 640, 960, or 1280")
-        if self._settings.rendition_cache_mb == 0:
+        if not self._worth_it(page, width):
             return None
-        # Re-encoding a page that is already small buys nothing and can cost
-        # bytes, so the original stays the better answer.
-        if page.width is not None and page.width <= width:
-            return None
-        destination = (
-            self._settings.rendition_dir
-            / publication.id
-            / f"{publication.revision}-{page.number}-{page.crc:08x}-{width}.webp"
-        )
-        if destination.is_file():
-            os.utime(destination, None)  # keep hot pages away from the budget
-            return destination
+        if cached := self.cached(publication, page, width):
+            return cached
+        destination = self._destination(publication, page, width)
         lock = self._locks[hash((publication.id, page.number)) % len(self._locks)]
         with self._slots, lock:
             if destination.is_file():
@@ -421,6 +509,20 @@ class PageRenditionService:
                 raise ArchiveUnavailable("page could not be resized") from error
             self._budget.added(destination, destination.stat().st_size)
         return destination
+
+    def _worth_it(self, page: Page, width: int) -> bool:
+        # Re-encoding a page that is already small buys nothing and can cost
+        # bytes, so the original stays the better answer.
+        if self._settings.rendition_cache_mb == 0:
+            return False
+        return page.width is None or page.width > width
+
+    def _destination(self, publication: Publication, page: Page, width: int) -> Path:
+        return (
+            self._settings.rendition_dir
+            / publication.id
+            / f"{publication.revision}-{page.number}-{page.crc:08x}-{width}.webp"
+        )
 
 
 class PageCacheService:
@@ -437,18 +539,21 @@ class PageCacheService:
             settings.page_cache_mb * 1024 * 1024,
         )
 
-    def page(self, publication: Publication, page: Page) -> Path | None:
-        cache_limit = self._settings.page_cache_mb * 1024 * 1024
-        if cache_limit == 0 or page.uncompressed_size > cache_limit:
+    def cached(self, publication: Publication, page: Page) -> Path | None:
+        if not self._cacheable(page):
             return None
-        destination = (
-            self._settings.page_cache_dir
-            / publication.id
-            / f"{publication.revision}-{page.number}-{page.crc:08x}.page"
-        )
-        if self._is_complete(destination, page):
-            os.utime(destination, None)  # keep hot pages away from the budget
-            return destination
+        destination = self._destination(publication, page)
+        if not self._is_complete(destination, page):
+            return None
+        os.utime(destination, None)  # keep hot pages away from the budget
+        return destination
+
+    def page(self, publication: Publication, page: Page) -> Path | None:
+        if not self._cacheable(page):
+            return None
+        if cached := self.cached(publication, page):
+            return cached
+        destination = self._destination(publication, page)
         lock = self._locks[hash((publication.id, page.number)) % len(self._locks)]
         with self._slots, lock:
             if self._is_complete(destination, page):
@@ -456,6 +561,17 @@ class PageCacheService:
             self._materialise(publication, page, destination)
             self._budget.added(destination, destination.stat().st_size)
         return destination
+
+    def _cacheable(self, page: Page) -> bool:
+        cache_limit = self._settings.page_cache_mb * 1024 * 1024
+        return cache_limit != 0 and page.uncompressed_size <= cache_limit
+
+    def _destination(self, publication: Publication, page: Page) -> Path:
+        return (
+            self._settings.page_cache_dir
+            / publication.id
+            / f"{publication.revision}-{page.number}-{page.crc:08x}.page"
+        )
 
     @staticmethod
     def _is_complete(destination: Path, page: Page) -> bool:

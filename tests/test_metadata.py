@@ -474,6 +474,42 @@ def test_cover_store_rejects_large_and_invalid_images(tmp_path: Path):
         store.save_custom("series", image_bytes((1, 2, 3), (4, 4)))
 
 
+def test_the_cover_store_decodes_through_its_renderer(tmp_path: Path):
+    rendered = []
+
+    class Recording:
+        def render_box(self, source, destination, box, quality):
+            rendered.append((box, quality))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read())
+
+    store = MetadataCoverStore(tmp_path, 10, renderer=Recording())
+    assert store.save_custom("series", b"payload").read_bytes() == b"payload"
+    assert rendered == [((960, 1440), 86)]
+
+
+def test_the_isolated_worker_refuses_what_the_in_process_decoder_refuses(tmp_path):
+    from nineveh.archives import SubprocessThumbnailRenderer
+
+    store = MetadataCoverStore(
+        tmp_path, 10, renderer=SubprocessThumbnailRenderer(10, 1 << 30, 20)
+    )
+    with pytest.raises(MetadataError, match="dimensions"):
+        store.save_custom("series", image_bytes((1, 2, 3), (4, 4)))
+    with pytest.raises(MetadataError, match="supported image"):
+        store.save_custom("series", b"not an image")
+
+
+def test_the_container_isolates_metadata_covers(tmp_path: Path):
+    from nineveh.archives import SubprocessThumbnailRenderer
+
+    container = build_container(
+        Settings(data_dir=tmp_path, state_dir=tmp_path / "state")
+    )
+    renderer = container.metadata.covers._renderer
+    assert isinstance(renderer, SubprocessThumbnailRenderer)
+
+
 def test_provider_rejects_unsafe_cover_urls():
     provider = MangaBakaProvider(StubTransport(), RecordingLimiter())
     with pytest.raises(MetadataError, match="unsafe"):

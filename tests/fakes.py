@@ -50,6 +50,9 @@ class FakeCovers:
     def __init__(self, path: Path) -> None:
         self._path = path
 
+    def cached(self, publication: Publication, page: Page, width: int) -> Path | None:
+        return None
+
     def cover(self, publication: Publication, page: Page, width: int) -> Path:
         return self._path
 
@@ -59,6 +62,9 @@ class FakeRenditions:
 
     def __init__(self) -> None:
         self.requested: list[tuple[int, int]] = []
+
+    def cached(self, publication: Publication, page: Page, width: int) -> Path | None:
+        return None
 
     def rendition(
         self, publication: Publication, page: Page, width: int
@@ -71,6 +77,9 @@ class FakeRenditions:
 
 class FakePageStore:
     """A `PageStore` that never caches, so responses take the streaming path."""
+
+    def cached(self, publication: Publication, page: Page) -> Path | None:
+        return None
 
     def page(self, publication: Publication, page: Page) -> Path | None:
         return None

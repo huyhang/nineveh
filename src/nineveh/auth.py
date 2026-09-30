@@ -20,6 +20,10 @@ class AuthenticationError(Exception):
     pass
 
 
+class PublicAdminRefused(AuthenticationError):
+    """Right password, wrong front door: answered exactly like a wrong one."""
+
+
 class InvalidUserInput(ValueError):
     pass
 
@@ -58,13 +62,22 @@ class AuthService:
         return self.create_user(username, password, is_admin=True)
 
     def authenticate(self, username: str, password: str) -> User:
-        cache_key = self._credential_key(username, password)
+        return self.cached_user(username, password) or self.verify(username, password)
+
+    def cached_user(self, username: str, password: str) -> User | None:
+        """A credential verified in the last few minutes, without Argon2 work."""
+        cache_key = self.credential_key(username, password)
         with self._cache_lock:
             cached = self._basic_cache.get(cache_key)
             if cached and cached[1] > time.monotonic():
                 self._basic_cache.move_to_end(cache_key)
                 return cached[0]
             self._basic_cache.pop(cache_key, None)
+        return None
+
+    def verify(self, username: str, password: str) -> User:
+        """Always pay for one Argon2 verification, then remember the result."""
+        cache_key = self.credential_key(username, password)
         user = self._repository.user_by_username(username)
         candidate_hash = user.password_hash if user else self._dummy_hash
         try:
@@ -178,7 +191,7 @@ class AuthService:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _credential_key(username: str, password: str) -> str:
+    def credential_key(username: str, password: str) -> str:
         value = f"{username.casefold()}\0{password}".encode()
         return hashlib.sha256(value).hexdigest()
 

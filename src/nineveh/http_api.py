@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import sqlite3
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -35,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, RootModel, WithJsonSchema
 from pydantic.alias_generators import to_camel
 from starlette.background import BackgroundTask
 
+from .admission import FairGate, Throttled
 from .archives import (
     ArchiveChanged,
     ArchiveUnavailable,
@@ -46,6 +50,7 @@ from .auth import (
     AuthService,
     InvalidUserInput,
     LastAdministratorError,
+    PublicAdminRefused,
 )
 from .catalog import IMAGE_TYPES, InvalidLibrary
 from .deployment import memory_limit_text
@@ -68,7 +73,9 @@ from .domain import (
     Session,
     User,
 )
+from .ingress import client_address
 from .librarian import (
+    LibrarianCapacity,
     LibrarianConflict,
     LibrarianError,
     LibrarianNotFound,
@@ -86,7 +93,7 @@ from .search import filters_from_params
 from .storage import MountInUse, MountNotFound, MountService, StorageError
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
-    from .app import Container
+    from .app import Container, Protection
 
 SESSION_COOKIE = "nineveh_session"
 NavigationEntries = tuple[str, dict[str, str], list[tuple[str, int, str]]]
@@ -574,34 +581,141 @@ def _container(request: Request) -> Container:
     return request.app.state.container
 
 
+def _protection(request: Request) -> Protection:
+    return request.app.state.protection
+
+
+def _too_many(error: Throttled) -> HTTPException:
+    return HTTPException(
+        status_code=429,
+        detail=error.detail,
+        headers={"Retry-After": str(error.retry_after)},
+    )
+
+
+async def _note_throttled(request: Request, user: User, what: str) -> None:
+    await run_in_threadpool(
+        _protection(request).events.record,
+        "account.throttled",
+        f"“{user.username}” was throttled: {what}",
+        {"username": user.username, "limit": what},
+        once_per=f"{user.id}\0{what}",
+    )
+
+
+async def _admit(request: Request, gate: FairGate, identity: Identity) -> None:
+    try:
+        await gate.acquire(identity.user.id)
+    except Throttled as error:
+        await _note_throttled(request, identity.user, error.detail)
+        raise _too_many(error) from error
+
+
+@asynccontextmanager
+async def work_slot(
+    request: Request, gate: FairGate, identity: Identity
+) -> AsyncIterator[None]:
+    """Hold a fair share of `gate` while the body runs; waiting holds no thread."""
+    await _admit(request, gate, identity)
+    try:
+        yield
+    finally:
+        gate.release(identity.user.id)
+
+
+async def held_slot(
+    request: Request, gate: FairGate, identity: Identity
+) -> Callable[[], Awaitable[None]]:
+    """A slot that outlives the handler: release it once the response is sent."""
+    await _admit(request, gate, identity)
+
+    async def release() -> None:
+        gate.release(identity.user.id)
+
+    return release
+
+
+async def verify_password(request: Request, username: str, password: str) -> User:
+    """Check one password under the login guard.
+
+    An administrator's correct password on the public origin is refused
+    exactly like a wrong one -- same status, same Argon2 cost, same delay for
+    the next attempt -- so the public origin cannot confirm an admin password.
+    """
+    container = _container(request)
+    protection = _protection(request)
+    cached = container.auth.cached_user(username, password)
+    if cached and protection.ingress.admits_account(request, is_admin=cached.is_admin):
+        return cached
+    address = client_address(request)
+
+    async def check() -> User:
+        async with protection.admission.passwords.slot(address):
+            user = await run_in_threadpool(container.auth.verify, username, password)
+        if not protection.ingress.admits_account(request, is_admin=user.is_admin):
+            raise PublicAdminRefused("Invalid username or password")
+        return user
+
+    # Identical credentials share one verification only on the same side of
+    # the split: a private success must never answer a public request.
+    side = "private" if protection.ingress.is_private(request) else "public"
+    flight = f"{side}\0{container.auth.credential_key(username, password)}"
+    try:
+        return await protection.logins.verify(address, username, flight, check)
+    except Throttled as error:
+        raise _too_many(error) from error
+
+
+async def _identify(
+    request: Request, credentials: HTTPBasicCredentials | None
+) -> Identity | None:
+    if credentials:
+        try:
+            user = await verify_password(
+                request, credentials.username, credentials.password
+            )
+        except AuthenticationError:
+            return None
+        return Identity(user)
+    session = await run_in_threadpool(
+        _container(request).auth.session, request.cookies.get(SESSION_COOKIE)
+    )
+    if session and _protection(request).ingress.admits_account(
+        request, is_admin=session.user.is_admin
+    ):
+        return Identity(session.user, session)
+    return None
+
+
+async def admit_account(request: Request, user: User) -> None:
+    """A generous per-account request rate: only a runaway client ever hits it."""
+    wait = _protection(request).admission.requests.take(user.id)
+    if wait:
+        await _note_throttled(request, user, "request rate")
+        raise _too_many(Throttled("Too many requests from this account", wait))
+
+
 async def authenticated(
     request: Request,
     credentials: Annotated[HTTPBasicCredentials | None, Depends(basic_auth)],
 ) -> Identity:
-    container = _container(request)
-    if credentials:
-        try:
-            user = await run_in_threadpool(
-                container.auth.authenticate, credentials.username, credentials.password
-            )
-            return Identity(user)
-        except AuthenticationError:
-            pass
-    elif browser_session := await run_in_threadpool(
-        container.auth.session, request.cookies.get(SESSION_COOKIE)
-    ):
-        return Identity(browser_session.user, browser_session)
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required",
-        headers={"WWW-Authenticate": 'Basic realm="Nineveh", charset="UTF-8"'},
-    )
+    identity = await _identify(request, credentials)
+    if identity is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": 'Basic realm="Nineveh", charset="UTF-8"'},
+        )
+    await admit_account(request, identity.user)
+    return identity
 
 
 async def administrator(
     identity: Annotated[Identity, Depends(authenticated)],
     request: Request,
 ) -> Identity:
+    if not _protection(request).ingress.is_private(request):
+        raise HTTPException(status_code=403, detail="Private access required")
     if not _container(request).authorization.can_administer(identity.user):
         raise HTTPException(status_code=403, detail="Administrator access required")
     return identity
@@ -617,8 +731,21 @@ def require_api_csrf(
 
 
 def base_url(request: Request) -> str:
-    configured = _container(request).settings.public_base_url
-    return (configured or str(request.base_url)).rstrip("/")
+    return _protection(request).ingress.link_origin(request)
+
+
+async def cached_or_made[T](
+    request: Request,
+    identity: Identity,
+    cached: Callable[[], T | None],
+    make: Callable[[], T],
+) -> T:
+    """Serve work already done at once; queue work still to do fairly."""
+    found = await run_in_threadpool(cached)
+    if found is not None:
+        return found
+    async with work_slot(request, _protection(request).admission.media, identity):
+        return await run_in_threadpool(make)
 
 
 router = APIRouter()
@@ -641,11 +768,11 @@ async def live() -> dict[str, str]:
 async def ready(request: Request) -> dict[str, object]:
     container = _container(request)
     database_ready = await run_in_threadpool(container.repository.ping)
-    scan = container.scanner.status
-    return {
-        "status": "ok" if database_ready else "unavailable",
-        "catalog": asdict(scan),
-    }
+    body: dict[str, object] = {"status": "ok" if database_ready else "unavailable"}
+    # Scan detail -- library size, timings, raw error text -- is for operators.
+    if _protection(request).ingress.is_private(request):
+        body["catalog"] = asdict(container.scanner.status)
+    return body
 
 
 @router.get("/api/v1/search", response_model=SearchResults, tags=["search"])
@@ -994,13 +1121,13 @@ async def series_cover(
     custom = container.metadata.covers.cover(series_id) if container.metadata else None
     if custom:
         stat = custom.stat()
+        etag = _etag(f"{stat.st_mtime_ns}-{stat.st_size}")
+        if _not_modified(request, etag):
+            return _not_modified_response(etag)
         return FileResponse(
             custom,
             media_type="image/webp",
-            headers={
-                "ETag": _etag(f"{stat.st_mtime_ns}-{stat.st_size}"),
-                "Cache-Control": "private, no-cache",
-            },
+            headers={"ETag": etag, "Cache-Control": "private, no-cache"},
         )
     publication = await run_in_threadpool(
         container.repository.publication_by_id,
@@ -1009,14 +1136,20 @@ async def series_cover(
     )
     if not publication:
         raise HTTPException(status_code=404, detail="Series cover not found")
+    etag = _etag(f"{publication.revision}-series-cover")
+    if _not_modified(request, etag):
+        return _not_modified_response(etag)
     page = await run_in_threadpool(
         container.repository.page, publication.id, publication.cover_page
     )
     if not page:
         raise HTTPException(status_code=404, detail="Series cover not found")
     try:
-        path = await run_in_threadpool(
-            container.thumbnails.cover, publication, page.page, 640
+        path = await cached_or_made(
+            request,
+            identity,
+            partial(container.thumbnails.cached, publication, page.page, 640),
+            partial(container.thumbnails.cover, publication, page.page, 640),
         )
     except ArchiveChanged as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -1025,10 +1158,7 @@ async def series_cover(
     return FileResponse(
         path,
         media_type="image/webp",
-        headers={
-            "ETag": _etag(f"{publication.revision}-series-cover"),
-            "Cache-Control": "private, no-cache",
-        },
+        headers={"ETag": etag, "Cache-Control": "private, no-cache"},
     )
 
 
@@ -1062,12 +1192,20 @@ async def publication_file(
         raise HTTPException(status_code=409, detail=str(error)) from error
     except ArchiveUnavailable as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
+    # A HEAD sends no body, so it takes no stream; a GET -- ranged or not --
+    # holds one until the last byte is sent, whether it waited for it or not.
+    release = None
+    if request.method != "HEAD":
+        release = await held_slot(
+            request, _protection(request).admission.downloads, identity
+        )
     return FileResponse(
         path,
         media_type=CBZ_MEDIA_TYPE,
         filename=publication.filename,
         content_disposition_type="attachment",
         headers={"ETag": etag, "Cache-Control": "private, no-cache"},
+        background=BackgroundTask(release) if release else None,
     )
 
 
@@ -1103,9 +1241,13 @@ async def page_manifest(
         container.repository.pages, publication.id, start, effective_end
     )
     try:
-        pages = await run_in_threadpool(
-            _enrich_dimensions, container, publication, pages
-        )
+        if any(page.width is None or page.height is None for page in pages):
+            async with work_slot(
+                request, _protection(request).admission.media, identity
+            ):
+                pages = await run_in_threadpool(
+                    _enrich_dimensions, container, publication, pages
+                )
     except ArchiveChanged as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except ArchiveUnavailable as error:
@@ -1208,20 +1350,68 @@ async def publication_range(
     )
     if len(pages) != last - first + 1:
         raise HTTPException(status_code=409, detail="Publication revision has changed")
+    size = sum(page.uncompressed_size for page in pages)
+    if size > container.settings.max_range_uncompressed_bytes:
+        raise HTTPException(
+            status_code=413, detail="This page range is larger than a range may be"
+        )
+    release = await held_slot(
+        request, _protection(request).admission.downloads, identity
+    )
     try:
-        archive = await run_in_threadpool(_build_range, container, publication, pages)
-    except ArchiveChanged as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    except ArchiveUnavailable as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
+        archive = await _generate_range(request, identity, publication, pages, size)
+    except BaseException:
+        await release()
+        raise
+
+    async def finish() -> None:
+        archive.unlink(missing_ok=True)
+        await release()
+
     return FileResponse(
         archive,
         media_type=CBZ_MEDIA_TYPE,
         filename=f"{Path(publication.filename).stem} p{first}-{last}.cbz",
         content_disposition_type="attachment",
         headers={"ETag": etag, "Cache-Control": "private, no-cache"},
-        background=BackgroundTask(archive.unlink, missing_ok=True),
+        background=BackgroundTask(finish),
     )
+
+
+async def _generate_range(
+    request: Request,
+    identity: Identity,
+    publication: Publication,
+    pages: list[Page],
+    size: int,
+) -> Path:
+    container = _container(request)
+    await _require_free_space(request, container.settings.range_dir, size)
+    try:
+        async with work_slot(request, _protection(request).admission.ranges, identity):
+            return await run_in_threadpool(_build_range, container, publication, pages)
+    except ArchiveChanged as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ArchiveUnavailable as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+async def _require_free_space(request: Request, directory: Path, size: int) -> None:
+    """Refuse work that would eat into the state volume's free-space reserve."""
+    directory.mkdir(parents=True, exist_ok=True)
+    free = await run_in_threadpool(lambda: shutil.disk_usage(directory).free)
+    reserve = _container(request).settings.state_free_reserve_bytes
+    if free - size >= reserve:
+        return
+    await run_in_threadpool(
+        _protection(request).events.record,
+        "storage.reserve",
+        f"Refused {size} bytes of generated work: {free} bytes free, "
+        f"{reserve} reserved",
+        {"free": free, "reserve": reserve, "requested": size},
+        once_per="range",
+    )
+    raise HTTPException(status_code=507, detail="The server is short of storage")
 
 
 def _build_range(
@@ -1275,15 +1465,18 @@ async def publication_page(
     if revision and revision != item.publication.revision:
         raise HTTPException(status_code=409, detail="Publication revision has changed")
     if width is not None:
-        resized = await _page_rendition(request, container, item, width, revision)
+        resized = await _page_rendition(request, identity, item, width, revision)
         if resized is not None:
             return resized
     etag = _etag(f"{item.publication.revision}-{item.page.crc:08x}")
     if _not_modified(request, etag):
         return _not_modified_response(etag)
     try:
-        cached_path = await run_in_threadpool(
-            container.page_cache.page, item.publication, item.page
+        cached_path = await cached_or_made(
+            request,
+            identity,
+            partial(container.page_cache.cached, item.publication, item.page),
+            partial(container.page_cache.page, item.publication, item.page),
         )
     except ArchiveChanged as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -1306,11 +1499,21 @@ async def publication_page(
     return StreamingResponse(content, media_type=item.page.media_type, headers=headers)
 
 
-async def _page_rendition(request: Request, container, item, width: int, revision):
+async def _page_rendition(
+    request: Request, identity: Identity, item, width: int, revision
+):
     """A width-bounded copy, or None when the original is the better answer."""
+    renditions = _container(request).renditions
+    etag = _etag(f"{item.publication.revision}-{item.page.crc:08x}-w{width}")
+    # Only a client that was once served this copy can hold its ETag.
+    if _not_modified(request, etag):
+        return _not_modified_response(etag)
     try:
-        path = await run_in_threadpool(
-            container.renditions.rendition, item.publication, item.page, width
+        path = await cached_or_made(
+            request,
+            identity,
+            partial(renditions.cached, item.publication, item.page, width),
+            partial(renditions.rendition, item.publication, item.page, width),
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -1320,9 +1523,6 @@ async def _page_rendition(request: Request, container, item, width: int, revisio
         raise HTTPException(status_code=404, detail=str(error)) from error
     if path is None:
         return None
-    etag = _etag(f"{item.publication.revision}-{item.page.crc:08x}-w{width}")
-    if _not_modified(request, etag):
-        return _not_modified_response(etag)
     return FileResponse(
         path,
         media_type="image/webp",
@@ -1360,14 +1560,20 @@ async def publication_cover(
     publication = await _publication_or_404(request, publication_id, identity)
     if revision and revision != publication.revision:
         raise HTTPException(status_code=409, detail="Publication revision has changed")
+    etag = _etag(f"{publication.revision}-cover-{width}")
+    if _not_modified(request, etag):
+        return _not_modified_response(etag)
     item = await run_in_threadpool(
         container.repository.page, publication.id, publication.cover_page
     )
     if not item:
         raise HTTPException(status_code=404, detail="Cover page not found")
     try:
-        path = await run_in_threadpool(
-            container.thumbnails.cover, publication, item.page, width
+        path = await cached_or_made(
+            request,
+            identity,
+            partial(container.thumbnails.cached, publication, item.page, width),
+            partial(container.thumbnails.cover, publication, item.page, width),
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -1379,7 +1585,7 @@ async def publication_cover(
         path,
         media_type="image/webp",
         headers={
-            "ETag": _etag(f"{publication.revision}-cover-{width}"),
+            "ETag": etag,
             "Cache-Control": "private, max-age=31536000, immutable",
         },
     )
@@ -2633,6 +2839,8 @@ async def librarian_identity(
         HTTPAuthorizationCredentials | None, Depends(librarian_bearer)
     ],
 ) -> LibrarianToken:
+    if not _protection(request).ingress.is_private(request):
+        raise HTTPException(status_code=403, detail="Private access required")
     secret = credentials.credentials if credentials else None
     token = await run_in_threadpool(_container(request).librarian_auth.verify, secret)
     if token is None:
@@ -2642,7 +2850,14 @@ async def librarian_identity(
 
 def _correlation(request: Request) -> str:
     """Group a resolve/stage/commit chain so the feed reads as one action."""
-    return request.headers.get("x-correlation-id") or str(uuid.uuid4())
+    supplied = request.headers.get("x-correlation-id", "")
+    # Stored and shown verbatim, so only a short, plain identifier is kept.
+    if _CORRELATION.fullmatch(supplied):
+        return supplied
+    return str(uuid.uuid4())
+
+
+_CORRELATION = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 
 
 async def _require_librarian_scope(
@@ -2671,6 +2886,8 @@ def _librarian_error(error: LibrarianError) -> HTTPException:
         return HTTPException(status_code=409, detail=str(error))
     if isinstance(error, LibrarianTooLarge):
         return HTTPException(status_code=413, detail=str(error))
+    if isinstance(error, LibrarianCapacity):
+        return HTTPException(status_code=507, detail=str(error))
     return HTTPException(status_code=422, detail=str(error))
 
 
@@ -3120,6 +3337,31 @@ async def revoke_librarian_token(
     if revoked is None:
         raise HTTPException(status_code=404, detail="Librarian token not found")
     return _token_payload(revoked)
+
+
+@router.get("/api/v1/admin/security/events", tags=["admin"])
+async def security_events(
+    request: Request,
+    _: Annotated[Identity, Depends(administrator)],
+    kind: Annotated[str | None, Query(max_length=64)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+) -> dict[str, object]:
+    """Abuse-facing signals: failed sign-ins, throttled accounts, storage refusals."""
+    events = await run_in_threadpool(
+        partial(_protection(request).events.recent, kind=kind, limit=limit)
+    )
+    return {
+        "events": [
+            {
+                "id": item.id,
+                "kind": item.kind,
+                "summary": item.summary,
+                "detail": item.detail,
+                "createdAt": item.created_at.isoformat(),
+            }
+            for item in events
+        ]
+    }
 
 
 @router.get("/api/v1/admin/librarian/activity", tags=["admin"])

@@ -115,6 +115,51 @@ def test_changing_a_password_invalidates_existing_sessions(service: AuthService)
     assert service.session(session.token) is None
 
 
+def test_disabling_a_user_invalidates_existing_sessions(service: AuthService):
+    user = service.create_user("reader", PASSWORD)
+    session = service.new_session(user)
+    service.set_enabled(user.id, False)
+    assert service.session(session.token) is None
+
+
+def test_re_enabling_a_user_revives_no_session(service: AuthService):
+    user = service.create_user("reader", PASSWORD)
+    session = service.new_session(user)
+    service.set_enabled(user.id, False)
+    service.set_enabled(user.id, True)
+    assert service.session(session.token) is None
+
+
+def test_the_credential_cache_answers_without_verifying(service: AuthService):
+    assert service.cached_user("reader", PASSWORD) is None
+    service.create_user("reader", PASSWORD)
+    verified = service.verify("reader", PASSWORD)
+    assert service.cached_user("reader", PASSWORD) == verified
+    assert service.cached_user("reader", "a different password") is None
+
+
+class CountingHasher:
+    def __init__(self, hasher) -> None:
+        self._hasher = hasher
+        self.checks = 0
+
+    def verify(self, *args):
+        self.checks += 1
+        return self._hasher.verify(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._hasher, name)
+
+
+def test_verify_always_pays_for_a_hash(service: AuthService):
+    service.create_user("reader", PASSWORD)
+    service.verify("reader", PASSWORD)
+    counting = service._hasher = CountingHasher(service._hasher)
+    service.verify("reader", PASSWORD)
+    service.authenticate("reader", PASSWORD)  # served from the cache
+    assert counting.checks == 1
+
+
 def test_disabling_a_user_invalidates_the_basic_auth_cache(service: AuthService):
     user = service.create_user("reader", PASSWORD)
     service.authenticate("reader", PASSWORD)

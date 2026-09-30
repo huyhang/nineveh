@@ -10,16 +10,26 @@ up passing after `os.link` is swapped for something that silently overwrites.
 from __future__ import annotations
 
 import io
+import json
 import zipfile
+from dataclasses import replace
 
 import pytest
-from conftest import authorization, image_bytes, wait_for_scan, write_cbz
+from conftest import (
+    authorization,
+    image_bytes,
+    scanned_client,
+    wait_for_scan,
+    write_cbz,
+)
 from fastapi.testclient import TestClient
 
 from nineveh import librarian
 from nineveh.app import create_app
 from nineveh.librarian import (
+    LibrarianCapacity,
     LibrarianError,
+    StagingQuota,
     best_match,
     suggest_filename,
     validate_filename,
@@ -468,11 +478,12 @@ def test_a_commit_interrupted_after_the_copy_leaves_no_archive(
         raise OSError("interrupted")
 
     monkeypatch.setattr(librarian.os, "link", explode)
-    with pytest.raises(OSError):
-        client.post(
-            f"/api/v1/librarian/ingest/{staged['ingestId']}/commit",
-            headers=bearer(token),
-        )
+    response = client.post(
+        f"/api/v1/librarian/ingest/{staged['ingestId']}/commit",
+        headers=bearer(token),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Ingest destination is not writable"
     assert not target.exists()
     # No temporary debris, and the directory holds exactly what it started with.
     assert list(target.parent.glob("*.part")) == []
@@ -1522,3 +1533,135 @@ def test_a_clipping_card_still_lets_an_open_picker_escape():
         ".user-card clips its children but nothing lifts the clip for an open "
         "picker — the capability dropdown will render as a sliver"
     )
+
+
+# --------------------------------------------------------------------------
+# Staging quotas, token-use writes, and correlation identifiers
+# --------------------------------------------------------------------------
+
+
+def _quota_client(library, **quota):
+    settings, _ = library
+    return scanned_client(replace(settings, **quota))
+
+
+def _series(client: TestClient) -> str:
+    finder = issue(client, ("catalog:read",), name="finder")
+    found = client.get(
+        "/api/v1/librarian/series", headers=bearer(finder), params={"query": "Example"}
+    ).json()
+    return found["candidates"][0]["seriesId"]
+
+
+def test_a_token_cannot_stage_past_its_count_quota(library):
+    for client in _quota_client(library, staging_max_per_token=2):
+        token, series = issue(client), _series(client)
+        assert stage(client, token, series, "Issue 2.cbz").status_code == 201
+        assert stage(client, token, series, "Issue 3.cbz").status_code == 201
+        refused = stage(client, token, series, "Issue 4.cbz")
+        assert refused.status_code == 507
+        assert "Commit or discard one first" in refused.json()["detail"]
+
+
+def test_a_token_cannot_stage_past_its_byte_quota(library):
+    payload = cbz_bytes()
+    for client in _quota_client(library, staging_max_bytes_per_token=len(payload) + 10):
+        token, series = issue(client), _series(client)
+        assert stage(client, token, series, "Issue 2.cbz", payload).status_code == 201
+        refused = stage(client, token, series, "Issue 3.cbz", payload)
+        assert refused.status_code == 507
+        staging = client.app.state.container.settings.ingest_staging_dir
+        assert len(list(staging.glob("*.cbz"))) == 1  # nothing partial left behind
+
+
+def test_quotas_are_per_token(library):
+    for client in _quota_client(library, staging_max_per_token=1):
+        series = _series(client)
+        first, second = issue(client, name="first"), issue(client, name="second")
+        assert stage(client, first, series, "Issue 2.cbz").status_code == 201
+        assert stage(client, first, series, "Issue 3.cbz").status_code == 507
+        assert stage(client, second, series, "Issue 3.cbz").status_code == 201
+
+
+def test_unattributed_staging_counts_against_every_token(library):
+    for client in _quota_client(library, staging_max_per_token=1):
+        token, series = issue(client), _series(client)
+        assert stage(client, token, series, "Issue 2.cbz").status_code == 201
+        staging = client.app.state.container.settings.ingest_staging_dir
+        sidecar = next(staging.glob("*.json"))
+        record = json.loads(sidecar.read_text())
+        record["token_id"] = None  # staged before attribution existed
+        sidecar.write_text(json.dumps(record))
+        other = issue(client, name="other")
+        assert stage(client, other, series, "Issue 3.cbz").status_code == 507
+
+
+def test_concurrent_uploads_cannot_both_slip_under_the_byte_quota(tmp_path):
+    quota = StagingQuota(max_files=10, max_bytes=100)
+    with quota.admit("token", [], tmp_path) as first:
+        first(60)
+        with (
+            quota.admit("token", [], tmp_path) as second,
+            pytest.raises(LibrarianCapacity),
+        ):
+            second(60)
+    with quota.admit("token", [], tmp_path) as later:
+        later(100)  # both earlier uploads are over; the whole quota is free
+
+
+def test_concurrent_uploads_count_towards_the_file_quota(tmp_path):
+    quota = StagingQuota(max_files=1)
+    with (
+        quota.admit("token", [], tmp_path),
+        pytest.raises(LibrarianCapacity),
+        quota.admit("token", [], tmp_path),
+    ):
+        pass
+    with quota.admit("token", [], tmp_path):
+        pass
+
+
+def test_staging_stops_at_the_free_space_reserve(tmp_path):
+    quota = StagingQuota(free_reserve=1000, free_bytes=lambda _path: 999)
+    with quota.admit("token", [], tmp_path) as accept, pytest.raises(LibrarianCapacity):
+        accept(1)
+
+
+def test_token_use_is_written_at_most_once_a_minute(client: TestClient):
+    now = [0.0]
+    container = client.app.state.container
+    touched = []
+    repository = container.repository
+
+    class Recording:
+        def __getattr__(self, name):
+            return getattr(repository, name)
+
+        def touch_librarian_token(self, token_id):
+            touched.append(token_id)
+
+    auth = librarian.LibrarianAuth(Recording(), container.audit, clock=lambda: now[0])
+    token, secret = auth.issue("agent", ("catalog:read",), ())
+    for _ in range(5):
+        assert auth.verify(secret).id == token.id
+    now[0] += 61
+    auth.verify(secret)
+    assert touched == [token.id, token.id]
+
+
+def test_only_plain_correlation_identifiers_are_kept(client: TestClient):
+    token = issue(client)
+    for supplied, kept in (
+        ("run-42:stage", True),
+        ("<script>alert(1)</script>", False),
+    ):
+        client.get(
+            "/api/v1/librarian/libraries",
+            headers={**bearer(token), "X-Correlation-Id": supplied},
+        )
+        feed = client.get(
+            "/api/v1/admin/librarian/activity",
+            headers=authorization(),
+            params={"severity": "info", "limit": 1},
+        ).json()["events"]
+        assert (feed[0]["correlationId"] == supplied) is kept

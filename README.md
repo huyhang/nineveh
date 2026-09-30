@@ -66,14 +66,14 @@ Symlinks and files outside this hierarchy are ignored. Pages are naturally sorte
 
 1. Copy `docker/.env.example` to `docker/.env` and set the absolute media and state paths.
 2. Create `docker/secrets/admin_password.txt` containing the initial administrator password. Use at least 12 characters and restrict access to the file.
-3. Ensure the configured UID/GID can read the media directory and write to the state directory.
+3. Ensure the configured UID/GID can read the media directory and write to the state directory. It needs write access to media only where the librarian places volumes; otherwise set `NINEVEH_DATA_MODE=ro`.
 4. Start the service:
 
 ```sh
 docker compose --env-file docker/.env -f docker/compose.yaml up --build -d
 ```
 
-Open `http://NAS_ADDRESS:8080/`, or the HTTPS address configured through a reverse proxy. The OPDS catalog URL is:
+Compose publishes port 8080 on the NAS's loopback interface only, so readers reach Nineveh through an HTTPS reverse proxy and administrators through Tailscale Serve or a LAN proxy address — see [Split access](#split-access). The OPDS catalog URL is:
 
 ```text
 https://nineveh.example.com/opds/v2/catalog.json
@@ -118,9 +118,10 @@ All catalog and content endpoints require authentication.
 | `/api/v1/admin/libraries/{id}/metadata/auto-match` | Start or inspect a resumable, confidence-gated library auto-match job |
 | `/api/v1/admin/series/{id}/spread-detection` | Enable or disable automatic spread-start detection for a series |
 | `/api/v1/admin/publications/{id}/spread-start` | Pin one volume's pairing start by hand, or restore detection |
-| `/api/v1/health/live`, `/api/v1/health/ready` | Liveness and readiness with scan status |
-| `/docs` | Interactive OpenAPI documentation |
-| `/openapi.json` | The same contract this service serves, committed at [`docs/openapi.json`](docs/openapi.json) |
+| `/api/v1/admin/security/events` | Failed sign-ins, throttled accounts, and storage refusals |
+| `/api/v1/health/live`, `/api/v1/health/ready` | Liveness and readiness; scan detail only on a private origin |
+| `/docs` | Interactive OpenAPI documentation, for administrators on a private origin |
+| `/openapi.json` | The same contract this service serves, committed at [`docs/openapi.json`](docs/openapi.json); administrators only |
 
 The committed specification is generated with `python scripts/export-openapi.py`. `tests/test_contract.py` compares it against the live route table, so a route added, removed, or renamed without regenerating the file fails the build rather than silently shipping a stale contract.
 
@@ -137,12 +138,16 @@ Reading position is API state rather than a private detail of the browser reader
 | Variable | Default | Description |
 |---|---:|---|
 | `NINEVEH_DATA_DIR` | `/data` | The first data mount; more are registered in Admin. The librarian's ingest path needs create access |
+| `NINEVEH_DATA_MODE` | `rw` | Compose only: `ro` mounts the primary library read-only |
+| `NINEVEH_PUBLISH_ADDRESS` | `127.0.0.1` | Compose only: host address the port is published on |
 | `NINEVEH_STATE_DIR` | `/state` | Writable database and cache directory |
 | `NINEVEH_ADMIN_USERNAME` | `admin` | First administrator username |
 | `NINEVEH_ADMIN_PASSWORD_FILE` | — | File containing the first administrator password |
 | `NINEVEH_ADMIN_PASSWORD` | — | Less secure alternative to the password file |
 | `NINEVEH_SECURE_COOKIES` | `true` | Require HTTPS for browser session cookies |
 | `NINEVEH_PUBLIC_BASE_URL` | request URL | Origin stamped into OPDS links and accepted for browser sign-in |
+| `NINEVEH_PRIVATE_BASE_URLS` | — | Comma-separated private origins (Tailscale, LAN); setting any turns on [split access](#split-access) |
+| `NINEVEH_PRIVATE_ALLOW_IPS` | Tailscale ranges | Client networks allowed on a private origin; add your LAN, e.g. `192.168.1.0/24` |
 | `NINEVEH_MEMORY_LIMIT` | `1g` | Container memory ceiling (Compose only) |
 | `NINEVEH_RESTART_ENABLED` | `false` | Permit the admin UI to terminate gracefully for supervisor restart |
 | `NINEVEH_HOST` | `0.0.0.0` | Listen address |
@@ -150,10 +155,48 @@ Reading position is API state rather than a private detail of the browser reader
 | `NINEVEH_LOG_LEVEL` | `INFO` | Level for the JSON stdout log |
 | `NINEVEH_FORWARDED_ALLOW_IPS` | `127.0.0.1` | Proxies whose `X-Forwarded-*` headers are trusted |
 | `NINEVEH_MAX_UPLOAD_BYTES` | `4294967296` | Largest body accepted for one agent upload |
+| `NINEVEH_MAX_REQUEST_BODY_BYTES` | `1048576` | Largest body for every other request, checked before parsing |
+| `NINEVEH_MAX_RANGE_UNCOMPRESSED_BYTES` | `536870912` | Largest page range generated as one CBZ |
+| `NINEVEH_STATE_FREE_RESERVE_BYTES` | `536870912` | Free space uploads and generated ranges may never use |
+| `NINEVEH_STAGING_MAX_PER_TOKEN` | `10` | Uploads one librarian token may have staged at once |
+| `NINEVEH_STAGING_MAX_BYTES_PER_TOKEN` | `21474836480` | Bytes one librarian token may have staged at once |
+| `NINEVEH_DOWNLOAD_STREAMS` | `16` | Concurrent downloads, all accounts together |
+| `NINEVEH_DOWNLOAD_STREAMS_PER_ACCOUNT` | `4` | Concurrent downloads per account; more wait their turn |
+| `NINEVEH_RANGE_WORKERS` | `1` | Page-range archives generated at once |
+| `NINEVEH_ACCOUNT_REQUESTS_PER_MINUTE` | `6000` | Per-account request rate; only a runaway client reaches it |
+| `NINEVEH_ISOLATE_MEDIA_PROCESSING` | `false` | Also decode library pages in a limited worker process |
+| `NINEVEH_CONNECTION_LIMIT` | `1024` | Concurrent connections uvicorn accepts before answering 503 |
 
-Getting that last one wrong used to fail silently. Nineveh now warns at startup when its own container gateway is not in the trusted list, and raises a banner on **Admin → Overview** — naming the peer address and the exact variable to set — the first time it discards a real proxy's `X-Forwarded-Proto`. It reports; it never widens the trust list itself, because finding the address in front of the container does not establish that it is your proxy.
+Getting `NINEVEH_FORWARDED_ALLOW_IPS` wrong used to fail silently. Nineveh now warns at startup when its own container gateway is not in the trusted list, and raises a banner on **Admin → Overview** — naming the peer address and the exact variable to set — the first time it discards a real proxy's `X-Forwarded-Proto`. It reports; it never widens the trust list itself, because finding the address in front of the container does not establish that it is your proxy.
 
-Archive safety limits can also be adjusted through the variables defined in [`config.py`](src/nineveh/config.py).
+Archive safety limits can also be adjusted through the variables defined in [`config.py`](src/nineveh/config.py). Compose passes every deployment-owned variable through explicitly — `--env-file` fills in `compose.yaml` but does not reach the container on its own — and `tests/test_deployment.py` fails if a new one is left out.
+
+### Split access
+
+A public origin serves readers. Administration and the librarian agent belong somewhere the Internet cannot reach, so Nineveh can answer on private origins as well: a Tailscale Serve name, a LAN address behind the NAS's reverse proxy, or both.
+
+```dotenv
+NINEVEH_PUBLIC_BASE_URL=https://nineveh.example.com
+NINEVEH_PRIVATE_BASE_URLS=https://nas.your-tailnet.ts.net,https://192.168.1.10:5443
+NINEVEH_PRIVATE_ALLOW_IPS=100.64.0.0/10,fd7a:115c:a1e0::/48,192.168.1.0/24
+```
+
+A request is private only when it names a private origin **and** arrives from an allowed network, so forging a `Host` header gets nobody in. Once any private origin is set:
+
+- administrator accounts sign in only on a private origin; on the public one their correct password is answered exactly like a wrong one;
+- the admin pages and APIs, the API docs, and the whole librarian API answer 403 on the public origin before a request body is read;
+- readiness detail (scan timing, library size, error text) is private; the public origin gets a bare status;
+- requests naming any other origin are refused, and links are generated for the origin a request arrived on.
+
+Every origin must be HTTPS, cookies must be secure, and `NINEVEH_FORWARDED_ALLOW_IPS` must name your proxies explicitly; Nineveh refuses to start otherwise. Without a private origin it behaves as before, and **Admin → Overview** warns that administration is reachable from anywhere. Keep a separate, non-administrator account for reading from the Internet. [The deployment guide](docker/synology-deployment.md#6-private-administration-over-tailscale-or-the-lan) walks through Tailscale Serve and a LAN address on a Synology.
+
+### Abuse resistance
+
+Nineveh does its blocking work — extraction, resizing, password hashing — on one shared thread pool, so the question is never only "how much" but "who waits behind whom". Expensive work waits for capacity on the event loop, not inside the pool, and a freed slot goes to the waiting account holding the fewest; a reader queued behind a script waits for one job, not the script's backlog. Work already done — a cached cover, page or rendition — never queues at all. Waiting is the normal answer: a grid of covers, a scroll window or a reader app's download queue simply takes its turn. Only a backlog far past anything a reader app produces is refused with `429` and `Retry-After`, and recorded.
+
+Sign-ins get progressive delays rather than lockouts: each failure doubles the wait for the next attempt on that address and account, up to 30 seconds, and an address failing across many accounts is slowed too. Attempts from one address run one at a time, so extra connections buy a guesser nothing; identical credentials arriving together, such as an OPDS app opening its catalog, are verified once. Failures are forgotten after 15 quiet minutes, and no account is ever locked. Every password path — browser, OPDS, API, docs — goes through the same guard.
+
+Failed sign-ins, throttled accounts and storage refusals are recorded on **Admin → Overview** and at `/api/v1/admin/security/events`. The table is bounded, so a spray can bury old signals but never grow the database.
 
 ### Settings owned by the admin UI
 
@@ -169,7 +212,7 @@ Reader-facing lists — alternative titles, creators, publishers, tags — are c
 
 Each has the same environment variable as before (`NINEVEH_FEED_PAGE_SIZE` and friends) and still reads from it if you set one. Precedence is narrow on purpose: a saved value is stored **only while it differs from the environment**, so editing one field in the UI never freezes the other twelve. Set a variable in `docker/.env` and it takes effect on the next `up -d` for every setting an administrator has not deliberately pinned; pin one in the UI and it wins until you clear it by saving the environment's value back.
 
-Nineveh's resident set is roughly 80–120 MB and does not grow with library size; the archive, thumbnail, and page caches are bounded on disk under `/state`, not in memory. The two worker ceilings and `NINEVEH_MAX_IMAGE_PIXELS` are what actually bound peak RAM. See [the deployment guide](docker/synology-deployment.md#resource-tuning) for sizing.
+Nineveh's resident set is roughly 80–120 MB and does not grow with library size; the archive, thumbnail, and page caches are bounded on disk under `/state`, not in memory. The two worker ceilings and `NINEVEH_MAX_IMAGE_PIXELS` (80 megapixels by default) are what actually bound peak RAM. See [the deployment guide](docker/synology-deployment.md#resource-tuning) for sizing.
 
 `/state` holds the database and generated caches, including `thumbnails/`, `page-cache/`, `renditions/`, `ranges/`, and `series-covers/`. Back up `nineveh.sqlite3` plus `series-covers/` if you use custom series artwork; the remaining caches are regenerated on demand. Inside `series-covers/`, only the top level is owned data — `series-covers/candidates/` holds throwaway thumbnails from suggestion lists and is bounded like every other cache under `/state`. Generated range archives are deleted as soon as their response completes, and any left behind by an unclean shutdown are cleared at startup.
 
@@ -344,4 +387,6 @@ Pin the slice by content hash rather than by `info.version`: the version tracks 
 
 ## Security notes
 
-Use HTTPS for any non-local deployment. The Docker Compose configuration mounts `/data` writable so the librarian can place volumes, drops Linux capabilities, uses a read-only container filesystem, and persists only `/state`. Nothing in the agent surface can overwrite, move, rename, or delete an existing file. Back up the media tree and `/state/nineveh.sqlite3`; filesystem access is broader than the agent API's authorization, so NAS snapshots remain worthwhile.
+Use HTTPS for any non-local deployment, and turn on [split access](#split-access) before exposing Nineveh to the Internet. The Compose configuration publishes the port on loopback only, drops Linux capabilities, forbids privilege escalation, limits memory, CPU, processes and open files, uses a read-only container filesystem with a `noexec` `/tmp`, and persists only `/state`. `/data` is writable only so the librarian can place volumes; set `NINEVEH_DATA_MODE=ro` if nothing ingests into it. Nothing in the agent surface can overwrite, move, rename, or delete an existing file. Metadata cover images, which arrive from uploads and a remote provider, are decoded in a worker process under memory and CPU limits; `NINEVEH_ISOLATE_MEDIA_PROCESSING=true` extends that to library pages at a latency cost on every cold render.
+
+The image installs only hash-pinned dependencies (`requirements*.lock`), CI audits them with `pip-audit` and generates an SBOM with each image build, and Dependabot proposes updates for Python packages, the base image and the workflow actions. Back up the media tree and `/state/nineveh.sqlite3`; filesystem access is broader than the agent API's authorization, so NAS snapshots remain worthwhile.

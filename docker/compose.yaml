@@ -15,7 +15,14 @@ services:
     init: true
     user: "${NINEVEH_PUID:-10001}:${NINEVEH_PGID:-10001}"
     ports:
-      - "${NINEVEH_PORT:-8080}:8080"
+      # Loopback only: the host's reverse proxy and Tailscale Serve connect
+      # locally, so the app port is never reachable from the LAN or Internet
+      # directly. Set NINEVEH_PUBLISH_ADDRESS=0.0.0.0 to undo that knowingly.
+      - "${NINEVEH_PUBLISH_ADDRESS:-127.0.0.1}:${NINEVEH_PORT:-8080}:8080"
+    # Every deployment-owned setting is listed here explicitly: `--env-file`
+    # only fills in this file, so a variable missing below never reaches
+    # Nineveh however it is spelled in docker/.env. tests/test_deployment.py
+    # fails when a setting is added to the code but not here.
     environment:
       NINEVEH_DATA_DIR: /data
       NINEVEH_STATE_DIR: /state
@@ -25,19 +32,44 @@ services:
       # nothing in the log to explain it. /state is the persistent volume.
       TMPDIR: /state
       NINEVEH_PUBLIC_BASE_URL: "${NINEVEH_PUBLIC_BASE_URL:-}"
+      NINEVEH_PRIVATE_BASE_URLS: "${NINEVEH_PRIVATE_BASE_URLS:-}"
+      NINEVEH_PRIVATE_ALLOW_IPS: "${NINEVEH_PRIVATE_ALLOW_IPS:-100.64.0.0/10,fd7a:115c:a1e0::/48}"
       NINEVEH_ADMIN_USERNAME: "${NINEVEH_ADMIN_USERNAME:-admin}"
       NINEVEH_ADMIN_PASSWORD: "${NINEVEH_ADMIN_PASSWORD:-}"
       NINEVEH_ADMIN_PASSWORD_FILE: "${NINEVEH_ADMIN_PASSWORD_FILE:-/run/secrets/admin_password.txt}"
       NINEVEH_SECURE_COOKIES: "${NINEVEH_SECURE_COOKIES:-true}"
       NINEVEH_MEMORY_LIMIT: "${NINEVEH_MEMORY_LIMIT:-1g}"
-      NINEVEH_MAX_UPLOAD_BYTES: "${NINEVEH_MAX_UPLOAD_BYTES:-4294967296}"
       NINEVEH_RESTART_ENABLED: "${NINEVEH_RESTART_ENABLED:-true}"
       NINEVEH_FORWARDED_ALLOW_IPS: "${NINEVEH_FORWARDED_ALLOW_IPS:-127.0.0.1}"
+      NINEVEH_LOG_LEVEL: "${NINEVEH_LOG_LEVEL:-INFO}"
+      NINEVEH_CONNECTION_LIMIT: "${NINEVEH_CONNECTION_LIMIT:-1024}"
+      # Fair use: work past a ceiling waits its turn rather than failing.
+      NINEVEH_ACCOUNT_REQUESTS_PER_MINUTE: "${NINEVEH_ACCOUNT_REQUESTS_PER_MINUTE:-6000}"
+      NINEVEH_DOWNLOAD_STREAMS: "${NINEVEH_DOWNLOAD_STREAMS:-16}"
+      NINEVEH_DOWNLOAD_STREAMS_PER_ACCOUNT: "${NINEVEH_DOWNLOAD_STREAMS_PER_ACCOUNT:-4}"
+      NINEVEH_RANGE_WORKERS: "${NINEVEH_RANGE_WORKERS:-1}"
+      # Size and storage ceilings.
+      NINEVEH_MAX_UPLOAD_BYTES: "${NINEVEH_MAX_UPLOAD_BYTES:-4294967296}"
+      NINEVEH_MAX_REQUEST_BODY_BYTES: "${NINEVEH_MAX_REQUEST_BODY_BYTES:-1048576}"
+      NINEVEH_MAX_RANGE_UNCOMPRESSED_BYTES: "${NINEVEH_MAX_RANGE_UNCOMPRESSED_BYTES:-536870912}"
+      NINEVEH_STATE_FREE_RESERVE_BYTES: "${NINEVEH_STATE_FREE_RESERVE_BYTES:-536870912}"
+      NINEVEH_STAGING_MAX_PER_TOKEN: "${NINEVEH_STAGING_MAX_PER_TOKEN:-10}"
+      NINEVEH_STAGING_MAX_BYTES_PER_TOKEN: "${NINEVEH_STAGING_MAX_BYTES_PER_TOKEN:-21474836480}"
+      # Archive safety limits.
+      NINEVEH_MAX_ARCHIVE_ENTRIES: "${NINEVEH_MAX_ARCHIVE_ENTRIES:-10000}"
+      NINEVEH_MAX_ARCHIVE_UNCOMPRESSED_BYTES: "${NINEVEH_MAX_ARCHIVE_UNCOMPRESSED_BYTES:-8589934592}"
+      NINEVEH_MAX_PAGE_UNCOMPRESSED_BYTES: "${NINEVEH_MAX_PAGE_UNCOMPRESSED_BYTES:-268435456}"
+      NINEVEH_MAX_COMPRESSION_RATIO: "${NINEVEH_MAX_COMPRESSION_RATIO:-200}"
+      # Image decoding in a constrained worker process.
+      NINEVEH_ISOLATE_MEDIA_PROCESSING: "${NINEVEH_ISOLATE_MEDIA_PROCESSING:-false}"
+      NINEVEH_IMAGE_WORKER_MEMORY_BYTES: "${NINEVEH_IMAGE_WORKER_MEMORY_BYTES:-805306368}"
+      NINEVEH_IMAGE_WORKER_TIMEOUT_SECONDS: "${NINEVEH_IMAGE_WORKER_TIMEOUT_SECONDS:-30}"
     volumes:
-      # Writable so the librarian can place a validated volume. Placement is
-      # the only write the agent can cause, and it never replaces a file: the
-      # final step is a hard link, which fails outright if the name is taken.
-      - "${NINEVEH_DATA_PATH:?Set NINEVEH_DATA_PATH in .env}:/data"
+      # The librarian places validated volumes here, never replacing a file:
+      # the final step is a hard link, which fails outright if the name is
+      # taken. With no ingest mount, set NINEVEH_DATA_MODE=ro in docker/.env
+      # so nothing in the container can write the library at all.
+      - "${NINEVEH_DATA_PATH:?Set NINEVEH_DATA_PATH in .env}:/data:${NINEVEH_DATA_MODE:-rw}"
       # More media roots mount at any stable container path and are then
       # registered by that path in Admin > Libraries. Prefer :ro unless
       # librarian ingest is meant to be enabled for that mount.
@@ -47,9 +79,15 @@ services:
     # A ceiling, not a target: Nineveh idles around 80-120 MB. The limit exists so
     # a runaway image decode fails inside the container instead of pressuring DSM.
     mem_limit: "${NINEVEH_MEMORY_LIMIT:-1g}"
+    cpus: "${NINEVEH_CPU_LIMIT:-2.0}"
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 4096
     read_only: true
     tmpfs:
-      - /tmp:size=128m,mode=1777
+      - /tmp:size=128m,mode=1777,noexec,nosuid,nodev
     cap_drop:
       - ALL
     security_opt:

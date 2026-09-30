@@ -3,6 +3,7 @@
 .venv
 .dev
 .pytest_cache
+.ruff_cache
 .coverage
 .coverage.*
 __pycache__

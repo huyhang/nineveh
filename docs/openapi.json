@@ -3842,6 +3842,76 @@
         ]
       }
     },
+    "/api/v1/admin/security/events": {
+      "get": {
+        "description": "Abuse-facing signals: failed sign-ins, throttled accounts, storage refusals.",
+        "operationId": "security_events_api_v1_admin_security_events_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Security Events Api V1 Admin Security Events Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Security Events",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/v1/admin/series/{series_id}/metadata": {
       "delete": {
         "operationId": "admin_series_metadata_unlink_api_v1_admin_series__series_id__metadata_delete",

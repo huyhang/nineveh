@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import zipfile
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from conftest import image_bytes, storage, write_cbz
 from PIL import Image
 
+from nineveh import archives
 from nineveh.archives import (
     ArchiveChanged,
     ArchivePool,
@@ -17,6 +21,7 @@ from nineveh.archives import (
     PageCacheService,
     PageRenditionService,
     PillowThumbnailRenderer,
+    SubprocessThumbnailRenderer,
     ThumbnailService,
 )
 from nineveh.catalog import ArchiveInspector
@@ -243,8 +248,6 @@ def test_thumbnail_is_rendered_once_and_then_reused(library):
 
 
 def test_renderer_refuses_an_oversized_image(tmp_path: Path):
-    from io import BytesIO
-
     renderer = PillowThumbnailRenderer(max_image_pixels=10)
     with pytest.raises(ArchiveUnavailable):
         renderer.render(BytesIO(image_bytes((1, 2, 3))), tmp_path / "out.webp", 160)
@@ -346,3 +349,107 @@ def test_an_unreadable_page_reports_the_archive_as_unavailable(tmp_path, library
 
     with pytest.raises(ArchiveUnavailable):
         _renditions(settings).rendition(publication, pages[0], width=640)
+
+
+# --- Cache lookups that never do work -----------------------------------------
+
+
+def test_a_cover_is_cached_only_once_it_has_been_rendered(library):
+    settings, archive = library
+    publication, pages = _scan(settings, archive)
+    service = ThumbnailService(
+        settings, _archives(settings), PillowThumbnailRenderer(10_000_000)
+    )
+    assert service.cached(publication, pages[0], 160) is None
+    rendered = service.cover(publication, pages[0], 160)
+    assert service.cached(publication, pages[0], 160) == rendered
+    assert service.cached(publication, pages[0], 999) is None
+
+
+def test_a_cached_rendition_is_not_served_once_the_original_is_better(
+    tmp_path, library
+):
+    """A copy made before a page was measured must not outlive the measurement."""
+    settings, _ = library
+    archive = _wide_library(tmp_path, settings)
+    publication, pages = _scan(settings, archive)
+    service = _renditions(settings)
+    assert service.cached(publication, pages[0], 640) is None
+    rendered = service.rendition(publication, pages[0], 640)
+    assert service.cached(publication, pages[0], 640) == rendered
+    measured = replace(pages[0], width=600, height=900)
+    assert service.cached(publication, measured, 640) is None
+
+
+def test_a_page_is_cached_only_once_complete(library):
+    settings, archive = library
+    publication, pages = _scan(settings, archive)
+    service = PageCacheService(settings, _archives(settings))
+    assert service.cached(publication, pages[0]) is None
+    stored = service.page(publication, pages[0])
+    assert service.cached(publication, pages[0]) == stored
+    stored.write_bytes(b"truncated")
+    assert service.cached(publication, pages[0]) is None
+
+
+# --- Decoding in a worker process ----------------------------------------------
+
+
+def _isolated(max_pixels: int = 10_000_000) -> SubprocessThumbnailRenderer:
+    return SubprocessThumbnailRenderer(max_pixels, 1024 * 1024 * 1024, 20)
+
+
+def test_the_worker_renders_a_webp_no_wider_than_asked(tmp_path: Path):
+    destination = tmp_path / "out.webp"
+    _isolated().render(BytesIO(image_bytes((1, 2, 3), (400, 600))), destination, 160)
+    with Image.open(destination) as rendered:
+        assert (rendered.format, rendered.width) == ("WEBP", 160)
+    assert list(tmp_path.iterdir()) == [destination]  # no spooled input left
+
+
+def test_the_worker_refuses_an_oversized_image(tmp_path: Path):
+    with pytest.raises(ArchiveUnavailable, match="exceed"):
+        _isolated(max_pixels=10).render(
+            BytesIO(image_bytes((1, 2, 3))), tmp_path / "out.webp", 160
+        )
+
+
+def test_the_worker_reports_a_broken_image_as_an_os_error(tmp_path: Path):
+    with pytest.raises(OSError, match="image worker exited 1"):
+        _isolated().render(BytesIO(b"not an image"), tmp_path / "out.webp", 160)
+
+
+def test_running_without_limits_is_logged_once(tmp_path: Path, monkeypatch, caplog):
+    def pretend(command, **_kwargs):
+        Path(command[4]).write_bytes(b"webp")
+        return subprocess.CompletedProcess(
+            command, 0, b"limits: RLIMIT_AS: refused\n", b""
+        )
+
+    monkeypatch.setattr(archives.subprocess, "run", pretend)
+    renderer = _isolated()
+    for _ in range(3):
+        renderer.render(BytesIO(b"x"), tmp_path / "out.webp", 160)
+    warnings = [r for r in caplog.records if "without some limits" in r.message]
+    assert len(warnings) == 1
+    assert "RLIMIT_AS" in warnings[0].getMessage()
+
+
+def test_the_worker_lowers_its_own_limits():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import resource; from nineveh.image_worker import apply_limits;"
+                "failed = apply_limits(1 << 40, 7);"
+                "print(resource.getrlimit(resource.RLIMIT_CPU)[0], failed)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    cpu, _, failed = completed.stdout.partition(" ")
+    assert cpu == "7"
+    assert "RLIMIT_CPU" not in failed

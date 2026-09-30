@@ -24,6 +24,17 @@ class User:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class SecurityEvent:
+    """One abuse-facing signal: a failed sign-in, a throttled account, a refusal."""
+
+    id: str
+    kind: str
+    summary: str
+    created_at: datetime
+    detail: dict[str, Any] | None = None
+
+
 DEFAULT_MOUNT_ID = "default"
 
 

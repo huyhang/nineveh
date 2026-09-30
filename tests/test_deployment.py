@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
+from nineveh.config import Settings
 from nineveh.deployment import (
     UNLIMITED_FLOOR,
     default_gateway,
@@ -183,3 +185,57 @@ def test_a_discarded_forwarded_proto_is_detected_exactly(
     header: str | None, scheme: str, discarded: bool
 ):
     assert discarded_forwarded_proto(header, scheme) is discarded
+
+
+# --- Compose passes every deployment-owned setting through ---------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+_READ = re.compile(r'(\w+)=(?:_\w+_env|os\.getenv)\(\s*"(NINEVEH_\w+)"', re.DOTALL)
+# Fixed by the container rather than configured: its own paths and listener.
+_CONTAINER_OWNED = {
+    "NINEVEH_DATA_DIR",
+    "NINEVEH_STATE_DIR",
+    "NINEVEH_HOST",
+    "NINEVEH_PORT",
+}
+
+
+def _read_by_code() -> dict[str, str]:
+    """Environment variable -> the setting it fills, from config and entrypoint."""
+    source = (ROOT / "src/nineveh/config.py").read_text()
+    names = {variable: field for field, variable in _READ.findall(source)}
+    entrypoint = (ROOT / "src/nineveh/__main__.py").read_text()
+    for variable in re.findall(r'os\.getenv\(\s*"(NINEVEH_\w+)"', entrypoint):
+        names.setdefault(variable, variable)
+    return names
+
+
+def _passed_by_compose() -> set[str]:
+    compose = (ROOT / "docker/compose.yaml").read_text()
+    return set(re.findall(r"^\s+(NINEVEH_\w+):", compose, re.MULTILINE))
+
+
+def test_compose_passes_every_deployment_owned_setting():
+    """`--env-file` fills in compose.yaml; it does not reach the container.
+
+    A variable read by the code but missing from the environment block can be
+    set in docker/.env all day and Nineveh will never see it. Settings owned by
+    the admin UI are deliberately left out, as the .env template explains.
+    """
+    ui_owned = set(Settings.EDITABLE_INTEGERS) | Settings.EDITABLE_TEXT
+    wanted = {
+        variable
+        for variable, field in _read_by_code().items()
+        if field not in ui_owned and variable not in _CONTAINER_OWNED
+    }
+    assert "NINEVEH_PRIVATE_BASE_URLS" in wanted
+    assert sorted(wanted - _passed_by_compose()) == []
+
+
+def test_every_variable_in_the_env_template_reaches_something():
+    template = (ROOT / "docker/.env.example").read_text()
+    documented = set(re.findall(r"^#?(NINEVEH_\w+)=", template, re.MULTILINE))
+    interpolated = set(
+        re.findall(r"\$\{(NINEVEH_\w+)", (ROOT / "docker/compose.yaml").read_text())
+    )
+    assert sorted(documented - interpolated) == []

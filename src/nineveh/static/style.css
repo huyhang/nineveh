@@ -183,6 +183,7 @@ th, td { padding: .75rem; border-bottom: 1px solid var(--line); text-align: left
 .notice { width: min(1180px, calc(100% - 2rem)); padding: .85rem 1rem; margin: 0 auto 1rem; border-radius: 10px; color: var(--success); background: color-mix(in srgb, var(--success) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--success) 30%, var(--line)); }
 .notice.error, .error-text { color: var(--danger); }
 .notice.error { background: color-mix(in srgb, var(--danger) 10%, var(--surface)); border-color: color-mix(in srgb, var(--danger) 30%, var(--line)); }
+.notice.warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, var(--surface)); border-color: color-mix(in srgb, var(--warning) 30%, var(--line)); }
 .danger-zone { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between; margin-top: 2rem; padding: 1rem 1.15rem; border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--line)); border-radius: 12px; background: color-mix(in srgb, var(--danger) 5%, var(--surface)); }
 .danger-zone h4 { margin: 0 0 .2rem; }
 .danger-zone p { margin: 0; max-width: 52ch; font-size: .85rem; }

@@ -4,9 +4,7 @@ import hashlib
 import io
 import json
 import logging
-import os
 import re
-import tempfile
 import threading
 import time
 import unicodedata
@@ -15,14 +13,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 
-from .archives import DiskCacheBudget
+from .archives import DiskCacheBudget, PillowThumbnailRenderer
 from .domain import (
     CatalogSeries,
     MetadataCandidate,
@@ -30,6 +28,7 @@ from .domain import (
     SeriesMetadata,
     SeriesMetadataState,
 )
+from .imaging import ImageTooLarge
 from .ports import MetadataRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -376,6 +375,12 @@ class MangaBakaProvider:
         return payload
 
 
+class BoxRenderer(Protocol):
+    def render_box(
+        self, source: BinaryIO, destination: Path, box: tuple[int, int], quality: int
+    ) -> None: ...
+
+
 class MetadataCoverStore:
     """Series artwork under `/state`.
 
@@ -391,9 +396,12 @@ class MetadataCoverStore:
         directory: Path,
         max_image_pixels: int,
         candidate_cache_bytes: int = CANDIDATE_CACHE_BYTES,
+        renderer: BoxRenderer | None = None,
     ) -> None:
         self._directory = directory
-        self._max_image_pixels = max_image_pixels
+        # Every cover here comes from an upload or a remote provider, so the
+        # composition root hands in an isolated worker; in-process otherwise.
+        self._renderer = renderer or PillowThumbnailRenderer(max_image_pixels)
         self._candidates = DiskCacheBudget(
             directory / "candidates", "*.webp", candidate_cache_bytes
         )
@@ -432,29 +440,12 @@ class MetadataCoverStore:
     def _save(self, destination: Path, payload: bytes) -> Path:
         if len(payload) > MAX_COVER_BYTES:
             raise MetadataError("Cover images may not exceed 16 MiB")
-        destination.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with Image.open(io.BytesIO(payload)) as opened:
-                if opened.width * opened.height > self._max_image_pixels:
-                    raise MetadataError("Cover dimensions exceed the configured limit")
-                image = ImageOps.exif_transpose(opened)
-                image.thumbnail((960, 1440), Image.Resampling.LANCZOS)
-                if image.mode not in ("RGB", "RGBA"):
-                    image = image.convert("RGB")
-                with tempfile.NamedTemporaryFile(
-                    prefix="series-cover-",
-                    suffix=".webp",
-                    dir=destination.parent,
-                    delete=False,
-                ) as temporary:
-                    temporary_path = Path(temporary.name)
-                try:
-                    image.save(temporary_path, format="WEBP", quality=86, method=4)
-                    os.replace(temporary_path, destination)
-                finally:
-                    temporary_path.unlink(missing_ok=True)
-        except MetadataError:
-            raise
+            self._renderer.render_box(io.BytesIO(payload), destination, (960, 1440), 86)
+        except ImageTooLarge as error:
+            raise MetadataError(
+                "Cover dimensions exceed the configured limit"
+            ) from error
         except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as error:
             raise MetadataError(
                 "The selected file is not a safe supported image"

@@ -1,5 +1,21 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.12-slim AS runtime
+FROM python:3.12.11-slim-bookworm AS build
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+COPY requirements-build.lock ./
+RUN python -m pip install --no-cache-dir --require-hashes -r requirements-build.lock
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN python -m pip wheel --no-cache-dir --no-build-isolation --no-deps \
+    --wheel-dir /wheels .
+
+FROM python:3.12.11-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -12,9 +28,12 @@ RUN groupadd --gid 10001 nineveh \
     && mkdir -p /data /state \
     && chown nineveh:nineveh /state
 
-COPY pyproject.toml README.md ./
-COPY src ./src
-RUN python -m pip install --no-cache-dir .
+COPY requirements.lock ./
+RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock
+
+COPY --from=build /wheels/nineveh-*.whl /tmp/
+RUN python -m pip install --no-cache-dir --no-deps /tmp/nineveh-*.whl \
+    && rm /tmp/nineveh-*.whl
 
 USER 10001:10001
 EXPOSE 8080

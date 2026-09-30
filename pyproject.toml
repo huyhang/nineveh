@@ -24,8 +24,12 @@ test = [
   # the QuickJS release: the controller tests need classes and async functions.
   "dukpy>=0.6,<1",
   "httpx>=0.28,<1",
-  "pytest>=8.3,<9",
+  "pytest>=9.0.3,<10",
   "pytest-cov>=6,<8",
+]
+dev = [
+  "pip-audit>=2.9,<3",
+  "ruff>=0.9,<1",
 ]
 
 [project.scripts]
@@ -46,4 +50,3 @@ omit = ["*/__main__.py"]
 
 [tool.coverage.report]
 exclude_also = ["if TYPE_CHECKING:", "\\.\\.\\."]
-

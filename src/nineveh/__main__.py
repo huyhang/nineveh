@@ -17,6 +17,12 @@ def main() -> None:
         workers=1,
         proxy_headers=True,
         forwarded_allow_ips=os.getenv("NINEVEH_FORWARDED_ALLOW_IPS", "127.0.0.1"),
+        # A memory backstop, not a fairness control: requests queued for a
+        # fair share hold a connection, so this sits well above any backlog
+        # the admission gates allow. Per-client limits belong to the proxy.
+        limit_concurrency=int(os.getenv("NINEVEH_CONNECTION_LIMIT", "1024")),
+        timeout_graceful_shutdown=15,
+        server_header=False,
         log_config=None,
     )
 

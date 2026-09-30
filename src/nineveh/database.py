@@ -40,6 +40,7 @@ from .domain import (
     SearchFilters,
     SearchSuggestion,
     SearchVolume,
+    SecurityEvent,
     SeriesMetadata,
     SeriesMetadataState,
     SeriesMetadataSummary,
@@ -344,6 +345,38 @@ CREATE INDEX IF NOT EXISTS librarian_events_recent
     ON librarian_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS librarian_events_token
     ON librarian_events(token_id, created_at DESC);
+-- Agent reads are useful context but must not grow the database without
+-- bound. Permission history (severity 'security') is never trimmed.
+CREATE TRIGGER IF NOT EXISTS librarian_events_bound
+AFTER INSERT ON librarian_events
+WHEN (SELECT COUNT(*) FROM librarian_events WHERE severity != 'security') > 10000
+BEGIN
+    DELETE FROM librarian_events WHERE id IN (
+        SELECT id FROM librarian_events WHERE severity != 'security'
+        ORDER BY created_at ASC LIMIT 1000
+    );
+END;
+
+-- Abuse-facing signals, kept apart from the agent feed: a password spray is
+-- exactly the noise that would bury the permission history worth keeping.
+CREATE TABLE IF NOT EXISTS security_events (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS security_events_recent
+    ON security_events(created_at DESC);
+-- A spray may bury old signals, but it can never grow the table.
+CREATE TRIGGER IF NOT EXISTS security_events_bound
+AFTER INSERT ON security_events
+WHEN (SELECT COUNT(*) FROM security_events) > 5000
+BEGIN
+    DELETE FROM security_events WHERE id IN (
+        SELECT id FROM security_events ORDER BY created_at ASC LIMIT 500
+    );
+END;
 """
 
 # Applied after `SCHEMA`, because a v1 database only grows the columns it indexes
@@ -2206,6 +2239,11 @@ class SQLiteRepository:
         self, relative_paths: set[str], library_id: str | None = None
     ) -> int:
         with self._connect() as connection:
+            # Take the write lock before reading the catalog snapshot below. A
+            # deferred transaction that reads first cannot upgrade to a writer
+            # once a concurrent session or audit write commits in between
+            # (SQLITE_BUSY_SNAPSHOT), and busy_timeout does not retry that.
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute("CREATE TEMP TABLE seen_paths(path TEXT PRIMARY KEY)")
             connection.executemany(
                 "INSERT INTO seen_paths(path) VALUES (?)",
@@ -2830,6 +2868,44 @@ class SQLiteRepository:
                 "UPDATE librarian_tokens SET last_used_at = ? WHERE id = ?",
                 (_now_iso(), token_id),
             )
+
+    def record_security_event(self, event: SecurityEvent) -> SecurityEvent:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO security_events(id, kind, summary, detail, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.kind,
+                    event.summary,
+                    json.dumps(event.detail) if event.detail is not None else None,
+                    event.created_at.isoformat(),
+                ),
+            )
+        return event
+
+    def security_events(
+        self, *, kind: str | None = None, limit: int = 100
+    ) -> list[SecurityEvent]:
+        where, values = ("WHERE kind = ?", [kind]) if kind else ("", [])
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM security_events {where}"
+                " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (*values, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [
+            SecurityEvent(
+                id=row["id"],
+                kind=row["kind"],
+                summary=row["summary"],
+                created_at=_parse_time(row["created_at"]),
+                detail=json.loads(row["detail"]) if row["detail"] else None,
+            )
+            for row in rows
+        ]
 
     def record_librarian_event(self, event: LibrarianEvent) -> LibrarianEvent:
         with self._connect() as connection:

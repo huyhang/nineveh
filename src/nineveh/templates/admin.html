@@ -21,6 +21,12 @@
         Set <code>NINEVEH_FORWARDED_ALLOW_IPS={{ untrusted_proxy }}</code> in <code>docker/.env</code> and recreate the container.
       </div>
     {% endif %}
+    {% if not split_access %}
+      <div class="notice warning" role="alert">
+        <strong>Administration is reachable from any address.</strong>
+        Set <code>NINEVEH_PRIVATE_BASE_URLS</code> to the tailnet or LAN origins that administer this install, and recreate the container. Administrator accounts will then sign in only there.
+      </div>
+    {% endif %}
     <div class="status-line {% if scan_status.error %}status-error{% endif %}" data-scan-status{% if scan_status.running %} data-scan-running{% endif %}>
       <span class="status-dot"></span>
       {# One element for the whole sentence: the row is a flex container, so
@@ -37,4 +43,21 @@
     <a href="/admin/libraries"><span>Libraries</span><strong>Review capacity and run scans →</strong></a>
     <a href="/admin/settings"><span>Settings</span><strong>Configure and restart Nineveh →</strong></a>
   </div>
+
+  <section class="admin-section">
+    <div class="section-heading">
+      <div><p class="eyebrow">Abuse-facing signals</p><h2>Security</h2></div>
+    </div>
+    <ol class="activity-feed">
+      {% for event in security_events %}
+        <li class="activity-row">
+          <time datetime="{{ event.created_at.isoformat() }}" title="{{ event.created_at|timestamp }}">{{ event.created_at|since }}</time>
+          <p class="activity-summary">{{ event.summary }}</p>
+          <span class="activity-outcome">{{ event.kind }}</span>
+        </li>
+      {% else %}
+        <li class="activity-row"><p class="activity-summary">No failed sign-ins, throttled accounts, or storage refusals recorded.</p></li>
+      {% endfor %}
+    </ol>
+  </section>
 {% endblock %}
