@@ -352,6 +352,7 @@ class UserRepository(Protocol):
         *,
         enabled: bool | None = None,
         password_hash: str | None = None,
+        is_admin: bool | None = None,
     ) -> User | None: ...
 
     def enabled_admin_count(self) -> int: ...

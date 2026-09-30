@@ -113,6 +113,61 @@ def test_the_last_administrator_cannot_be_disabled(client: TestClient):
     assert last.status_code == 422
 
 
+def test_an_administrator_can_make_another_administrator_a_reader(
+    client: TestClient,
+):
+    client.post(
+        "/api/v1/admin/users",
+        headers=authorization(),
+        json={"username": "admin2", "password": NEW_PASSWORD, "is_admin": True},
+    )
+    second = authorization("admin2", NEW_PASSWORD)
+    users = client.get("/api/v1/admin/users", headers=second).json()
+    second_id = next(user["id"] for user in users if user["username"] == "admin2")
+
+    response = client.patch(
+        f"/api/v1/admin/users/{second_id}",
+        headers=authorization(),
+        json={"is_admin": False},
+    )
+    assert response.status_code == 200
+    assert response.json()["isAdmin"] is False
+    # admin2 authenticated moments ago; the cached credential must not keep
+    # the old role.
+    assert client.get("/api/v1/admin/users", headers=second).status_code == 403
+    assert client.get("/api/v1/auth/me", headers=second).json()["isAdmin"] is False
+
+    restored = client.patch(
+        f"/api/v1/admin/users/{second_id}",
+        headers=authorization(),
+        json={"is_admin": True},
+    )
+    assert restored.json()["isAdmin"] is True
+    assert client.get("/api/v1/admin/users", headers=second).status_code == 200
+
+
+def test_an_administrator_cannot_remove_their_own_administrator_role(
+    client: TestClient,
+):
+    me = client.get("/api/v1/auth/me", headers=authorization()).json()
+    response = client.patch(
+        f"/api/v1/admin/users/{me['id']}",
+        headers=authorization(),
+        json={"is_admin": False},
+    )
+    assert response.status_code == 422
+    assert "own administrator role" in response.json()["detail"]
+    assert client.get("/api/v1/auth/me", headers=authorization()).json()["isAdmin"]
+
+
+def test_a_reader_cannot_change_roles(client: TestClient, reader: dict):
+    me = client.get("/api/v1/auth/me", headers=reader).json()
+    response = client.patch(
+        f"/api/v1/admin/users/{me['id']}", headers=reader, json={"is_admin": True}
+    )
+    assert response.status_code == 403
+
+
 def test_patching_an_unknown_user_is_404(client: TestClient):
     response = client.patch(
         "/api/v1/admin/users/missing", headers=authorization(), json={"enabled": True}

@@ -1022,6 +1022,33 @@ async def admin_enable_user(
     )
 
 
+@router.post("/admin/users/{user_id}/role")
+async def admin_set_user_role(
+    request: Request,
+    user_id: str,
+    is_admin: bool = Form(...),
+    csrf_token: str = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    if user_id == session.user.id and not is_admin:
+        return await _admin_redirect(
+            request, "users", error="You cannot remove your own administrator role."
+        )
+    try:
+        user = await run_in_threadpool(
+            _container(request).auth.set_admin, user_id, is_admin
+        )
+    except LastAdministratorError as error:
+        return await _admin_redirect(request, "users", error=str(error))
+    if not user:
+        return await _admin_redirect(request, "users", error="User not found.")
+    role = "an administrator" if is_admin else "a reader"
+    return await _admin_redirect(
+        request, "users", message=f"{user.username} is now {role}."
+    )
+
+
 @router.post("/admin/users/{user_id}/password")
 async def admin_reset_password(
     request: Request,

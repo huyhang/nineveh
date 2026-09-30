@@ -108,6 +108,7 @@ All catalog and content endpoints require authentication.
 | `/api/v1/search/suggestions` | Type-ahead series suggestions for the browser search box |
 | `/api/v1/admin/libraries` | Managed libraries, indexed capacity, data mounts, and their unmanaged directories |
 | `/api/v1/admin/mounts` | Register a data mount; `PUT`, `DELETE`, `/disconnect`, `/reconnect`, and `/scan` manage one |
+| `/api/v1/admin/users` | List and create accounts; `PATCH /{id}` resets a password, disables or re-enables, or changes the role with `is_admin` |
 | `/api/v1/admin/users/{id}/access` | Library, content-type, and series read grants |
 | `/api/v1/admin/settings`, `/api/v1/admin/restart` | Persisted application settings and restart control |
 | `/api/v1/admin/librarian-tokens` | Issue, re-scope, list, and revoke librarian credentials |

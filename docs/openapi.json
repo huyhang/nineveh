@@ -2312,6 +2312,17 @@
             ],
             "title": "Enabled"
           },
+          "is_admin": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Admin"
+          },
           "password": {
             "anyOf": [
               {

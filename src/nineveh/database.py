@@ -1893,6 +1893,7 @@ class SQLiteRepository:
         *,
         enabled: bool | None = None,
         password_hash: str | None = None,
+        is_admin: bool | None = None,
     ) -> User | None:
         updates: list[str] = []
         values: list[object] = []
@@ -1902,6 +1903,9 @@ class SQLiteRepository:
         if password_hash is not None:
             updates.append("password_hash = ?")
             values.append(password_hash)
+        if is_admin is not None:
+            updates.append("is_admin = ?")
+            values.append(int(is_admin))
         if not updates:
             return self.user_by_id(user_id)
         values.append(user_id)

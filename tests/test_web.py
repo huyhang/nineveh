@@ -842,6 +842,79 @@ def test_an_administrator_cannot_disable_their_own_account(client: TestClient):
     assert "cannot disable your own account" in response.text
 
 
+def test_an_administrator_can_make_another_administrator_a_reader_and_back(
+    client: TestClient,
+):
+    _login(client)
+    client.post(
+        "/admin/users",
+        data={
+            "username": "admin2",
+            "password": NEW_PASSWORD,
+            "csrf_token": _csrf(client),
+            "is_admin": "true",
+        },
+    )
+    user_id = _user_id(client, "admin2")
+    token = _csrf(client)
+    page = client.get("/admin/users")
+    assert f'action="/admin/users/{user_id}/role"' in page.text
+    assert "Make reader" in page.text
+
+    demoted = client.post(
+        f"/admin/users/{user_id}/role",
+        data={"is_admin": "false", "csrf_token": token},
+        follow_redirects=True,
+    )
+    assert "admin2 is now a reader." in demoted.text
+    assert "Make administrator" in demoted.text
+    assert not client.get(
+        "/api/v1/auth/me", headers=authorization("admin2", NEW_PASSWORD)
+    ).json()["isAdmin"]
+
+    promoted = client.post(
+        f"/admin/users/{user_id}/role",
+        data={"is_admin": "true", "csrf_token": token},
+        follow_redirects=True,
+    )
+    assert "admin2 is now an administrator." in promoted.text
+
+
+def test_an_administrator_cannot_remove_their_own_administrator_role(
+    client: TestClient,
+):
+    _login(client)
+    me = client.get("/api/v1/auth/me").json()
+    response = client.post(
+        f"/admin/users/{me['id']}/role",
+        data={"is_admin": "false", "csrf_token": _csrf(client)},
+        follow_redirects=True,
+    )
+    assert "cannot remove your own administrator role" in response.text
+    assert client.get("/api/v1/auth/me").json()["isAdmin"] is True
+
+
+def test_changing_a_role_requires_a_valid_csrf_token(client: TestClient, reader: dict):
+    _login(client)
+    user_id = _user_id(client, "reader")
+    response = client.post(
+        f"/admin/users/{user_id}/role",
+        data={"is_admin": "true", "csrf_token": "forged"},
+    )
+    assert response.status_code == 403
+    assert not client.get("/api/v1/auth/me", headers=reader).json()["isAdmin"]
+
+
+def test_changing_the_role_of_an_unknown_user_reports_not_found(client: TestClient):
+    _login(client)
+    response = client.post(
+        "/admin/users/missing/role",
+        data={"is_admin": "false", "csrf_token": _csrf(client)},
+        follow_redirects=True,
+    )
+    assert "User not found." in response.text
+
+
 def test_password_resets_report_success_and_failure(client: TestClient, reader: dict):
     _login(client)
     user_id = _user_id(client, "reader")

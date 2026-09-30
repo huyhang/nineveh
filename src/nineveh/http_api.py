@@ -123,6 +123,7 @@ class UserCreate(BaseModel):
 class UserUpdate(BaseModel):
     enabled: bool | None = None
     password: str | None = Field(default=None, min_length=12, max_length=1024)
+    is_admin: bool | None = None
 
 
 class GrantInput(BaseModel):
@@ -1783,6 +1784,10 @@ async def update_user(
         raise HTTPException(
             status_code=422, detail="You cannot disable your own account"
         )
+    if body.is_admin is False and user_id == identity.user.id:
+        raise HTTPException(
+            status_code=422, detail="You cannot remove your own administrator role"
+        )
     service: AuthService = _container(request).auth
     existing = await run_in_threadpool(
         _container(request).repository.user_by_id, user_id
@@ -1797,6 +1802,8 @@ async def update_user(
             )
         if body.enabled is not None:
             user = await run_in_threadpool(service.set_enabled, user_id, body.enabled)
+        if body.is_admin is not None:
+            user = await run_in_threadpool(service.set_admin, user_id, body.is_admin)
     except (InvalidUserInput, LastAdministratorError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     if not user:

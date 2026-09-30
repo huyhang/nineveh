@@ -191,6 +191,58 @@ def test_a_second_administrator_may_be_disabled(service: AuthService):
     assert service.set_enabled(spare.id, False) is not None
 
 
+def test_the_final_administrator_cannot_be_made_a_reader(service: AuthService):
+    admin = service.create_user("admin", PASSWORD, is_admin=True)
+    with pytest.raises(LastAdministratorError):
+        service.set_admin(admin.id, False)
+
+
+def test_a_second_administrator_may_be_made_a_reader(service: AuthService):
+    service.create_user("admin", PASSWORD, is_admin=True)
+    spare = service.create_user("admin2", PASSWORD, is_admin=True)
+    demoted = service.set_admin(spare.id, False)
+    assert demoted is not None and not demoted.is_admin
+    assert not ReadAllPolicy().can_administer(demoted)
+
+
+def test_a_disabled_administrator_does_not_count_as_the_last_one(
+    service: AuthService,
+):
+    admin = service.create_user("admin", PASSWORD, is_admin=True)
+    spare = service.create_user("admin2", PASSWORD, is_admin=True)
+    service.set_enabled(spare.id, False)
+    assert service.set_admin(spare.id, False) is not None
+    with pytest.raises(LastAdministratorError):
+        service.set_admin(admin.id, False)
+
+
+def test_a_reader_may_be_made_an_administrator(service: AuthService):
+    reader = service.create_user("reader", PASSWORD)
+    promoted = service.set_admin(reader.id, True)
+    assert promoted is not None and promoted.is_admin
+
+
+def test_changing_a_role_invalidates_the_basic_auth_cache(service: AuthService):
+    service.create_user("admin", PASSWORD, is_admin=True)
+    spare = service.create_user("admin2", PASSWORD, is_admin=True)
+    assert service.authenticate("admin2", PASSWORD).is_admin
+    service.set_admin(spare.id, False)
+    assert not service.authenticate("admin2", PASSWORD).is_admin
+
+
+def test_changing_a_role_keeps_existing_sessions(service: AuthService):
+    service.create_user("admin", PASSWORD, is_admin=True)
+    spare = service.create_user("admin2", PASSWORD, is_admin=True)
+    session = service.new_session(spare)
+    service.set_admin(spare.id, False)
+    restored = service.session(session.token)
+    assert restored is not None and not restored.user.is_admin
+
+
+def test_setting_a_role_on_an_unknown_user_returns_none(service: AuthService):
+    assert service.set_admin("missing", False) is None
+
+
 def test_bootstrap_creates_the_first_administrator_only_once(service: AuthService):
     created = service.bootstrap_admin("admin", PASSWORD)
     assert created is not None and created.is_admin

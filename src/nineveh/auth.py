@@ -132,6 +132,23 @@ class AuthService:
         self._clear_basic_cache()
         return self._repository.update_user(user_id, enabled=enabled)
 
+    def set_admin(self, user_id: str, is_admin: bool) -> User | None:
+        user = self._repository.user_by_id(user_id)
+        if not user:
+            return None
+        if (
+            not is_admin
+            and user.is_admin
+            and user.enabled
+            and self._repository.enabled_admin_count() <= 1
+        ):
+            raise LastAdministratorError(
+                "The final enabled administrator cannot be made a reader"
+            )
+        # A cached Basic credential carries the old role for minutes otherwise.
+        self._clear_basic_cache()
+        return self._repository.update_user(user_id, is_admin=is_admin)
+
     def new_session(self, user: User) -> Session:
         token = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)

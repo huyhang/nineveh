@@ -21,6 +21,11 @@
             <summary>Manage account</summary>
             <div class="user-editor">
               <form method="post" action="/admin/users/{{ user.id }}/password" class="inline-form"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><label>New password <input name="password" type="password" autocomplete="new-password" minlength="12" required></label><button class="secondary" type="submit">Reset password</button></form>
+              {% if user.is_admin %}
+                <form method="post" action="/admin/users/{{ user.id }}/role" class="inline-form" data-confirm="Make {{ user.username }} a reader? They lose administration and can read only the libraries you grant them."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="is_admin" value="false"><button class="secondary" type="submit" {% if user.id == session.user.id %}disabled title="You cannot remove your own administrator role"{% endif %}>Make reader</button></form>
+              {% else %}
+                <form method="post" action="/admin/users/{{ user.id }}/role" class="inline-form" data-confirm="Make {{ user.username }} an administrator? They can manage every account, library and setting, and read everything."><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="is_admin" value="true"><button class="secondary" type="submit">Make administrator</button></form>
+              {% endif %}
               {% if user.is_admin %}<p class="access-note">Administrators have access to every managed library.</p>
               {% else %}
                 <form method="post" action="/admin/users/{{ user.id }}/access" class="access-form">
