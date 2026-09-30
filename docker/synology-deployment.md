@@ -288,6 +288,136 @@ docker compose --env-file docker/.env -f docker/compose.yaml up --build -d
 
 The media directory is never modified. The persistent state directory preserves accounts, catalog identifiers, and cached thumbnails.
 
+Coming from a release before the security hardening? Read the next section before you rebuild.
+
+### What to watch for to migrate existing Nineveh to security-hardened version
+
+An existing `docker/.env` keeps working: split access stays off until you name
+a private origin, and the library mount stays writable. Four things can still
+catch you on the first `up --build -d`, and a few behaviours change on purpose.
+
+#### Before you rebuild
+
+1. **The port is published on loopback only.** Compose now binds
+   `127.0.0.1:${NINEVEH_PORT}` instead of every interface. A DSM reverse-proxy
+   rule whose destination is `http://127.0.0.1:8080` (or `localhost`) keeps
+   working. One pointed at the NAS's LAN address stops, and so does anything
+   that talks to `http://NAS_ADDRESS:8080` directly: an OPDS app, a script, or
+   the librarian agent using the tailnet address and port. Point those at a
+   proxy address, or restore the old binding with
+   `NINEVEH_PUBLISH_ADDRESS=0.0.0.0` — plain HTTP, and pointless once split
+   access is on, since Nineveh then refuses origins it was not configured with.
+
+2. **The proxy must be trusted.** `NINEVEH_FORWARDED_ALLOW_IPS` is not new,
+   but more now depends on it: sign-in delays and per-account limits are kept
+   per client address. If the proxy's gateway is not trusted, every request
+   appears to come from that gateway, so one person's mistyped password slows
+   everyone's sign-in — and under split access nobody counts as private, so no
+   administrator can sign in anywhere. Set it as described in
+   [Finding the address your proxy arrives from](#finding-the-address-your-proxy-arrives-from)
+   and check it with [Confirming the proxy is trusted](#confirming-the-proxy-is-trusted).
+   **Admin → Overview** raises a banner naming the right address when it is wrong.
+
+3. **The CPU cap.** Compose now sets `cpus: ${NINEVEH_CPU_LIMIT:-2.0}`. Docker
+   refuses to create the container if the NAS has fewer cores than that, or if
+   its kernel cannot enforce CPU limits. If `up` fails with a CPU error, set
+   `NINEVEH_CPU_LIMIT` to your core count, or to `0` to leave the cap out
+   entirely. A kernel without the pids controller may print a warning that the
+   PIDs limit was discarded; the container still starts.
+
+4. **The rebuild downloads pinned packages.** The image installs only the
+   hash-pinned versions in `requirements*.lock`, so the NAS needs Internet
+   access to PyPI while building. A hash mismatch means a download is not the
+   file that was pinned; do not work around it.
+
+#### What behaves differently afterwards
+
+None of these is a fault:
+
+- `/docs`, `/redoc` and `/openapi.json` answer administrators only
+  (anonymous callers get 401, readers 403); under split access, only on a
+  private origin.
+- Every failed sign-in makes the next one from that address and account wait
+  longer — 1 second, doubling to 30 — and an address failing across many
+  accounts is slowed too. Nothing is ever locked, and failures are forgotten
+  after 15 quiet minutes. An OPDS client stuck on an old password will make
+  sign-ins from its network slow until it is fixed; **Admin → Overview → Security**
+  lists failed sign-ins with their address.
+- Heavy use waits its turn instead of failing: image rendering, page-range
+  generation, and more than four downloads at once per account queue fairly
+  between accounts. Only a runaway backlog is refused, with `429` and
+  `Retry-After`, and recorded under Security.
+- Request bodies over 1 MiB are refused with `413`, except cover and librarian
+  uploads, which keep their own ceilings. A page range that would expand past
+  512 MiB is refused with `413`. Generated ranges and uploads stop with `507`
+  when the state volume would drop below 512 MiB free.
+- The default image-pixel ceiling is 80 megapixels, down from 200. A volume
+  with a larger page cannot be opened in the browser reader and its covers
+  cannot be generated; raise the ceiling in **Admin → Settings** if a real scan
+  hits it. A value you had already saved there is kept.
+- Each librarian token may have 10 uploads, and 20 GiB, staged at once; past
+  that it gets `507` until something is committed or discarded. Its "last
+  used" time updates at most once a minute.
+- Downloaded and uploaded metadata covers are decoded in a separate worker
+  process, so saving a match or a custom cover takes a moment longer.
+
+#### Turning on split access
+
+This is the change the hardening exists for, and the only one that needs new
+lines in `docker/.env`:
+
+```dotenv
+NINEVEH_PRIVATE_BASE_URLS=https://your-nas.your-tailnet.ts.net,https://192.168.1.10:5443
+NINEVEH_PRIVATE_ALLOW_IPS=100.64.0.0/10,fd7a:115c:a1e0::/48,192.168.1.0/24
+```
+
+Set up Tailscale Serve and the LAN proxy rule first, as described in
+[section 6](#6-private-administration-over-tailscale-or-the-lan). Nineveh
+refuses to start in this mode unless `NINEVEH_PUBLIC_BASE_URL` is set and uses
+`https://`, every private origin uses `https://`, `NINEVEH_SECURE_COOKIES` is
+`true`, and `NINEVEH_FORWARDED_ALLOW_IPS` names addresses rather than `*`. The
+container log says which one is missing.
+
+Once it is on:
+
+- Administrator accounts sign in only on a private origin. On the public URL
+  their correct password is answered exactly like a wrong one, so move any app
+  or OPDS client signed in as an administrator to a reader account.
+- The librarian agent must use a private origin; the public URL answers `403`
+  for the whole librarian API.
+- Links in feeds and pages name whichever origin the request arrived on.
+- `/api/v1/health/ready` includes scan detail only on a private origin. Point
+  any monitoring that reads it at one.
+
+#### Optional
+
+If the librarian never places volumes in the primary library, mount it
+read-only with `NINEVEH_DATA_MODE=ro`. Leave it writable if it does, or ingest
+fails with *Ingest destination is not writable*. The fair-use and storage
+settings in `docker/.env.example` all have working defaults.
+
+#### Checking the result
+
+After `up --build -d`:
+
+- **Admin → Overview** shows no *Forwarded headers are being ignored* banner,
+  and — once split access is on — no *Administration is reachable from any
+  address* banner either.
+- Only a private origin returns scan detail:
+
+  ```sh
+  curl -s https://your-nas.your-tailnet.ts.net/api/v1/health/ready   # {"status":"ok","catalog":{...}}
+  curl -s https://nineveh.example.com/api/v1/health/ready            # {"status":"ok"}
+  ```
+
+  A private origin that returns only a status means Nineveh does not see the
+  client's real address (item 2 above, or a network missing from
+  `NINEVEH_PRIVATE_ALLOW_IPS`). One that answers *Unrecognized request origin*
+  is missing from `NINEVEH_PRIVATE_BASE_URLS`, or is listed with another port.
+
+- Signing in as an administrator on the public URL fails as if the password
+  were wrong; the same account signs in on a private origin.
+
 ### Backups
 
 Back up `/volume1/docker/nineveh/state`. Stop Nineveh before copying the SQLite files, or use a SQLite-aware backup tool while the service is running.
