@@ -886,11 +886,15 @@ def test_the_upgrade_rescopes_both_uniqueness_constraints(tmp_path: Path):
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
-            "INSERT INTO catalog_series VALUES (?, ?, 'comics', 'Example Series', 0)",
+            "INSERT INTO catalog_series(id, library_id, category, name, is_private)"
+            " VALUES (?, ?, 'comics', 'Example Series', 0)",
             ("ser2", aliased.id),
         )
         connection.execute(
-            "INSERT INTO publications VALUES (?, ?, ?, 'comics', 'Example Series',"
+            "INSERT INTO publications(id, relative_path, library, category, series,"
+            " filename, title, number, description, authors_json, modified_ns, size,"
+            " revision, page_count, cover_page, library_id, series_id)"
+            " VALUES (?, ?, ?, 'comics', 'Example Series',"
             " 'One.cbz', 'The First Issue', '1', NULL, '[]', 1, 4096, 'rev', 1, 1, ?, ?)",
             (
                 "pub2",

@@ -15,6 +15,7 @@
       {% if session.user.is_admin %}
         <div class="series-admin-actions">
           {% if series.category == 'manga' %}<a class="button metadata-manage-button" href="/series/{{ series.id }}/metadata">Manage metadata</a>{% endif %}
+          {% if series.category == 'manga' %}{% with cover_return = 'series' %}{% include "series_cover_choice.html" %}{% endwith %}{% endif %}
           <form method="post" action="/series/{{ series.id }}/privacy">
             <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
             <input type="hidden" name="is_private" value="{{ 'false' if series.is_private else 'true' }}">

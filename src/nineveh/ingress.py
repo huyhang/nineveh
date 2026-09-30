@@ -29,7 +29,7 @@ _PRIVATE_PATHS = frozenset(
 _PRIVATE_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
-        r"/series/[^/]+/(?:privacy|spread-detection)",
+        r"/series/[^/]+/(?:privacy|spread-detection|cover-source)",
         r"/series/[^/]+/metadata(?:/.*)?",
         r"/libraries/[^/]+/[^/]+/metadata(?:/.*)?",
         r"/publications/[^/]+/spread-start",

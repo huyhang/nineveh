@@ -484,6 +484,24 @@
         "title": "LibraryList",
         "type": "object"
       },
+      "LibrarySeriesCoverInput": {
+        "description": "Where every series in a library takes its cover from, unless overridden.",
+        "properties": {
+          "source": {
+            "enum": [
+              "artwork",
+              "first_volume"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "LibrarySeriesCoverInput",
+        "type": "object"
+      },
       "LinkProperties": {
         "properties": {
           "length": {
@@ -1755,6 +1773,25 @@
           "ambiguous"
         ],
         "title": "SeriesCandidates",
+        "type": "object"
+      },
+      "SeriesCoverInput": {
+        "description": "Where one series' cover comes from; `library` follows its library.",
+        "properties": {
+          "source": {
+            "enum": [
+              "library",
+              "artwork",
+              "first_volume"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "SeriesCoverInput",
         "type": "object"
       },
       "SeriesDetail": {
@@ -3215,6 +3252,82 @@
         ]
       }
     },
+    "/api/v1/admin/libraries/{library_id}/series-cover": {
+      "put": {
+        "description": "Set the cover source for every series in a library, including later ones.",
+        "operationId": "library_series_cover_api_v1_admin_libraries__library_id__series_cover_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "library_id",
+            "required": true,
+            "schema": {
+              "title": "Library Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LibrarySeriesCoverInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Library Series Cover Api V1 Admin Libraries  Library Id  Series Cover Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Library Series Cover",
+        "tags": [
+          "administration"
+        ]
+      }
+    },
     "/api/v1/admin/metadata": {
       "get": {
         "operationId": "admin_metadata_api_v1_admin_metadata_get",
@@ -3909,6 +4022,82 @@
         "summary": "Security Events",
         "tags": [
           "admin"
+        ]
+      }
+    },
+    "/api/v1/admin/series/{series_id}/cover-source": {
+      "put": {
+        "description": "Use this series' artwork or its first volume's cover, or follow the library.",
+        "operationId": "series_cover_source_api_v1_admin_series__series_id__cover_source_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "series_id",
+            "required": true,
+            "schema": {
+              "title": "Series Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-CSRF-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Csrf-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeriesCoverInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Series Cover Source Api V1 Admin Series  Series Id  Cover Source Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBasic": []
+          }
+        ],
+        "summary": "Series Cover Source",
+        "tags": [
+          "administration"
         ]
       }
     },

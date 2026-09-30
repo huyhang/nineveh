@@ -97,6 +97,10 @@ small, .muted { color: var(--muted); }
 :root[data-catalog-layout="list"] .series-grid .series-card-body h2 { min-height: 0; }
 .series-admin-actions { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin: .4rem 0 .8rem; }
 .series-admin-actions .metadata-manage-button { margin: 0; }
+/* Label beside its select, so the choice sits in a row of buttons. */
+.series-cover-choice { flex-wrap: wrap; align-items: center; }
+.series-cover-choice label { display: inline-flex; align-items: center; gap: .5rem; }
+.library-body > .series-cover-choice { margin-top: 1rem; }
 .local-title { margin-bottom: .55rem; color: var(--muted); font-size: .88rem; }
 .series-hero { display: grid; grid-template-columns: minmax(220px, 330px) minmax(0, 1fr); gap: clamp(1.5rem, 5vw, 4rem); align-items: start; margin-top: 1rem; }
 .hero-cover { display: block; width: 100%; aspect-ratio: 2 / 3; border-radius: 18px; object-fit: cover; background: var(--line); box-shadow: var(--shadow); }

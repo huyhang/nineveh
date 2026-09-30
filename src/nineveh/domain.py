@@ -93,6 +93,15 @@ class AvailableDirectory:
     name: str
 
 
+class SeriesCover(StrEnum):
+    """Where a series' cover comes from."""
+
+    # A custom upload or the MangaBaka cover when there is one, otherwise the
+    # first volume's cover. What every series did before the choice existed.
+    ARTWORK = "artwork"
+    FIRST_VOLUME = "first_volume"
+
+
 @dataclass(frozen=True, slots=True)
 class ManagedLibrary:
     id: str
@@ -101,6 +110,8 @@ class ManagedLibrary:
     enabled: bool
     created_at: datetime
     mount_id: str = DEFAULT_MOUNT_ID
+    # The default for every series in the library, present and future.
+    series_cover: SeriesCover = SeriesCover.ARTWORK
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +138,7 @@ class SeriesUsage:
 
 @dataclass(frozen=True, slots=True)
 class CatalogSeries:
-    """A locally indexed series and the publication used for its fallback cover."""
+    """A locally indexed series and its first volume, in reading order."""
 
     id: str
     library_id: str
@@ -138,6 +149,13 @@ class CatalogSeries:
     publication_count: int
     first_publication_id: str
     first_publication_revision: str
+    # None follows the library's choice; a value overrides it for this series.
+    cover: SeriesCover | None = None
+    library_cover: SeriesCover = SeriesCover.ARTWORK
+
+    @property
+    def effective_cover(self) -> SeriesCover:
+        return self.cover or self.library_cover
 
 
 READ_UNREAD = "unread"

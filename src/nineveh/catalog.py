@@ -24,6 +24,7 @@ from .domain import (
     ScannedPublication,
     ScanReport,
     ScanStatus,
+    SeriesCover,
 )
 from .ports import CatalogRepository, LibraryRepository, MountRepository
 from .storage import StorageError, StoragePathResolver
@@ -44,6 +45,14 @@ class SeriesManagementRepository(Protocol):
         self, series_id: str, is_private: bool
     ) -> CatalogSeries | None: ...
 
+    def set_series_cover(
+        self, series_id: str, cover: SeriesCover | None
+    ) -> CatalogSeries | None: ...
+
+    def set_library_series_cover(
+        self, library_id: str, cover: SeriesCover
+    ) -> ManagedLibrary | None: ...
+
 
 class SeriesService:
     """Administrative series changes, independent of the HTTP transport."""
@@ -53,6 +62,18 @@ class SeriesService:
 
     def set_private(self, series_id: str, is_private: bool) -> CatalogSeries | None:
         return self._repository.set_series_private(series_id, is_private)
+
+    def set_cover(
+        self, series_id: str, cover: SeriesCover | None
+    ) -> CatalogSeries | None:
+        """Choose one series' cover source; None follows its library again."""
+        return self._repository.set_series_cover(series_id, cover)
+
+    def set_library_cover(
+        self, library_id: str, cover: SeriesCover
+    ) -> ManagedLibrary | None:
+        """Choose the cover source for every series in a library, now and later."""
+        return self._repository.set_library_series_cover(library_id, cover)
 
 
 __all__ = [

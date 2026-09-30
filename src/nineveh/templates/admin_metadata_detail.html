@@ -18,6 +18,7 @@
           <button class="secondary" type="submit">Upload cover</button>
         </form>
         {% if has_custom_cover %}<form method="post" action="/series/{{ series.id }}/metadata/cover/remove"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="danger ghost" type="submit">Remove custom cover</button></form>{% endif %}
+        {% with cover_return = 'metadata' %}{% include "series_cover_choice.html" %}{% endwith %}
       </div>
 
       <div>

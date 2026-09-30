@@ -29,6 +29,7 @@ from .domain import (
     CatalogVisibility,
     Publication,
     SearchFilters,
+    SeriesCover,
     Session,
 )
 from .http_api import (
@@ -536,6 +537,42 @@ async def series_detail(request: Request, series_id: str):
             "error": error,
         },
     )
+
+
+@router.post("/series/{series_id}/cover-source")
+async def update_series_cover_source(
+    request: Request,
+    series_id: str,
+    source: Annotated[Literal["library", "artwork", "first_volume"], Form()],
+    back: Annotated[Literal["series", "metadata"], Form()] = "series",
+    csrf_token: str = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    cover = None if source == "library" else SeriesCover(source)
+    updated = await run_in_threadpool(
+        _container(request).series.set_cover, series_id, cover
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Series not found")
+    following = " (the library's choice)" if cover is None else ""
+    return await _flash_redirect(
+        request,
+        f"/series/{series_id}/metadata"
+        if back == "metadata"
+        else f"/series/{series_id}",
+        message=(
+            f"{updated.name} now uses {_cover_phrase(updated.effective_cover)}"
+            f"{following}."
+        ),
+    )
+
+
+def _cover_phrase(cover: SeriesCover, *, plural: bool = False) -> str:
+    owner, has = ("their", "they have") if plural else ("its", "it has")
+    if cover is SeriesCover.FIRST_VOLUME:
+        return f"{owner} first volume's cover"
+    return f"{owner} artwork when {has} any"
 
 
 @router.post("/series/{series_id}/privacy")
@@ -1216,6 +1253,30 @@ async def admin_scan_library(
     )
 
 
+@router.post("/admin/libraries/{library_id}/series-cover")
+async def admin_library_series_cover(
+    request: Request,
+    library_id: str,
+    source: Annotated[SeriesCover, Form()],
+    csrf_token: str = Form(...),
+):
+    session = await _require_admin(request)
+    _verify_csrf(request, session, csrf_token)
+    library = await run_in_threadpool(
+        _container(request).series.set_library_cover, library_id, source
+    )
+    if not library:
+        return await _admin_redirect(
+            request, "libraries", error="Managed library not found."
+        )
+    return await _admin_redirect(
+        request,
+        "libraries",
+        message=f"Series in {library.name} now use "
+        f"{_cover_phrase(source, plural=True)}.",
+    )
+
+
 @router.post("/libraries/{library_id}/{category}/metadata/lookup")
 async def library_bulk_metadata_lookup(
     request: Request, library_id: str, category: str
@@ -1513,9 +1574,13 @@ async def series_metadata_cover(
         await run_in_threadpool(service.covers.save_custom, series_id, payload)
     except MetadataError as error:
         return await _metadata_redirect(request, series_id, error=str(error))
-    return await _metadata_redirect(
-        request, series_id, message="Custom series cover uploaded."
-    )
+    # Uploading a cover is asking to see it, now and after any later change
+    # to the library's choice.
+    await run_in_threadpool(container.series.set_cover, series_id, SeriesCover.ARTWORK)
+    message = "Custom series cover uploaded."
+    if series.effective_cover is SeriesCover.FIRST_VOLUME:
+        message += " This series now shows its artwork instead of its first volume."
+    return await _metadata_redirect(request, series_id, message=message)
 
 
 @router.post("/series/{series_id}/metadata/cover/remove")
@@ -1532,7 +1597,12 @@ async def remove_series_metadata_cover(
     if not series or series.category.casefold() != "manga" or not service:
         return RedirectResponse("/", status_code=303)
     await run_in_threadpool(service.covers.remove_custom, series_id)
-    return await _metadata_redirect(request, series_id, message="Custom cover removed.")
+    await run_in_threadpool(container.series.set_cover, series_id, None)
+    return await _metadata_redirect(
+        request,
+        series_id,
+        message="Custom cover removed. This series follows its library's choice again.",
+    )
 
 
 @router.post("/series/{series_id}/metadata/unlink")

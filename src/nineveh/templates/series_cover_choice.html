@@ -1,0 +1,13 @@
+{# Where a series' cover comes from. Needs `series`, `session` and `cover_return`. #}
+<form method="post" action="/series/{{ series.id }}/cover-source" class="inline-form series-cover-choice">
+  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+  <input type="hidden" name="back" value="{{ cover_return }}">
+  <label>Series cover
+    <select name="source">
+      <option value="library" {% if not series.cover %}selected{% endif %}>Library default ({{ 'first volume' if series.library_cover == 'first_volume' else 'artwork' }})</option>
+      <option value="first_volume" {% if series.cover == 'first_volume' %}selected{% endif %}>First volume</option>
+      <option value="artwork" {% if series.cover == 'artwork' %}selected{% endif %}>Artwork when available</option>
+    </select>
+  </label>
+  <button class="secondary" type="submit">Save</button>
+</form>

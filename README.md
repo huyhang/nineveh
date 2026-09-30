@@ -94,7 +94,9 @@ All catalog and content endpoints require authentication.
 | `/opds/v2/publications.json` | Paginated publication feed and search; `collection=private` selects private series instead of the default public ones |
 | `/api/v1/publications/{id}` | Single publication as an OPDS entry |
 | `/api/v1/series/{id}` | Local series information and optional stored metadata |
-| `/api/v1/series/{id}/cover` | Admin, MangaBaka, or local fallback series cover |
+| `/api/v1/series/{id}/cover` | The series cover: its artwork or its first volume's cover, as chosen below |
+| `/api/v1/admin/series/{id}/cover-source` | Choose one series' cover source, or let it follow its library |
+| `/api/v1/admin/libraries/{id}/series-cover` | Choose the cover source for every series in a library |
 | `/api/v1/series/{id}/privacy` | `PUT` moves a series into or out of Private Collection (administrators only) |
 | `/api/v1/publications/{id}/file` | Original CBZ download |
 | `/api/v1/publications/{id}/cover?width=320` | Generated WebP cover (160, 320, or 640) |
@@ -205,6 +207,8 @@ Thirteen settings are edited at **Admin → Settings** rather than in the enviro
 The MangaBaka request limit defaults to 30 per rolling 60-second window and may only be lowered. Unlike the other settings, it takes effect immediately. Request reservations are persisted, so a restart cannot reset the limit. Browsing and catalog scans use stored metadata and never contact MangaBaka; an administrator must explicitly request suggestions, confirm a match, or refresh one. MangaBaka-derived data is attributed in the interface under its CC BY-NC-SA 4.0 license.
 
 Metadata management lives alongside the collection: administrators can open a manga category to perform selected batch lookups, confidently auto-match every unmatched series in its library, or use **Manage metadata** on an individual series. Auto-match jobs preserve existing links and local edits, retain ambiguous suggestions for review, obey the configured request limit, and resume after an interrupted process. The same library-wide action is available from **Admin → Libraries**.
+
+A matched series shows its MangaBaka cover, or an uploaded custom cover, in place of its first volume's. When your own scans make better covers, choose **First volume of each series** under a library in **Admin → Libraries**: every series in it switches, including series added or matched later, and a MangaBaka refresh does not bring the artwork back. A single series can override its library either way from its own page or from **Manage metadata**. Uploading a custom cover pins that series to its artwork, so the upload keeps showing whatever the library later chooses; removing the upload returns the series to its library's choice. "First volume" means the volume the series page lists first — numbered volumes in natural order (2 before 10), then unnumbered ones — not whichever file name sorts first. Comics have no series artwork, so their covers always come from the first volume.
 
 Reader-facing lists — alternative titles, creators, publishers, tags — are capped at twenty entries, because MangaBaka returns every tag it holds and a popular series carries hundreds. The untruncated response stays in the retained provider record. In the editor, list fields take **one entry per line**: titles and credits contain commas often enough ("Oh, My Sweet Alien!", "Smith, John") that splitting on them corrupted the value the moment the form was saved.
 

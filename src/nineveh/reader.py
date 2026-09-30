@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import replace
 from typing import Protocol
 
@@ -14,10 +13,10 @@ from .domain import (
     SpreadAnalysis,
     SpreadGuess,
 )
+from .ordering import publication_order_key
 from .ports import ArchiveSource, CatalogRepository, ReadingRepository, SpreadRepository
 
 READING_MODES = frozenset({"single", "double", "scroll"})
-_NATURAL_PARTS = re.compile(r"(\d+)")
 # The cover always stands alone, so the earliest page pairing can start at.
 FIRST_PAIRED_PAGE = 2
 
@@ -204,25 +203,5 @@ class ReaderService:
         self._progress.delete_reading_progress(user_id, publication_id)
 
 
-def publication_order_key(publication: Publication) -> tuple[object, ...]:
-    """Sort numbered issues naturally, with deterministic fallbacks."""
-    primary = publication.number or publication.title or publication.filename
-    return (
-        0 if publication.number else 1,
-        _natural_key(primary),
-        _natural_key(publication.title),
-        _natural_key(publication.filename),
-        publication.id,
-    )
-
-
 def reading_direction(category: str) -> str:
     return "rtl" if category.casefold() == "manga" else "ltr"
-
-
-def _natural_key(value: str) -> tuple[tuple[int, object], ...]:
-    return tuple(
-        (0, int(part)) if part.isdigit() else (1, part.casefold())
-        for part in _NATURAL_PARTS.split(value)
-        if part
-    )

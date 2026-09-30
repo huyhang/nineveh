@@ -70,6 +70,7 @@ from .domain import (
     ReadingProgress,
     SearchHit,
     SearchPage,
+    SeriesCover,
     Session,
     User,
 )
@@ -185,6 +186,18 @@ class SpreadStartInput(BaseModel):
 
 class SeriesPrivacyInput(BaseModel):
     private: bool
+
+
+class SeriesCoverInput(BaseModel):
+    """Where one series' cover comes from; `library` follows its library."""
+
+    source: Literal["library", "artwork", "first_volume"]
+
+
+class LibrarySeriesCoverInput(BaseModel):
+    """Where every series in a library takes its cover from, unless overridden."""
+
+    source: Literal["artwork", "first_volume"]
 
 
 ReadingMode = Literal["single", "double", "scroll"]
@@ -1097,6 +1110,47 @@ async def series_privacy(
     return _public_series(series, metadata)
 
 
+@router.put("/api/v1/admin/series/{series_id}/cover-source", tags=["administration"])
+async def series_cover_source(
+    request: Request,
+    series_id: str,
+    body: SeriesCoverInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    """Use this series' artwork or its first volume's cover, or follow the library."""
+    require_api_csrf(request, identity, csrf_token)
+    cover = None if body.source == "library" else SeriesCover(body.source)
+    series = await run_in_threadpool(
+        _container(request).series.set_cover, series_id, cover
+    )
+    if not series:
+        raise HTTPException(status_code=404, detail="Series not found")
+    return _series_cover_payload(series)
+
+
+@router.put(
+    "/api/v1/admin/libraries/{library_id}/series-cover", tags=["administration"]
+)
+async def library_series_cover(
+    request: Request,
+    library_id: str,
+    body: LibrarySeriesCoverInput,
+    identity: Annotated[Identity, Depends(administrator)],
+    csrf_token: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> dict[str, object]:
+    """Set the cover source for every series in a library, including later ones."""
+    require_api_csrf(request, identity, csrf_token)
+    library = await run_in_threadpool(
+        _container(request).series.set_library_cover,
+        library_id,
+        SeriesCover(body.source),
+    )
+    if not library:
+        raise HTTPException(status_code=404, detail="Library not found")
+    return _public_library(library)
+
+
 @router.get(
     "/api/v1/series/{series_id}/cover",
     tags=["series"],
@@ -1118,7 +1172,11 @@ async def series_cover(
     del revision  # The URL changes with the local fallback; ETag covers overrides.
     container = _container(request)
     series = await _series_or_404(request, series_id, identity)
-    custom = container.metadata.covers.cover(series_id) if container.metadata else None
+    custom = (
+        container.metadata.covers.cover(series_id)
+        if container.metadata and series.effective_cover is SeriesCover.ARTWORK
+        else None
+    )
     if custom:
         stat = custom.stat()
         etag = _etag(f"{stat.st_mtime_ns}-{stat.st_size}")
@@ -2591,6 +2649,16 @@ def _public_library(library: ManagedLibrary) -> dict[str, object]:
         "mountId": library.mount_id,
         "enabled": library.enabled,
         "createdAt": library.created_at.isoformat(),
+        "seriesCover": library.series_cover.value,
+    }
+
+
+def _series_cover_payload(series: CatalogSeries) -> dict[str, object]:
+    return {
+        "seriesId": series.id,
+        "source": series.cover.value if series.cover else "library",
+        "libraryDefault": series.library_cover.value,
+        "effective": series.effective_cover.value,
     }
 
 

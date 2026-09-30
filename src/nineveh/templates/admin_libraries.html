@@ -101,6 +101,19 @@
                     </div>
                   {% endfor %}
                 {% else %}<p class="muted">No indexed publications yet.</p>{% endif %}
+                {% if usage.categories|selectattr('name', 'equalto', 'manga')|list %}
+                  <form method="post" action="/admin/libraries/{{ usage.library.id }}/series-cover" class="inline-form series-cover-choice">
+                    {{ csrf() }}
+                    <label>Series covers
+                      <select name="source">
+                        <option value="artwork" {% if usage.library.series_cover == 'artwork' %}selected{% endif %}>Artwork when available</option>
+                        <option value="first_volume" {% if usage.library.series_cover == 'first_volume' %}selected{% endif %}>First volume of each series</option>
+                      </select>
+                    </label>
+                    <button class="secondary" type="submit">Save</button>
+                    <small class="muted">Applies to series added later too. A series can override it from its own page.</small>
+                  </form>
+                {% endif %}
                 <div class="card-actions">
                   {% if usage.categories|selectattr('name', 'equalto', 'manga')|list %}<form method="post" action="/admin/libraries/{{ usage.library.id }}/metadata/auto-match" data-confirm="Auto-match every unmatched manga series in {{ usage.library.name }}? Existing links and local edits will be preserved.">{{ csrf() }}<button class="secondary" type="submit">Auto-match MangaBaka</button></form>{% endif %}
                   <form method="post" action="/admin/libraries/{{ usage.library.id }}/scan">{{ csrf() }}<button class="secondary" type="submit" data-scan-lock data-scan-label="Scan library" data-scan-busy-label="Scanning…" {% if scan_status.running %}disabled{% endif %}>{{ "Scanning…" if scan_status.running else "Scan library" }}</button></form>

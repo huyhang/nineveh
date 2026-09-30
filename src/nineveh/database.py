@@ -41,6 +41,7 @@ from .domain import (
     SearchSuggestion,
     SearchVolume,
     SecurityEvent,
+    SeriesCover,
     SeriesMetadata,
     SeriesMetadataState,
     SeriesMetadataSummary,
@@ -48,6 +49,7 @@ from .domain import (
     SpreadAnalysis,
     User,
 )
+from .ordering import publication_sort_key
 
 SCHEMA_VERSION = 10
 # The release that began recording `ComicInfo.xml` spread markers. Databases
@@ -109,6 +111,7 @@ CREATE TABLE IF NOT EXISTS managed_libraries (
     mount_id TEXT NOT NULL DEFAULT 'default' REFERENCES data_mounts(id),
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
+    series_cover TEXT NOT NULL DEFAULT 'artwork',
     UNIQUE(mount_id, relative_path)
 );
 
@@ -118,6 +121,7 @@ CREATE TABLE IF NOT EXISTS catalog_series (
     category TEXT NOT NULL COLLATE NOCASE,
     name TEXT NOT NULL COLLATE NOCASE,
     is_private INTEGER NOT NULL DEFAULT 0,
+    cover TEXT,
     UNIQUE(library_id, category, name)
 );
 
@@ -141,6 +145,7 @@ CREATE TABLE IF NOT EXISTS publications (
     cover_page INTEGER NOT NULL DEFAULT 1,
     library_id TEXT REFERENCES managed_libraries(id),
     series_id TEXT REFERENCES catalog_series(id),
+    sort_key TEXT,
     UNIQUE(library_id, relative_path)
 );
 CREATE INDEX IF NOT EXISTS publications_hierarchy
@@ -439,6 +444,9 @@ class SQLiteRepository:
             self._ensure_session_flash_columns(connection)
             self._ensure_page_spread_column(connection)
             self._ensure_spread_source_column(connection)
+            # After the rebuilds above: they copy an explicit column list.
+            self._ensure_series_cover_columns(connection)
+            self._ensure_publication_sort_keys(connection)
             connection.executescript(SCOPE_INDEX)
             if 0 < version < SPREAD_MARKER_VERSION:
                 # Reinspect existing ComicInfo files once so the new spread
@@ -637,6 +645,43 @@ class SQLiteRepository:
             connection.execute(
                 "ALTER TABLE publication_spread_analysis ADD COLUMN source TEXT"
             )
+
+    @staticmethod
+    def _ensure_series_cover_columns(connection: sqlite3.Connection) -> None:
+        """Every existing series keeps its artwork until someone chooses otherwise."""
+        if "series_cover" not in _columns(connection, "managed_libraries"):
+            connection.execute(
+                "ALTER TABLE managed_libraries "
+                "ADD COLUMN series_cover TEXT NOT NULL DEFAULT 'artwork'"
+            )
+        if "cover" not in _columns(connection, "catalog_series"):
+            connection.execute("ALTER TABLE catalog_series ADD COLUMN cover TEXT")
+
+    @staticmethod
+    def _ensure_publication_sort_keys(connection: sqlite3.Connection) -> None:
+        """Give every publication the reading-order key its series cover sorts on."""
+        if "sort_key" not in _columns(connection, "publications"):
+            connection.execute("ALTER TABLE publications ADD COLUMN sort_key TEXT")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS publications_series_order"
+            " ON publications(series_id, sort_key)"
+        )
+        missing = connection.execute(
+            "SELECT id, number, title, filename FROM publications"
+            " WHERE sort_key IS NULL"
+        ).fetchall()
+        connection.executemany(
+            "UPDATE publications SET sort_key = ? WHERE id = ?",
+            (
+                (
+                    publication_sort_key(
+                        row["number"], row["title"], row["filename"], row["id"]
+                    ),
+                    row["id"],
+                )
+                for row in missing
+            ),
+        )
 
     @staticmethod
     def _ensure_page_spread_column(connection: sqlite3.Connection) -> None:
@@ -1787,6 +1832,7 @@ class SQLiteRepository:
             enabled=bool(row["enabled"]),
             created_at=datetime.fromisoformat(row["created_at"]),
             mount_id=row["mount_id"],
+            series_cover=SeriesCover(row["series_cover"]),
         )
 
     @staticmethod
@@ -2120,15 +2166,16 @@ class SQLiteRepository:
                 INSERT INTO publications(
                     id, relative_path, library, category, series, filename, title, number,
                     description, authors_json, modified_ns, size, revision, page_count,
-                    cover_page, library_id, series_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cover_page, library_id, series_id, sort_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(library_id, relative_path) DO UPDATE SET
                     library=excluded.library, category=excluded.category, series=excluded.series,
                     filename=excluded.filename, title=excluded.title, number=excluded.number,
                     description=excluded.description, authors_json=excluded.authors_json,
                     modified_ns=excluded.modified_ns, size=excluded.size, revision=excluded.revision,
                     page_count=excluded.page_count, cover_page=excluded.cover_page,
-                    library_id=excluded.library_id, series_id=excluded.series_id
+                    library_id=excluded.library_id, series_id=excluded.series_id,
+                    sort_key=excluded.sort_key
                 """,
             (
                 item.id,
@@ -2148,6 +2195,7 @@ class SQLiteRepository:
                 item.cover_page,
                 library_id,
                 series_id,
+                publication_sort_key(item.number, item.title, item.filename, item.id),
             ),
         )
 
@@ -2670,16 +2718,18 @@ class SQLiteRepository:
                            managed_libraries.name AS library,
                            catalog_series.category, catalog_series.name,
                            catalog_series.is_private,
+                           catalog_series.cover AS series_cover,
+                           managed_libraries.series_cover AS library_cover,
                            publications.id AS publication_id,
                            publications.revision AS publication_revision,
                            COUNT(*) OVER (
                                PARTITION BY catalog_series.id
                            ) AS publication_count,
+                           -- The series page's order, so "first volume"
+                           -- means the same volume in both places.
                            ROW_NUMBER() OVER (
                                PARTITION BY catalog_series.id
-                               ORDER BY publications.number COLLATE NOCASE,
-                                        publications.title COLLATE NOCASE,
-                                        publications.id
+                               ORDER BY publications.sort_key, publications.id
                            ) AS cover_order
                     FROM catalog_series
                     JOIN managed_libraries
@@ -2731,6 +2781,26 @@ class SQLiteRepository:
                     (_now_iso(),),
                 )
         return self.catalog_series_by_id(series_id)
+
+    def set_series_cover(
+        self, series_id: str, cover: SeriesCover | None
+    ) -> CatalogSeries | None:
+        with self._connect() as connection:
+            updated = connection.execute(
+                "UPDATE catalog_series SET cover = ? WHERE id = ?",
+                (cover.value if cover else None, series_id),
+            ).rowcount
+        return self.catalog_series_by_id(series_id) if updated else None
+
+    def set_library_series_cover(
+        self, library_id: str, cover: SeriesCover
+    ) -> ManagedLibrary | None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE managed_libraries SET series_cover = ? WHERE id = ?",
+                (cover.value, library_id),
+            )
+        return self.managed_library(library_id)
 
     def catalog_visibility_modified_at(self) -> str | None:
         with self._connect() as connection:
@@ -3053,6 +3123,8 @@ class SQLiteRepository:
             publication_count=row["publication_count"],
             first_publication_id=row["publication_id"],
             first_publication_revision=row["publication_revision"],
+            cover=SeriesCover(row["series_cover"]) if row["series_cover"] else None,
+            library_cover=SeriesCover(row["library_cover"]),
         )
 
     def libraries(
@@ -3487,6 +3559,13 @@ def _mount_conflict(
     if row and row["path"] == path:
         return f"{row['name']} is already registered at that path"
     return f"Another data mount is already called “{name}”"
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
 
 
 def _unique_index_on(

@@ -47,13 +47,13 @@ from .domain import (
     ScannedPublication,
     SeriesMetadata,
 )
+from .ordering import publication_order_key
 from .ports import (
     CatalogRepository,
     LibrarianRepository,
     LibraryRepository,
     MetadataRepository,
 )
-from .reader import publication_order_key
 from .storage import StorageError, StoragePathResolver
 
 SCOPE_OPTIONS: tuple[tuple[str, str, str], ...] = (

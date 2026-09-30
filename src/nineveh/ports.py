@@ -30,6 +30,7 @@ from .domain import (
     SearchFilters,
     SearchSuggestion,
     SecurityEvent,
+    SeriesCover,
     SeriesMetadata,
     SeriesMetadataState,
     SeriesMetadataSummary,
@@ -117,6 +118,10 @@ class CatalogRepository(Protocol):
         self, series_id: str, is_private: bool
     ) -> CatalogSeries | None: ...
 
+    def set_series_cover(
+        self, series_id: str, cover: SeriesCover | None
+    ) -> CatalogSeries | None: ...
+
     def catalog_visibility_modified_at(self) -> str | None: ...
 
     def publications_in_series(
@@ -161,6 +166,10 @@ class LibraryRepository(Protocol):
     ) -> ManagedLibrary: ...
 
     def remove_library(self, library_id: str) -> ManagedLibrary | None: ...
+
+    def set_library_series_cover(
+        self, library_id: str, cover: SeriesCover
+    ) -> ManagedLibrary | None: ...
 
     def library_usage(self) -> list[LibraryUsage]: ...
 
