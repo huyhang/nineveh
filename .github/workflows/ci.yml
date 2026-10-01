@@ -62,7 +62,19 @@ jobs:
           push: false
           load: true
           tags: nineveh:ci
-          sbom: true
+
+      # The runner's classic image store cannot load an image that carries
+      # attestations, so export the same cached build as a tarball and keep
+      # only its SBOM.
+      - name: Generate SBOM
+        run: |
+          docker buildx build --file docker/Dockerfile --sbom=true \
+            --output type=tar,dest=- . | tar -x -C "$RUNNER_TEMP" sbom.spdx.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/sbom.spdx.json
 
       - name: Smoke test the container
         run: |
