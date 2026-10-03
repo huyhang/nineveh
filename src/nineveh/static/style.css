@@ -16,11 +16,16 @@
   --on-danger: #ffffff;
   --shadow: 0 18px 48px rgb(52 42 26 / 8%);
   --texture: radial-gradient(circle at 12% 18%, rgb(122 92 52 / 5%) 0 1px, transparent 1.5px), radial-gradient(circle at 78% 64%, rgb(122 92 52 / 4%) 0 1px, transparent 1.5px);
+  /* The select arrow in --muted, spelled out per theme: an SVG background
+     cannot read a custom property. */
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='m1 1.5 5 5 5-5' fill='none' stroke='%23716d64' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 :root[data-theme="light"] { color-scheme: light; --bg: #f6f7fa; --surface: #ffffff; --raised: #ffffff; --text: #20242b; --muted: #68707d; --accent: #3857a6; --accent-strong: #294488; --accent-soft: #e7ecfa; --line: #dfe3ea; --line-strong: #c5cbd5; --success: #28724b; --warning: #916116; --danger: #ae3030; --on-danger: #ffffff; --shadow: 0 18px 48px rgb(35 45 65 / 8%); --texture: none; }
 :root[data-theme="paper"] { color-scheme: light; }
 :root[data-theme="dark"] { color-scheme: dark; --bg: #151412; --surface: #201e1a; --raised: #27241f; --text: #f2ede4; --muted: #b4ada1; --line: #3d3932; --line-strong: #554e44; --accent: #ec806d; --accent-strong: #d76855; --accent-soft: #3b2420; --success: #75bd91; --warning: #e3ae53; --danger: #ff8b84; --on-danger: #2a1412; --shadow: none; --texture: none; }
+:root[data-theme="light"] { --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='m1 1.5 5 5 5-5' fill='none' stroke='%2368707d' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
+:root[data-theme="dark"] { --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='m1 1.5 5 5 5-5' fill='none' stroke='%23b4ada1' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body { margin: 0; background-color: var(--bg); background-image: var(--texture); background-size: 31px 37px, 43px 47px; color: var(--text); line-height: 1.5; }
@@ -144,6 +149,10 @@ small, .muted { color: var(--muted); }
 label { display: grid; gap: .4rem; font-size: .88rem; font-weight: 680; }
 input, select, button, .button { min-height: 42px; border: 1px solid var(--line-strong); border-radius: 9px; padding: .58rem .82rem; background: var(--raised); color: var(--text); font: inherit; }
 input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 35%, transparent); outline-offset: 2px; }
+/* Safari draws its own native popup for a select, ignoring the height, padding
+   and border above, until the select opts out of the platform appearance;
+   Chrome honours them either way. Opting out means drawing the arrow here. */
+select { appearance: none; padding-right: 2.3rem; background-image: var(--select-arrow); background-repeat: no-repeat; background-position: right .85rem center; background-size: .75rem auto; }
 button, .button { border-color: var(--accent); background: var(--accent); color: white; cursor: pointer; font-weight: 720; text-decoration: none; text-align: center; transition: transform .14s ease, background .14s ease; }
 /* The lift is shared; the repaint is not. Filling every button with
    `--accent-strong` on hover left the outline and quiet variants showing their
