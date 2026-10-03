@@ -82,6 +82,8 @@ NINEVEH_SECURE_COOKIES=true
 
 Replace the example UID, GID, hostname, and paths. Put a unique password of at least 12 characters in `admin_password.txt`; the file must contain only the password and a trailing newline is allowed.
 
+Leave `NINEVEH_CPU_LIMIT=0` as the template has it unless your NAS can enforce a CPU cap. Many DSM kernels cannot, and Docker then refuses to create the container with *NanoCPUs can not be set, as your kernel does not support CPU CFS scheduler*. To check, run `docker info 2>&1 | grep -i cfs` over SSH: a `No cpu cfs quota support` warning means leave it at `0`; no output means you may set it to at most the NAS's core count, such as `2.0`.
+
 The password bootstraps the `admin` account only when the state database has no users. It does not reset an existing account.
 
 ## 4. Build and start the container
@@ -318,12 +320,15 @@ catch you on the first `up --build -d`, and a few behaviours change on purpose.
    and check it with [Confirming the proxy is trusted](#confirming-the-proxy-is-trusted).
    **Admin → Overview** raises a banner naming the right address when it is wrong.
 
-3. **The CPU cap.** Compose now sets `cpus: ${NINEVEH_CPU_LIMIT:-2.0}`. Docker
-   refuses to create the container if the NAS has fewer cores than that, or if
-   its kernel cannot enforce CPU limits. If `up` fails with a CPU error, set
-   `NINEVEH_CPU_LIMIT` to your core count, or to `0` to leave the cap out
-   entirely. A kernel without the pids controller may print a warning that the
-   PIDs limit was discarded; the container still starts.
+3. **The CPU cap.** Compose now sets `cpus: ${NINEVEH_CPU_LIMIT:-2.0}`, so an
+   older `docker/.env` with no `NINEVEH_CPU_LIMIT` line asks for two cores.
+   Many DSM kernels cannot enforce CPU limits, and Docker then refuses to
+   create the container (*NanoCPUs can not be set …*); it also refuses a cap
+   above the NAS's core count. Add `NINEVEH_CPU_LIMIT=0` to leave the cap out,
+   as the current template does, or see [Configure Nineveh](#3-configure-nineveh)
+   to check whether your kernel can enforce one. A kernel without the pids
+   controller may print a warning that the PIDs limit was discarded; the
+   container still starts.
 
 4. **The rebuild downloads pinned packages.** The image installs only the
    hash-pinned versions in `requirements*.lock`, so the NAS needs Internet
@@ -461,7 +466,6 @@ NINEVEH_FEED_PAGE_SIZE=48
 NINEVEH_PAGE_RANGE_LIMIT=200
 NINEVEH_SCAN_INTERVAL_SECONDS=3600
 NINEVEH_MEMORY_LIMIT=2g
-NINEVEH_CPU_LIMIT=4.0
 NINEVEH_DOWNLOAD_STREAMS=32
 NINEVEH_RANGE_WORKERS=2
 ```
@@ -482,11 +486,14 @@ if you add books rarely.
 
 `NINEVEH_MEMORY_LIMIT` (default `1g`) caps the container. It is a ceiling, not a
 target — it exists so a runaway decode fails inside the container rather than
-pressuring DSM. Container Manager can also apply CPU limits. Avoid multiple
+pressuring DSM. `NINEVEH_CPU_LIMIT` caps CPU in cores, but only on a kernel
+that can enforce it; see [Configure Nineveh](#3-configure-nineveh). Container
+Manager can also apply CPU limits. Avoid multiple
 application workers because each worker would duplicate caches and scheduled scans.
 
 ## Troubleshooting
 
+- **`up` fails with *NanoCPUs can not be set*:** the NAS kernel cannot enforce a CPU cap. Set `NINEVEH_CPU_LIMIT=0` in `docker/.env` and run `up -d` again.
 - **The container exits immediately:** ensure the data directory exists, the state directory is writable, and an initial administrator password is configured.
 - **No books appear:** confirm the exact `library/comics-or-manga/series/file.cbz` hierarchy, then run a scan from the admin page.
 - **Permission denied:** verify `NINEVEH_PUID` and `NINEVEH_PGID` and the DSM ACLs on all mounted directories.
