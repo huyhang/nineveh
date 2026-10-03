@@ -113,6 +113,34 @@ export function adjacentPage(
   return target < 0 || target >= groups.length ? null : groups[target][0].number;
 }
 
+// What a paged reader fetches before it is turned to: the next few views,
+// nearest first, then the one behind for a turn back. A view is what one turn
+// shows -- a page, or a whole spread in double mode, so a spread never arrives
+// half-loaded. Enough to outrun quick turns while keeping a phone to a handful
+// of pages, like the continuous window below.
+export function preloadViews(
+  mode,
+  pages,
+  pageNumber,
+  adaptiveSingle = false,
+  totalPages = pages.length,
+  pairingAnchor = null,
+) {
+  if (mode !== "double" || adaptiveSingle) {
+    return [pageNumber + 1, pageNumber + 2, pageNumber + 3, pageNumber - 1]
+      .filter((number) => number >= 1 && number <= totalPages)
+      .map((number) => [number]);
+  }
+  const groups = pageGroups(pages, pairingAnchor);
+  const current = groups.findIndex((group) =>
+    group.some((page) => page.number === pageNumber),
+  );
+  if (current < 0) return [];
+  return [current + 1, current + 2, current - 1]
+    .filter((index) => index >= 0 && index < groups.length)
+    .map((index) => groups[index].map((page) => page.number));
+}
+
 export function activeImageNumbers(pageNumber, totalPages, before = 2, after = 3) {
   const current = clampPage(pageNumber, totalPages);
   const first = Math.max(1, current - before);

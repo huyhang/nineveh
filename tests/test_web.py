@@ -58,6 +58,16 @@ def test_the_login_page_renders(client: TestClient):
     assert "nineveh-theme" in script.text
 
 
+def test_static_files_are_revalidated_so_scripts_update_together(client: TestClient):
+    """reader.js imports reader-model.js by bare URL; a stale half breaks both."""
+    for path in ("/static/reader.js", "/static/reader-model.js", "/static/style.css"):
+        response = client.get(path)
+        assert response.headers["cache-control"] == "no-cache", path
+        etag = response.headers["etag"]
+        revalidated = client.get(path, headers={"If-None-Match": etag})
+        assert revalidated.status_code == 304, path
+
+
 def test_a_bad_password_re_renders_the_form(client: TestClient):
     response = client.post("/login", data={"username": "admin", "password": "nope"})
     assert response.status_code == 401

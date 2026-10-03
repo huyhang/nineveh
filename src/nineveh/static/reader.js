@@ -7,6 +7,7 @@ import {
   isStitched,
   navigationDelta,
   pageGroups,
+  preloadViews,
   readerModeStorageKey,
   visiblePages,
 } from "/static/reader-model.js";
@@ -29,6 +30,8 @@ class ReaderController {
     this.storage = dependencies.storage || window.localStorage;
     this.history = dependencies.history || window.history;
     this.pages = new Map();
+    // Page number -> a promise of its preloaded Image, or null if it failed.
+    this.preloaded = new Map();
     this.allPagesPromise = null;
     this.observer = null;
     this.endObserver = null;
@@ -197,7 +200,6 @@ class ReaderController {
     try {
       await this.ensurePage(this.state.page);
       await this.render();
-      if (this.state.mode === "single") this.prefetchAdjacent();
       this.scheduleSave(this.needsSync);
     } catch (error) {
       this.showError(error);
@@ -406,11 +408,13 @@ class ReaderController {
     this.elements.adaptiveMessage.textContent = stitchedOnPortrait
       ? "Wide stitched spread. Rotate or zoom for a closer view."
       : "Showing one page for readability. Rotate your device to restore the pair.";
-    this.prefetchAdjacent();
+    this.preloadAhead();
   }
 
   renderContinuous() {
     this.disconnectObservers();
+    // Continuous scroll keeps its own window of live images.
+    this.preloaded.clear();
     this.finished = false;
     const fragment = document.createDocumentFragment();
     for (const page of this.orderedPages()) {
@@ -789,18 +793,50 @@ class ReaderController {
     }
   }
 
-  prefetchAdjacent() {
-    for (const number of [this.state.page - 1, this.state.page + 1]) {
-      if (number < 1 || number > this.totalPages) continue;
-      this.ensurePage(number)
-        .then((page) => {
-          if (page) new Image().src = page.href;
-        })
-        // Prefetching is an optimisation. A neighbour that cannot be fetched
-        // will report itself when the reader actually navigates to it, and
-        // surfacing it here would fire an error over a page being read fine.
-        .catch(() => {});
+  // Fetch the next few views before the reader turns to them, so a turn shows
+  // an image already in the browser's cache instead of waiting on the archive.
+  // Page URLs carry the revision, so the server lets the browser keep them.
+  preloadAhead() {
+    const views = preloadViews(
+      this.state.mode,
+      this.orderedPages(),
+      this.state.page,
+      this.isAdaptiveSingle(),
+      this.totalPages,
+      this.pairingAnchor,
+    );
+    const wanted = new Set(views.flat());
+    // Letting go of a page that fell out of the window frees its memory.
+    for (const number of this.preloaded.keys()) {
+      if (!wanted.has(number)) this.preloaded.delete(number);
     }
+    views.forEach((view, index) => {
+      for (const number of view) {
+        if (!this.preloaded.has(number)) {
+          this.preloaded.set(
+            number,
+            this.ensurePage(number)
+              .then((page) => {
+                const image = new Image();
+                image.src = page.href;
+                return image;
+              })
+              // Preloading is an optimisation. A page that cannot be fetched
+              // will report itself when the reader actually turns to it, and
+              // surfacing it here would raise an error over a page being read.
+              .catch(() => null),
+          );
+        }
+        // Only the view one turn away is decoded ahead: it is the one that
+        // has to appear at once, and a decoded page is many times its file.
+        if (index === 0) {
+          this.preloaded
+            .get(number)
+            .then((image) => image && image.decode())
+            .catch(() => {});
+        }
+      }
+    });
   }
 
   onKeydown(event) {

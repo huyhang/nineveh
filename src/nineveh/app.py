@@ -467,6 +467,11 @@ def _harden(request: Request, response: Response) -> None:
         response.headers.setdefault("Cache-Control", "private, no-store")
     elif request.url.path.startswith("/opds/"):
         response.headers.setdefault("Cache-Control", "private, no-cache")
+    elif request.url.path.startswith("/static/"):
+        # Scripts import one another by unversioned URL. Left to heuristic
+        # freshness, a browser can pair an updated reader.js with a cached
+        # reader-model.js that lacks what it imports. Revalidating is a 304.
+        response.headers.setdefault("Cache-Control", "no-cache")
     if request.url.scheme == "https":
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"

@@ -170,6 +170,67 @@ def test_turning_a_page_in_double_mode_steps_whole_spreads():
     assert evaluate(step, pages=pages, **{"from": 7, "by": 1}) is None
 
 
+def _preload(mode, pages, number, *, total, adaptive=False, anchor=None):
+    return evaluate(
+        "preloadViews(dukpy['mode'], dukpy['pages'], dukpy['number'],"
+        " dukpy['adaptive'], dukpy['total'], dukpy['anchor'])",
+        mode=mode,
+        pages=pages,
+        number=number,
+        adaptive=adaptive,
+        total=total,
+        anchor=anchor,
+    )
+
+
+def test_single_mode_preloads_three_pages_ahead_and_one_behind():
+    # Single mode works from numbers alone: it never loads the whole manifest.
+    assert _preload("single", [], 5, total=12) == [[6], [7], [8], [4]]
+    assert _preload("single", [], 1, total=12) == [[2], [3], [4]]
+    assert _preload("single", [], 11, total=12) == [[12], [10]]
+    assert _preload("single", [], 1, total=1) == []
+
+
+def test_double_mode_preloads_whole_spreads_ahead_of_the_one_on_screen():
+    """Fetching page + 1 in double mode fetched the half already showing."""
+    pages = volume(12)  # [1] [2 3] [4 5] [6 7] [8 9] [10 11] [12]
+    assert _preload("double", pages, 4, total=12) == [[6, 7], [8, 9], [2, 3]]
+    assert _preload("double", pages, 1, total=12) == [[2, 3], [4, 5]]
+    assert _preload("double", pages, 10, total=12) == [[12], [8, 9]]
+
+
+def test_a_stitched_page_is_preloaded_as_the_view_it_will_be():
+    pages = volume(9, wide={4})  # [1] [2 3] [4] [5 6] [7 8] [9]
+    assert _preload("double", pages, 2, total=9) == [[4], [5, 6], [1]]
+
+
+def test_preloaded_spreads_follow_the_anchor():
+    pages = volume(8)  # anchored at 3: [1] [2] [3 4] [5 6] [7 8]
+    assert _preload("double", pages, 2, total=8, anchor=3) == [[3, 4], [5, 6], [1]]
+
+
+def test_double_mode_on_a_portrait_phone_preloads_page_by_page():
+    pages = volume(12)
+    assert _preload("double", pages, 4, total=12, adaptive=True) == [
+        [5],
+        [6],
+        [7],
+        [3],
+    ]
+
+
+def test_preloading_stays_inside_the_volume_and_off_the_current_view():
+    pages = volume(30, wide={5, 12})
+    for mode, adaptive in (("single", False), ("double", False), ("double", True)):
+        for number in range(1, 31):
+            views = _preload(mode, pages, number, total=30, adaptive=adaptive)
+            numbers = [n for view in views for n in view]
+            assert views, f"nothing preloaded from page {number} in {mode}"
+            assert number not in numbers
+            assert len(numbers) <= 6, "a phone should hold only a handful"
+            assert all(1 <= n <= 30 for n in numbers)
+
+
 def test_every_page_of_a_volume_belongs_to_exactly_one_group():
     """Pairing must partition the volume: a dropped or duplicated page would
     make a spread unreachable by turning."""
