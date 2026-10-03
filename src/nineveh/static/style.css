@@ -223,13 +223,19 @@ time[title] { cursor: help; text-decoration: underline dotted color-mix(in srgb,
 .admin-tabs a:hover { color: var(--accent); background: var(--accent-soft); }
 .admin-tabs a[aria-current="page"] { color: white; background: var(--accent); }
 .admin-section { padding: clamp(1.1rem, 2.5vw, 1.75rem); }
+.admin-section + .admin-section, .admin-shortcuts + .admin-section { margin-top: 1rem; }
+/* The base rule centres a page-level flash message; inside a section a notice
+   spans the content like its neighbours and sits clear of what precedes it. */
+.admin-section .notice { width: auto; margin: 1rem 0 0; font-size: .9rem; }
 .admin-shortcuts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .85rem; margin-top: 1rem; }
 .admin-shortcuts a { display: grid; gap: .35rem; min-height: 110px; padding: 1rem; border: 1px solid var(--line); border-radius: 12px; color: var(--text); background: var(--surface); text-decoration: none; }
 .admin-shortcuts a:hover { border-color: var(--accent); box-shadow: var(--shadow); transform: translateY(-1px); }
 .admin-shortcuts span { color: var(--muted); font-size: .78rem; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
 .section-heading { margin-bottom: 1.25rem; }
 .metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .85rem; }
-.metric { display: grid; gap: .2rem; min-height: 112px; padding: 1rem; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(145deg, var(--raised), color-mix(in srgb, var(--accent-soft) 35%, var(--surface))); }
+/* Packed to the top: stretched rows would share a tile's spare height, so a
+   tile with a detail line would lift its value above its neighbours'. */
+.metric { display: grid; align-content: start; gap: .2rem; min-height: 112px; padding: 1rem; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(145deg, var(--raised), color-mix(in srgb, var(--accent-soft) 35%, var(--surface))); }
 .metric span { color: var(--muted); font-size: .8rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
 .metric strong { font-size: 1.65rem; letter-spacing: -.03em; }
 .status-line { display: flex; gap: .65rem; align-items: center; margin-top: 1rem; color: var(--muted); }
@@ -289,7 +295,6 @@ time[title] { cursor: help; text-decoration: underline dotted color-mix(in srgb,
 .deployment-note, .settings-actions { grid-column: 1 / -1; }
 .deployment-note p { margin: .15rem 0 0; color: var(--muted); }
 .add-library-hint { max-width: 32rem; margin: 0; text-align: right; font-size: .85rem; }
-.proxy-warning { width: 100%; margin: 1rem 0 0; font-size: .9rem; }
 .proxy-warning code { padding: .1rem .3rem; border-radius: 4px; background: color-mix(in srgb, var(--danger) 12%, transparent); }
 .badge { padding: .3rem .6rem; border-radius: 99px; font-size: .78rem; font-weight: 750; background: var(--accent-soft); color: var(--accent); }
 .badge.warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 14%, var(--surface)); }
@@ -420,7 +425,6 @@ time[title] { cursor: help; text-decoration: underline dotted color-mix(in srgb,
 .search-start p { margin: .3rem 0 0; color: var(--muted); }
 
 /* Data mounts */
-.mount-admin { margin-bottom: 1rem; }
 .mount-grid { display: grid; gap: .75rem; }
 .mount-card { overflow: hidden; border: 1px solid var(--line); border-radius: 13px; background: var(--raised); }
 .mount-card > summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: .85rem; padding: .85rem 1rem; cursor: pointer; list-style: none; }
