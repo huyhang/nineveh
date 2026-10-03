@@ -21,6 +21,7 @@ from .domain import (
     ManagedLibrary,
     Page,
     Publication,
+    ScanFailure,
     ScannedPublication,
     ScanReport,
     ScanStatus,
@@ -98,6 +99,7 @@ IMAGE_TYPES = {
 }
 NATURAL_PARTS = re.compile(r"(\d+)")
 LIBRARY_NAME_LIMIT = 80
+REPORTED_FAILURE_LIMIT = 50
 
 
 class UnsafeArchive(ValueError):
@@ -487,7 +489,8 @@ class CatalogScanner:
                 report = self._scan_library(library)
             except (OSError, StorageError) as error:
                 LOGGER.warning("Leaving %s indexed: %s", library.name, error)
-                totals = _add_reports(totals, ScanReport(0, 0, 0, 0, 1))
+                failure = ScanFailure(library.name, None, _reason(error))
+                totals = _add_reports(totals, ScanReport(0, 0, 0, 0, 1, (failure,)))
                 continue
             totals = _add_reports(totals, report)
         return totals
@@ -498,6 +501,7 @@ class CatalogScanner:
         mount_root = Path(self._paths.mount_for_library(library).path)
         seen: set[str] = set()
         indexed = unchanged = failed = 0
+        failures: list[ScanFailure] = []
         for path in paths:
             relative_path = path.relative_to(mount_root).as_posix()
             seen.add(relative_path)
@@ -526,8 +530,14 @@ class CatalogScanner:
             except (OSError, UnsafeArchive, zipfile.BadZipFile) as error:
                 failed += 1
                 LOGGER.warning("Skipping %s: %s", relative_path, error)
+                if len(failures) < REPORTED_FAILURE_LIMIT:
+                    failures.append(
+                        ScanFailure(library.name, relative_path, _reason(error))
+                    )
         removed = self._repository.remove_publications_except(seen, library.id)
-        return ScanReport(len(paths), indexed, unchanged, removed, failed)
+        return ScanReport(
+            len(paths), indexed, unchanged, removed, failed, tuple(failures)
+        )
 
     def _library_root(self, library: ManagedLibrary) -> Path:
         mount = self._paths.mount_for_library(library)
@@ -579,7 +589,14 @@ def _add_reports(left: ScanReport, right: ScanReport) -> ScanReport:
         left.unchanged + right.unchanged,
         left.removed + right.removed,
         left.failed + right.failed,
+        (left.failures + right.failures)[:REPORTED_FAILURE_LIMIT],
     )
+
+
+def _reason(error: Exception) -> str:
+    # An exception raised without a message stringifies to nothing; its type
+    # still says more than a blank.
+    return str(error) or type(error).__name__
 
 
 def _completed_status(

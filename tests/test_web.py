@@ -714,6 +714,32 @@ def test_the_overview_reports_what_the_last_scan_found(client: TestClient):
     assert "data-scan-status" in overview
     assert "Last scan completed" in overview
     assert re.search(r"\d+ found · \d+ indexed · \d+ unchanged", overview)
+    assert "What failed and why" not in overview
+
+
+def test_the_overview_says_what_failed_and_why(client: TestClient, library):
+    """A bare count sends the administrator digging through container logs."""
+    settings, _ = library
+    bad = settings.data_dir / "Main Library" / "manga" / "Bad"
+    bad.mkdir(parents=True)
+    (bad / "broken.cbz").write_bytes(b"plain text")
+    _login(client)
+    client.post("/admin/scan", data={"csrf_token": _csrf(client)})
+    scanner = client.app.state.container.scanner
+    for _ in range(200):
+        if scanner.status.report.failed and not scanner.status.running:
+            break
+        time.sleep(0.01)
+
+    overview = client.get("/admin").text
+
+    assert "<strong>1 failed</strong>" in overview
+    assert 'class="status-line status-warning"' in overview
+    assert "What failed and why" in overview
+    assert (
+        "<code>Main Library/manga/Bad/broken.cbz</code>: File is not a zip file"
+        in overview
+    )
 
 
 def test_every_scan_locked_control_carries_the_hook_that_releases_it():

@@ -512,12 +512,28 @@ class ReaderContext:
 
 
 @dataclass(frozen=True, slots=True)
+class ScanFailure:
+    """One thing a scan could not index, and why.
+
+    `path` is relative to the library's mount, or None when the whole library
+    was skipped -- its disk disconnected or its directory gone.
+    """
+
+    library: str
+    path: str | None
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class ScanReport:
     discovered: int
     indexed: int
     unchanged: int
     removed: int
     failed: int
+    # The first few, in scan order. `failed` stays the full count: a broken
+    # disk can fail every file, and this rides along on every readiness poll.
+    failures: tuple[ScanFailure, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

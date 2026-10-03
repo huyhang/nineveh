@@ -159,6 +159,9 @@ def test_unavailable_storage_is_reported_without_losing_the_index(library):
     assert repository.publications(limit=10)[1] == 1
     assert scanner.status.running is False
     assert scanner.status.error is None
+    [failure] = scanner.status.report.failures
+    assert (failure.library, failure.path) == ("Main Library", None)
+    assert "unavailable" in failure.reason
 
 
 def test_a_failed_scan_is_recorded_in_the_status(library):
@@ -192,6 +195,47 @@ def test_unsafe_or_empty_archives_are_skipped(library, name, build):
 
     assert report.failed == 1, name
     assert repository.publications(limit=10)[1] == 1
+    [failure] = report.failures
+    assert failure.path == "Main Library/manga/Bad/bad.cbz"
+    assert failure.reason, name
+
+
+def test_a_failure_says_why_the_archive_was_skipped(library):
+    settings, _ = library
+    bad_dir = settings.data_dir / "Main Library" / "manga" / "Bad"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "not-a-zip.cbz").write_bytes(b"plain text")
+    with zipfile.ZipFile(bad_dir / "text-only.cbz", "w") as archive:
+        archive.writestr("readme.txt", b"x")
+
+    scanner, _ = _scanner(settings)
+    report = scanner.scan()
+
+    assert [
+        (item.path.rsplit("/", 1)[-1], item.reason) for item in report.failures
+    ] == [
+        ("not-a-zip.cbz", "File is not a zip file"),
+        ("text-only.cbz", "archive contains no supported images"),
+    ]
+
+
+def test_reported_failures_are_capped_but_still_counted(library, monkeypatch):
+    """A disk that fails every file must not turn each readiness poll into a dump."""
+    monkeypatch.setattr("nineveh.catalog.REPORTED_FAILURE_LIMIT", 2)
+    settings, _ = library
+    bad_dir = settings.data_dir / "Main Library" / "manga" / "Bad"
+    bad_dir.mkdir(parents=True)
+    for number in range(3):
+        (bad_dir / f"broken {number}.cbz").write_bytes(b"plain text")
+
+    scanner, _ = _scanner(settings)
+    report = scanner.scan()
+
+    assert report.failed == 3
+    assert [item.path.rsplit("/", 1)[-1] for item in report.failures] == [
+        "broken 0.cbz",
+        "broken 1.cbz",
+    ]
 
 
 def test_a_duplicate_entry_is_rejected(library, tmp_path: Path):

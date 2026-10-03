@@ -350,6 +350,9 @@ def test_storage_that_disappears_is_reported_not_pruned(two_roots):
     report = scanner.scan()
 
     assert (report.failed, report.removed) == (1, 0)
+    assert [(item.library, item.path) for item in report.failures] == [
+        ("Archive", None)
+    ]
     assert graph.repository.publications(limit=10)[1] == 2
     assert graph.mounts.status(mount).health is MountHealth.MISSING
 

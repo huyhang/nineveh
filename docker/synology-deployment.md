@@ -499,4 +499,4 @@ application workers because each worker would duplicate caches and scheduled sca
 - **Permission denied:** verify `NINEVEH_PUID` and `NINEVEH_PGID` and the DSM ACLs on all mounted directories.
 - **Login succeeds but returns to the login page:** HTTPS is required while `NINEVEH_SECURE_COOKIES=true`.
 - **Feed links use the wrong hostname:** set `NINEVEH_PUBLIC_BASE_URL` to the external HTTPS origin.
-- **An archive is skipped:** review container logs for malformed ZIP entries, unsupported page formats, encryption, or configured safety limits.
+- **A scan reports some failed:** open **What failed and why** under the last scan on **Admin → Overview**. It names each file and the reason, such as a malformed ZIP, an encrypted archive, no supported pages, or a configured safety limit, and each library left unscanned because its disk is disconnected or its directory is missing. It lists the first 50; the container log has every one.

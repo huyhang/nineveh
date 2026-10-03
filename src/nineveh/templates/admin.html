@@ -27,7 +27,8 @@
         Set <code>NINEVEH_PRIVATE_BASE_URLS</code> to the tailnet or LAN origins that administer this install, and recreate the container. Administrator accounts will then sign in only there.
       </div>
     {% endif %}
-    <div class="status-line {% if scan_status.error %}status-error{% endif %}" data-scan-status{% if scan_status.running %} data-scan-running{% endif %}>
+    {% set failed_report = scan_status.report if scan_status.report and scan_status.report.failed and not (scan_status.running or scan_status.error) else none %}
+    <div class="status-line {% if scan_status.error %}status-error{% elif failed_report %}status-warning{% endif %}" data-scan-status{% if scan_status.running %} data-scan-running{% endif %}>
       <span class="status-dot"></span>
       {# One element for the whole sentence: the row is a flex container, so
          loose text nodes become separate items and the gap lands mid-sentence. #}
@@ -35,6 +36,17 @@
       {%- elif scan_status.error %}Last scan failed: {{ scan_status.error }}
       {%- elif scan_status.completed_at %}Last scan completed <time datetime="{{ scan_status.completed_at }}" title="{{ scan_status.completed_at|timestamp }}">{{ scan_status.completed_at|since }}</time>.{% if scan_status.report %}<span class="scan-report">{{ scan_status.report.discovered }} found · {{ scan_status.report.indexed }} indexed · {{ scan_status.report.unchanged }} unchanged{% if scan_status.report.removed %} · {{ scan_status.report.removed }} removed{% endif %}{% if scan_status.report.failed %} · <strong>{{ scan_status.report.failed }} failed</strong>{% endif %}</span>{% endif %}
       {%- else %}No scan has completed yet.{% endif %}</span>
+      {% if failed_report %}
+        <details class="scan-failures">
+          <summary>What failed and why</summary>
+          <ul>
+            {% for failure in failed_report.failures %}
+              <li>{% if failure.path %}<code>{{ failure.path }}</code>{% else %}Library <strong>{{ failure.library }}</strong> was not scanned, and keeps its index{% endif %}: {{ failure.reason }}</li>
+            {% endfor %}
+          </ul>
+          {% if failed_report.failed > failed_report.failures|length %}<p>…and {{ failed_report.failed - failed_report.failures|length }} more. The container log lists every one.</p>{% endif %}
+        </details>
+      {% endif %}
     </div>
   </section>
 
