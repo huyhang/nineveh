@@ -84,8 +84,22 @@ def test_a_cross_origin_login_is_refused(client: TestClient):
 
 
 def test_signing_in_sets_a_hardened_cookie_and_shows_the_catalog(client: TestClient):
-    assert _login(client).status_code == 303
+    response = _login(client)
+    assert response.status_code == 303
     assert "nineveh_session" in client.cookies
+    attributes = {
+        name.strip().casefold(): value.strip()
+        for name, _, value in (
+            part.partition("=")
+            for part in response.headers["set-cookie"].split(";")[1:]
+        )
+    }
+    assert "httponly" in attributes
+    assert attributes["path"] == "/"
+    assert attributes["max-age"] == str(168 * 3600)
+    # Lax, not Strict: Safari can withhold a Strict cookie when it reloads a
+    # tab it reclaimed for memory, and the reader lands back on the login page.
+    assert attributes["samesite"].casefold() == "lax"
 
     catalog = client.get("/")
     assert catalog.status_code == 200

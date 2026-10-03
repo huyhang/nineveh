@@ -142,7 +142,13 @@ async def login(
         max_age=container.settings.session_hours * 3600,
         secure=container.settings.secure_cookies,
         httponly=True,
-        samesite="strict",
+        # Not "strict": Safari reloads a tab whose process it reclaimed for
+        # memory from a blank page, can treat that reload as cross-site and
+        # withhold a Strict cookie -- an idle library tab lands on the login
+        # page with a perfectly good session. Every state change is a POST
+        # behind a CSRF token, and Lax still keeps the cookie off cross-site
+        # posts and subresources.
+        samesite="lax",
         path="/",
     )
     return response
